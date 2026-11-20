@@ -461,9 +461,33 @@ public struct LeftoverScanner: Sendable {
         }
     }
 
-    /// True if `name` is an executable shipped with macOS (system daemons such as `accountsd`).
+    /// Names of macOS-bundled launchd services (label tail + program basename), read once from the
+    /// read-only system volume. Covers daemons living inside frameworks, e.g.
+    /// `Accounts.framework/.../Support/accountsd` (label `com.apple.accountsd`).
+    public static let systemServiceNames: Set<String> = {
+        var names = Set<String>()
+        let fm = FileManager.default
+        for dir in ["/System/Library/LaunchAgents", "/System/Library/LaunchDaemons"] {
+            guard let files = try? fm.contentsOfDirectory(atPath: dir) else { continue }
+            for file in files where file.hasSuffix(".plist") {
+                let meta = LibraryIndex.parseLaunchPlistMetadata(at: URL(fileURLWithPath: "\(dir)/\(file)"))
+                if let label = meta.label?.lowercased(), let tail = label.split(separator: ".").last {
+                    names.insert(String(tail))
+                }
+                if let prog = meta.programs.first {
+                    names.insert(URL(fileURLWithPath: prog).lastPathComponent.lowercased())
+                }
+            }
+        }
+        return names
+    }()
+
+    /// True if `name` is an executable / launchd service shipped with macOS (e.g. `accountsd`).
     public static func isSystemExecutableName(_ name: String) -> Bool {
         guard !name.isEmpty, !name.contains("/") else { return false }
+        if systemServiceNames.contains(name.lowercased()) {
+            return true
+        }
         let fm = FileManager.default
         for dir in ["/usr/libexec", "/usr/sbin", "/usr/bin", "/System/Library/CoreServices"] {
             if fm.fileExists(atPath: "\(dir)/\(name)") {
