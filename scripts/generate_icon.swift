@@ -86,7 +86,7 @@ ctx.setStrokeColor(CGColor(red: 0.48, green: 0.78, blue: 1.0, alpha: 0.28))
 ctx.setLineWidth(6)
 ctx.strokePath()
 
-// Layered stylized folder + sweep arc motif (echoing App Cleaner silhouette in fresh geometric form)
+// Layered stylized folder + sparkle motif in clean geometric form
 let folderBack = CGRect(x: 256, y: 292, width: 512, height: 344)
 let tabPath = CGMutablePath()
 tabPath.move(to: CGPoint(x: folderBack.minX, y: folderBack.minY + 46))

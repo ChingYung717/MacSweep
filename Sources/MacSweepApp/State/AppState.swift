@@ -240,7 +240,7 @@ final class AppState: ObservableObject {
         let sizerRef = self.sizer
 
         sizeTask = Task.detached(priority: .utility) { [weak self] in
-            // Process in small batches so UI updates progressively like App Cleaner 9!
+            // Process in small batches so UI updates progressively.
             let batchSize = 8
             for start in stride(from: 0, to: currentApps.count, by: batchSize) {
                 if Task.isCancelled { return }

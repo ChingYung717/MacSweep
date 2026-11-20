@@ -1,5 +1,7 @@
 #!/bin/bash
-# Build and bundle MacSweep.app cleanly using SwiftPM + automatic code signing.
+# Build and bundle MacSweep.app cleanly using SwiftPM, with auto-versioning,
+# code signing (Apple Development / Developer ID / ad-hoc), optional notarization,
+# and standalone zip packaging.
 # Usage: ./make_app.sh [output_dir]
 set -euo pipefail
 
@@ -9,10 +11,42 @@ APP="$OUT/MacSweep.app"
 NAME="MacSweepApp"
 DISPLAY_NAME="MacSweep"
 BUNDLE_ID="local.macsweep"
-VERSION="${MACSWEEP_VERSION:-1.0.0}"
-BUILD_NUMBER="${MACSWEEP_BUILD_NUMBER:-1}"
+VERSION_BASE_COMMIT="2dfba249b6dca88ce6841e3bc80aab91410dd25a"
 
-echo "==> Building release binary ($NAME)"
+if [ -n "${MACSWEEP_VERSION:-}" ]; then
+    VERSION="$MACSWEEP_VERSION"
+    BUILD_NUMBER="${MACSWEEP_BUILD_NUMBER:-1}"
+elif git -C "$HERE" rev-parse --verify "${VERSION_BASE_COMMIT}^{commit}" >/dev/null 2>&1; then
+    COMMITS_SINCE_BASE="$(git -C "$HERE" rev-list --count "${VERSION_BASE_COMMIT}..HEAD")"
+    PATCH_COUNT=$((COMMITS_SINCE_BASE > 0 ? COMMITS_SINCE_BASE - 1 : 0))
+    VERSION="1.0.${PATCH_COUNT}"
+    BUILD_NUMBER="$((PATCH_COUNT + 1))"
+else
+    VERSION="1.0.0"
+    BUILD_NUMBER="1"
+fi
+
+NOTARY_PROFILE="${MACSWEEP_NOTARY_PROFILE:-}"
+
+# Resolve signing identity: explicit env -> first Apple Development identity -> ad-hoc fallback
+if [ "${MACSWEEP_SIGN_IDENTITY+set}" = "set" ] && [ -n "${MACSWEEP_SIGN_IDENTITY}" ]; then
+    SIGN_IDENTITY="$MACSWEEP_SIGN_IDENTITY"
+else
+    AUTO_ID="$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Apple Development:/ {print $2; exit}' || true)"
+    if [ -n "$AUTO_ID" ]; then
+        SIGN_IDENTITY="$AUTO_ID"
+    else
+        SIGN_IDENTITY="-"
+        echo "Warning: No 'Apple Development' signing identity found; falling back to ad-hoc ('-'). TCC grants may reset after rebuilds." >&2
+    fi
+fi
+
+if [ -n "$NOTARY_PROFILE" ] && [ "$SIGN_IDENTITY" = "-" ]; then
+    echo "Error: Notarization requires MACSWEEP_SIGN_IDENTITY set to a Developer ID Application identity." >&2
+    exit 1
+fi
+
+echo "==> Building release binary ($NAME, v${VERSION} build ${BUILD_NUMBER})"
 cd "$HERE"
 swift build -c release --product "$NAME"
 
@@ -29,8 +63,11 @@ ICON_PNG="$RES_TMP/AppIcon-1024.png"
 ICONSET="$RES_TMP/AppIcon.iconset"
 ICNS="$RES_TMP/AppIcon.icns"
 
-if [ ! -f "$ICNS" ] || [ "$HERE/scripts/generate_icon.swift" -nt "$ICNS" ]; then
+if [ ! -f "$ICON_PNG" ] || [ "$HERE/scripts/generate_icon.swift" -nt "$ICON_PNG" ]; then
     swift "$HERE/scripts/generate_icon.swift" "$ICON_PNG"
+fi
+
+if [ ! -f "$ICNS" ] || [ "$ICON_PNG" -nt "$ICNS" ]; then
     rm -rf "$ICONSET"
     mkdir -p "$ICONSET"
     for sz in 16 32 128 256 512; do
@@ -49,6 +86,24 @@ cp "$BIN" "$APP/Contents/MacOS/$NAME"
 chmod 755 "$APP/Contents/MacOS/$NAME"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 cp "$ICNS" "$APP/Contents/Resources/AppIcon.icns"
+if [ -f "$HERE/LICENSE" ]; then
+    cp "$HERE/LICENSE" "$APP/Contents/Resources/LICENSE"
+fi
+
+MIN_MACOS="$(otool -l "$APP/Contents/MacOS/$NAME" |
+    awk '
+        /cmd LC_BUILD_VERSION/ { build=1; next }
+        build && $1=="minos" { print $2; build=0 }
+        /cmd LC_VERSION_MIN_MACOSX/ { legacy=1; next }
+        legacy && $1=="version" { print $2; legacy=0 }
+    ' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)"
+MIN_MACOS="${MIN_MACOS:-14.0}"
+
+ARCH="$(lipo -archs "$APP/Contents/MacOS/$NAME")"
+case "$ARCH" in
+    arm64|x86_64) ;;
+    *) echo "Error: Unsupported output architecture: $ARCH" >&2; exit 1 ;;
+esac
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -63,8 +118,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>${VERSION}</string>
     <key>CFBundleVersion</key><string>${BUILD_NUMBER}</string>
-    <key>LSMinimumSystemVersion</key><string>14.0</string>
+    <key>LSMinimumSystemVersion</key><string>${MIN_MACOS}</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSHumanReadableCopyright</key><string>Copyright © 2026 MacSweep Contributors</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
     <key>NSAppDataUsageDescription</key><string>MacSweep scans application service files, caches, and browser extension manifests to calculate disk usage and assist with clean uninstallation.</string>
     <key>NSAppleEventsUsageDescription</key><string>MacSweep uses Finder to move protected or root-owned items to the Trash so they remain recoverable via Put Back.</string>
@@ -85,23 +141,27 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Resolve signing identity: explicit env -> first Apple Development identity -> ad-hoc fallback
-SIGN_IDENTITY="${MACSWEEP_SIGN_IDENTITY:-}"
-if [ -z "$SIGN_IDENTITY" ]; then
-    AUTO_ID="$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Apple Development:/ {print $2; exit}')"
-    if [ -n "$AUTO_ID" ]; then
-        SIGN_IDENTITY="$AUTO_ID"
-    else
-        SIGN_IDENTITY="-"
-        echo "Warning: No 'Apple Development' signing identity found; falling back to ad-hoc ('-'). TCC grants may reset after rebuilds." >&2
-    fi
+echo "==> Signing (${ARCH}, macOS ${MIN_MACOS}+) with identity: $SIGN_IDENTITY"
+sign_args=(--force --sign "$SIGN_IDENTITY")
+if [ -n "$NOTARY_PROFILE" ] || [[ "$SIGN_IDENTITY" == "Developer ID "* ]]; then
+    sign_args+=(--options runtime --timestamp)
 fi
-
-echo "==> Signing with identity: $SIGN_IDENTITY"
-codesign --force --sign "$SIGN_IDENTITY" "$APP"
+codesign "${sign_args[@]}" "$APP"
 codesign --verify --deep --strict --verbose=1 "$APP"
 
+ZIP_OUT="$OUT/${DISPLAY_NAME}-${ARCH}.zip"
+ZIP_TMP="$OUT/.${DISPLAY_NAME}-${ARCH}-$$.zip"
+trap 'rm -f "$ZIP_TMP"' EXIT
+ditto -c -k --norsrc --keepParent "$APP" "$ZIP_TMP"
+if [ -n "$NOTARY_PROFILE" ]; then
+    xcrun notarytool submit "$ZIP_TMP" --keychain-profile "$NOTARY_PROFILE" --wait
+    xcrun stapler staple "$APP"
+    xcrun stapler validate "$APP"
+    ditto -c -k --norsrc --keepParent "$APP" "$ZIP_TMP"
+fi
+mv -f "$ZIP_TMP" "$ZIP_OUT"
+
 echo "==> Done"
-du -sh "$APP"
+du -sh "$APP" "$ZIP_OUT"
 file "$APP/Contents/MacOS/$NAME"
 echo "$APP"
