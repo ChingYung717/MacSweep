@@ -297,6 +297,33 @@ struct SettingsSheet: View {
                         }
                         .font(.system(size: 11))
                         .foregroundStyle(palette.tertiaryText)
+
+                        if !rec.removedPaths.isEmpty {
+                            DisclosureGroup {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    ForEach(rec.removedPaths, id: \.self) { path in
+                                        Text(path)
+                                            .font(.system(size: 10.5, design: .monospaced))
+                                            .foregroundStyle(palette.secondaryText)
+                                            .textSelection(.enabled)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                    }
+                                    if rec.mode == .trash {
+                                        Button(l10n.t("打开废纸篓（可用「放回原处」恢复）", "Open Trash (use Put Back to restore)")) {
+                                            NSWorkspace.shared.open(FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".Trash"))
+                                        }
+                                        .buttonStyle(.link)
+                                        .font(.system(size: 11))
+                                    }
+                                }
+                                .padding(.top, 4)
+                            } label: {
+                                Text(l10n.t("已移除的路径", "Removed paths"))
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(palette.secondaryText)
+                            }
+                        }
                     }
                     .padding(10)
                     .background(

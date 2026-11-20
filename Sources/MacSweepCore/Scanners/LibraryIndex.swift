@@ -12,6 +12,9 @@ public struct LibraryEntry: Hashable, Sendable {
     public let launchLabel: String?
     public let launchProgramPaths: [String]
     public let requiresAdmin: Bool
+    /// Result of `SafetyGuard.validateForRemoval` computed ONCE at index time, so per-app matching
+    /// stays a pure in-memory pass (previously ~450k filesystem-touching validations ≈ 26 s).
+    public let isRemovable: Bool
 
     public init(
         url: URL,
@@ -21,7 +24,8 @@ public struct LibraryEntry: Hashable, Sendable {
         parentVendorName: String? = nil,
         launchLabel: String? = nil,
         launchProgramPaths: [String] = [],
-        requiresAdmin: Bool = false
+        requiresAdmin: Bool = false,
+        isRemovable: Bool = true
     ) {
         self.url = url
         self.name = url.lastPathComponent
@@ -34,6 +38,7 @@ public struct LibraryEntry: Hashable, Sendable {
         self.launchLabel = launchLabel
         self.launchProgramPaths = launchProgramPaths
         self.requiresAdmin = requiresAdmin
+        self.isRemovable = isRemovable
     }
 
     public static func stripKnownSuffixes(from name: String) -> String {
@@ -157,7 +162,8 @@ public struct LibraryIndex: Sendable {
                                 isSystemScope: isSystemScope,
                                 isInsideVendorFolder: true,
                                 parentVendorName: childName,
-                                requiresAdmin: admin
+                                requiresAdmin: admin,
+                                isRemovable: safetyGuard.validateForRemoval(sub).isAllowed
                             ))
                         }
                     }
@@ -180,7 +186,8 @@ public struct LibraryIndex: Sendable {
                     isSystemScope: isSystemScope,
                     launchLabel: launchLabel,
                     launchProgramPaths: launchPrograms,
-                    requiresAdmin: admin
+                    requiresAdmin: admin,
+                    isRemovable: safetyGuard.validateForRemoval(child).isAllowed
                 ))
             }
         }

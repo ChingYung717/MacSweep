@@ -262,6 +262,13 @@ struct ApplicationsView: View {
                             .help(l10n.runningBadge)
                     }
 
+                    if app.sharesBundleIDWithOtherApp {
+                        Image(systemName: "square.on.square")
+                            .font(.system(size: 9.5))
+                            .foregroundStyle(palette.warning)
+                            .help(l10n.t("与其他已安装应用共享 Bundle ID", "Shares its bundle ID with another installed app"))
+                    }
+
                     if app.isAppleAppStoreApp {
                         Image(systemName: "apple.logo")
                             .font(.system(size: 9.5))
@@ -453,6 +460,19 @@ struct ApplicationsView: View {
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
+                    }
+                }
+
+                if app.sharesBundleIDWithOtherApp {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(palette.warning)
+                        Text(l10n.t(
+                            "另一个已安装的应用使用相同的 Bundle ID（\(app.bundleID)），服务文件为两者共享，默认不勾选。",
+                            "Another installed app uses the same bundle ID (\(app.bundleID)); service files are shared and unchecked by default."
+                        ))
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(palette.secondaryText)
                     }
                 }
 

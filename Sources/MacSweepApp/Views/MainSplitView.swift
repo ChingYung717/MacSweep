@@ -56,6 +56,16 @@ struct MainSplitView: View {
                         .controlSize(.mini)
                     }
 
+                    if !banner.forceQuitBundleIDs.isEmpty {
+                        Button(state.l10n.t("强制退出", "Force Quit")) {
+                            let ids = banner.forceQuitBundleIDs
+                            Task { await state.forceQuitApps(bundleIDs: ids) }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.red)
+                        .controlSize(.mini)
+                    }
+
                     Button {
                         state.banner = nil
                     } label: {

@@ -17,6 +17,8 @@ public struct SafetyGuard: Sendable {
     public let selfSupportPath: String
     public let protectedPaths: Set<String>
     public let protectedBundleIDs: Set<String>
+    /// Precomputed once (was a computed property rebuilt on every `validateForRemoval` call).
+    private let criticalExactPaths: Set<String>
 
     public init(
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
@@ -25,18 +27,19 @@ public struct SafetyGuard: Sendable {
         protectedBundleIDs: [String] = []
     ) {
         let stdHome = homeDirectory.standardizedFileURL.path
-        self.homeDirectoryPath = stdHome
-        self.selfBundlePath = selfBundlePath.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
-        self.selfSupportPath = URL(fileURLWithPath: stdHome)
+        let supportPath = URL(fileURLWithPath: stdHome)
             .appendingPathComponent("Library/Application Support/MacSweep")
             .standardizedFileURL.path
+        self.homeDirectoryPath = stdHome
+        self.selfBundlePath = selfBundlePath.map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+        self.selfSupportPath = supportPath
         self.protectedPaths = Set(protectedPaths.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
         self.protectedBundleIDs = Set(protectedBundleIDs.map { $0.lowercased() })
+        self.criticalExactPaths = Self.makeCriticalExactPaths(home: stdHome, selfSupportPath: supportPath)
     }
 
     // Directories that must NEVER be deleted themselves (neither directly nor via pkgutil/leftovers).
-    private var criticalExactPaths: Set<String> {
-        let h = homeDirectoryPath
+    private static func makeCriticalExactPaths(home h: String, selfSupportPath: String) -> Set<String> {
         return [
             "/",
             "/System",

@@ -45,6 +45,9 @@ public struct AppItem: Identifiable, Hashable, Sendable {
     public let requiresAdmin: Bool
     public var isChecked: Bool
     public var scanState: AppScanState
+    /// Another installed copy uses the same bundle ID (e.g. a renamed duplicate), so its
+    /// service files are shared and must not be pre-selected for removal.
+    public var sharesBundleIDWithOtherApp: Bool = false
 
     public init(
         url: URL,

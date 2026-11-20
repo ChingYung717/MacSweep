@@ -99,8 +99,8 @@ func runStartupChecks(_ runner: CheckRunner) {
         )
         let (dom, cmd) = try StartupController.buildToggleShellCommand(item: userItem, enable: false, uid: 501)
         try runner.expectEqual(dom, "gui/501")
-        try runner.expect(cmd.contains("launchctl disable 'gui/501/com.acme.helper'"))
-        try runner.expect(cmd.contains("launchctl bootout 'gui/501/com.acme.helper'"))
+        try runner.expect(cmd.contains("'/bin/launchctl' disable 'gui/501/com.acme.helper'"))
+        try runner.expect(cmd.contains("'/bin/launchctl' bootout 'gui/501/com.acme.helper'"))
 
         let daemonItem = StartupItem(
             label: "com.acme.daemon",
@@ -112,7 +112,19 @@ func runStartupChecks(_ runner: CheckRunner) {
         )
         let (sysDom, sysCmd) = try StartupController.buildToggleShellCommand(item: daemonItem, enable: true, uid: 501)
         try runner.expectEqual(sysDom, "system")
-        try runner.expect(sysCmd.contains("launchctl enable 'system/com.acme.daemon'"))
-        try runner.expect(sysCmd.contains("launchctl bootstrap 'system'"))
+        try runner.expect(sysCmd.contains("'/bin/launchctl' enable 'system/com.acme.daemon'"))
+        try runner.expect(sysCmd.contains("'/bin/launchctl' bootstrap 'system'"))
+
+        let loginItem = StartupItem(
+            label: "com.acme.login",
+            plistURL: URL(fileURLWithPath: "/Applications/Acme.app/Contents/Library/LoginItems/Helper.app"),
+            programPath: nil,
+            scope: .appLoginItem,
+            isEnabled: true,
+            canToggle: false
+        )
+        var rejected = false
+        do { _ = try StartupController.buildToggleShellCommand(item: loginItem, enable: false) } catch { rejected = true }
+        try runner.expect(rejected, "app login items must not be toggled via launchctl")
     }
 }

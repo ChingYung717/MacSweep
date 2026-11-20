@@ -5,17 +5,68 @@ public struct InstalledAppInventory: Sendable {
     public let baseBundlePrefixes: Set<String>
     public let appNames: Set<String>
     public let compactAppNames: Set<String>
+    /// 2-part reverse-DNS vendor prefixes (e.g. `com.baidu`, `com.tencent`) of installed apps / live services.
+    public let vendorPrefixes: Set<String>
+    /// Compact (lowercased, no spaces/hyphens) names ≥ 5 chars used for containment checks
+    /// such as `com.baidu.baidunetdisk-mac` ⊃ `baidunetdisk`.
+    public let containmentNames: Set<String>
 
     public init(
         bundleIDs: Set<String>,
         baseBundlePrefixes: Set<String>,
         appNames: Set<String>,
-        compactAppNames: Set<String>
+        compactAppNames: Set<String>,
+        vendorPrefixes: Set<String> = [],
+        containmentNames: Set<String> = []
     ) {
         self.bundleIDs = bundleIDs
         self.baseBundlePrefixes = baseBundlePrefixes
         self.appNames = appNames
         self.compactAppNames = compactAppNames
+        self.vendorPrefixes = vendorPrefixes
+        self.containmentNames = containmentNames
+    }
+
+    public static func compact(_ s: String) -> String {
+        s.lowercased()
+            .replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "-", with: "")
+            .replacingOccurrences(of: "_", with: "")
+    }
+
+    /// Strips a trailing `_<UUID>` / `-<UUID>` suffix, e.g. `企业微信_269F5995-70FC-5B55-BCF5-D7E491D2E457`.
+    public static func stripUUIDSuffix(_ name: String) -> String {
+        guard name.count > 37 else { return name }
+        let suffix = String(name.suffix(36))
+        let sep = name[name.index(name.endIndex, offsetBy: -37)]
+        if (sep == "_" || sep == "-"), UUID(uuidString: suffix) != nil {
+            return String(name.dropLast(37))
+        }
+        return name
+    }
+
+    /// Reads localized `CFBundleDisplayName` / `CFBundleName` from `*.lproj/InfoPlist.strings`
+    /// (e.g. aDrive.app → 阿里云盘 lives only in `zh_CN.lproj`).
+    public static func localizedBundleNames(at appURL: URL) -> [String] {
+        let fm = FileManager.default
+        let resources = appURL.appendingPathComponent("Contents/Resources")
+        guard let lprojs = try? fm.contentsOfDirectory(atPath: resources.path) else { return [] }
+        var names: [String] = []
+        for lproj in lprojs where lproj.hasSuffix(".lproj") {
+            let lower = lproj.lowercased()
+            guard lower.hasPrefix("zh") || lower.hasPrefix("en") || lower == "base.lproj" else { continue }
+            let stringsURL = resources.appendingPathComponent(lproj).appendingPathComponent("InfoPlist.strings")
+            guard let data = try? Data(contentsOf: stringsURL),
+                  let dict = (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? [String: Any] else {
+                continue
+            }
+            for key in ["CFBundleDisplayName", "CFBundleName"] {
+                if let value = (dict[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+                    names.append(value)
+                }
+            }
+        }
+        return names
     }
 
     public static func build(
@@ -33,8 +84,10 @@ public struct InstalledAppInventory: Sendable {
 
         var bundleIDs = Set<String>()
         var basePrefixes = Set<String>()
+        var vendors = Set<String>()
         var names = Set<String>()
         var compactNames = Set<String>()
+        var containment = Set<String>()
         let fm = FileManager.default
 
         func recordBundleID(_ bid: String) {
@@ -46,27 +99,41 @@ public struct InstalledAppInventory: Sendable {
                 basePrefixes.insert(parts.prefix(3).joined(separator: "."))
             }
             if parts.count >= 2 {
-                basePrefixes.insert(parts.prefix(2).joined(separator: "."))
+                let p2 = parts.prefix(2).joined(separator: ".")
+                basePrefixes.insert(p2)
+                vendors.insert(p2)
             }
         }
 
-        func recordBundle(at url: URL) {
-            let rawName = url.deletingPathExtension().lastPathComponent.lowercased()
-            if !rawName.isEmpty {
-                names.insert(rawName)
-                compactNames.insert(rawName.replacingOccurrences(of: " ", with: ""))
+        func recordName(_ raw: String) {
+            let val = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !val.isEmpty,
+                  !ServiceFileMatcher.genericExecutableNames.contains(val) else { return }
+            names.insert(val)
+            compactNames.insert(val.replacingOccurrences(of: " ", with: ""))
+            let c = compact(val)
+            if c.count >= 5 && !SafetyGuard.sharedVendorFolderNames.contains(c) {
+                containment.insert(c)
             }
+        }
+
+        func recordBundle(at url: URL, includeLocalized: Bool) {
+            recordName(url.deletingPathExtension().lastPathComponent)
             if let bundle = Bundle(url: url), let info = bundle.infoDictionary {
                 if let bid = info["CFBundleIdentifier"] as? String {
                     recordBundleID(bid)
                 }
                 for key in ["CFBundleName", "CFBundleDisplayName", "CFBundleExecutable"] {
-                    if let val = (info[key] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-                       !val.isEmpty {
-                        names.insert(val)
-                        compactNames.insert(val.replacingOccurrences(of: " ", with: ""))
+                    if let val = info[key] as? String {
+                        recordName(val)
                     }
                 }
+            }
+            if includeLocalized {
+                for localized in localizedBundleNames(at: url) {
+                    recordName(localized)
+                }
+                recordName(fm.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: ""))
             }
         }
 
@@ -81,12 +148,12 @@ public struct InstalledAppInventory: Sendable {
 
             for item in items {
                 if item.pathExtension.lowercased() == "app" {
-                    recordBundle(at: item)
+                    recordBundle(at: item, includeLocalized: true)
                     for subDir in ["Contents/Library/LoginItems", "Contents/PlugIns", "Contents/XPCServices", "Contents/Applications"] {
                         let nested = item.appendingPathComponent(subDir)
                         if let nestedItems = try? fm.contentsOfDirectory(at: nested, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
                             for nestedItem in nestedItems {
-                                recordBundle(at: nestedItem)
+                                recordBundle(at: nestedItem, includeLocalized: false)
                             }
                         }
                     }
@@ -119,7 +186,7 @@ public struct InstalledAppInventory: Sendable {
                     recordBundleID(label)
                 }
                 if let enclosing = StartupScanner.extractEnclosingApp(from: entry.launchProgramPaths) {
-                    recordBundle(at: URL(fileURLWithPath: enclosing.path))
+                    recordBundle(at: URL(fileURLWithPath: enclosing.path), includeLocalized: false)
                 }
             }
         }
@@ -128,8 +195,35 @@ public struct InstalledAppInventory: Sendable {
             bundleIDs: bundleIDs,
             baseBundlePrefixes: basePrefixes,
             appNames: names,
-            compactAppNames: compactNames
+            compactAppNames: compactNames,
+            vendorPrefixes: vendors,
+            containmentNames: containment
         )
+    }
+
+    /// True if a reverse-DNS identifier's product part contains an installed app name,
+    /// e.g. `com.baidu.baidunetdisk-mac` while `BaiduNetdisk.app` (bundle id `com.baidu.netdisk`) is installed.
+    public func productPartContainsInstalledName(_ reverseDNS: String) -> Bool {
+        let parts = reverseDNS.lowercased().split(separator: ".")
+        guard parts.count >= 3 else { return false }
+        let product = Self.compact(parts.dropFirst(2).joined())
+        guard product.count >= 5 else { return false }
+        return containmentNames.contains { product.contains($0) }
+    }
+
+    /// True if a plain (non reverse-DNS) folder/file name contains an installed app name,
+    /// e.g. CrashReporter `BaiduNetdisk_mac` while `BaiduNetdisk.app` is installed.
+    public func plainNameContainsInstalledName(_ name: String) -> Bool {
+        let c = Self.compact(name)
+        guard c.count >= 5 else { return false }
+        return containmentNames.contains { c.contains($0) }
+    }
+
+    /// True if any installed app / live service shares the 2-part vendor prefix (e.g. `com.tencent`).
+    public func hasInstalledVendor(_ reverseDNS: String) -> Bool {
+        let parts = reverseDNS.lowercased().split(separator: ".")
+        guard parts.count >= 2 else { return false }
+        return vendorPrefixes.contains(parts.prefix(2).joined(separator: "."))
     }
 
     public func matchesEntry(stem: String, fullName: String, launchLabel: String?) -> Bool {
@@ -209,9 +303,10 @@ public struct LeftoverScanner: Sendable {
         var groupedFiles: [String: (displayName: String, bundleID: String?, confidence: LeftoverConfidence, files: [ServiceFile])] = [:]
 
         for entry in index.entries {
-            guard safetyGuard.validateForRemoval(entry.url).isAllowed else { continue }
+            // Safety validation was precomputed once per entry at index time.
+            guard entry.isRemovable else { continue }
 
-            let stem = entry.stem
+            let stem = InstalledAppInventory.stripUUIDSuffix(entry.stem)
             let strippedID = InstalledAppInventory.stripContainerPrefixes(stem.lowercased())
 
             // Skip Apple system, CLI/dev tools, shared vendor dirs, and user-ignored leftovers
@@ -249,7 +344,13 @@ public struct LeftoverScanner: Sendable {
             let isReverseDNS = Self.looksLikeReverseDNSBundleID(strippedID)
             let isOrphanedLaunch = (entry.category == .launchAgents || entry.category == .launchDaemons)
 
-            let confidence: LeftoverConfidence
+            // Reverse-DNS data whose product part names an installed app (e.g. `com.baidu.baidunetdisk-mac`
+            // while BaiduNetdisk.app with bundle id `com.baidu.netdisk` is installed) is NOT a leftover.
+            if isReverseDNS && !isOrphanedLaunch && inventory.productPartContainsInstalledName(strippedID) {
+                continue
+            }
+
+            var confidence: LeftoverConfidence
             if isOrphanedLaunch {
                 confidence = .high
             } else if isReverseDNS {
@@ -274,7 +375,27 @@ public struct LeftoverScanner: Sendable {
                       UUID(uuidString: stem) == nil else {
                     continue
                 }
+                // e.g. `BaiduNetdisk_mac` (crash reporter state) belongs to installed BaiduNetdisk.app
+                if inventory.plainNameContainsInstalledName(stem) {
+                    continue
+                }
+                // e.g. `accountsd`: data of a macOS system daemon / tool that ships with the OS
+                if Self.isSystemExecutableName(stem) {
+                    continue
+                }
                 confidence = .medium
+            }
+
+            // Never pre-select (default-check) items that are risky to remove blindly:
+            //  - system-wide `/Library/...` entries (shared by all users, need admin)        [F5]
+            //  - data of a vendor that still has installed apps / live services (shared SDK data such as
+            //    `com.tencent.bugly`, or a renamed bundle id of an installed product)
+            if confidence == .high {
+                if entry.isSystemScope {
+                    confidence = .medium
+                } else if isReverseDNS && inventory.hasInstalledVendor(strippedID) {
+                    confidence = .medium
+                }
             }
 
             let groupKey = Self.deriveGroupKey(
@@ -338,6 +459,18 @@ public struct LeftoverScanner: Sendable {
             }
             return lhs.groupName.localizedCaseInsensitiveCompare(rhs.groupName) == .orderedAscending
         }
+    }
+
+    /// True if `name` is an executable shipped with macOS (system daemons such as `accountsd`).
+    public static func isSystemExecutableName(_ name: String) -> Bool {
+        guard !name.isEmpty, !name.contains("/") else { return false }
+        let fm = FileManager.default
+        for dir in ["/usr/libexec", "/usr/sbin", "/usr/bin", "/System/Library/CoreServices"] {
+            if fm.fileExists(atPath: "\(dir)/\(name)") {
+                return true
+            }
+        }
+        return false
     }
 
     public static func looksLikeReverseDNSBundleID(_ value: String) -> Bool {
