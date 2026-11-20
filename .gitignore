@@ -1,7 +1,23 @@
+# Swift Package Manager & Build Artifacts
 .build/
 .swiftpm/
 dist/
-*.xcuserdata
-.DS_Store
+Package.resolved
+
+# Generated App Icon Artifacts (AppIcon-1024.png is tracked; .icns is built on demand)
 Resources/AppIcon.icns
 Resources/AppIcon.iconset/
+
+# Xcode
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+*.xcuserdata
+DerivedData/
+
+# macOS & Editors
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.vscode/
