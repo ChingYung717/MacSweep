@@ -61,6 +61,8 @@ struct PendingConfirmation: Identifiable {
     let affectedStartupIDs: [String]
     let affectedExtensionIDs: [String]
     let affectedLeftoverIDs: [String]
+    /// Preference domains to flush from cfprefsd after a successful reset.
+    var resetBundleIDs: [String] = []
 }
 
 struct OperationBanner: Identifiable, Equatable {
@@ -69,6 +71,8 @@ struct OperationBanner: Identifiable, Equatable {
     let message: String
     let showAppManagementLink: Bool
     let showFDALink: Bool
+    /// Apps that did not quit gracefully; the banner offers an explicit (user-confirmed) Force Quit.
+    var forceQuitBundleIDs: [String] = []
 }
 
 @MainActor
@@ -90,6 +94,7 @@ final class AppState: ObservableObject {
     let sizer = DirectorySizer()
     private var libraryIndex: LibraryIndex?
     private var cachedThirdPartyPackages: [String]?
+    private var ambiguousNames: Set<String> = []
 
     // Tab 1: Applications
     @Published var apps: [AppItem] = []
@@ -186,7 +191,7 @@ final class AppState: ObservableObject {
         let includeUtil = preferences.includeUtilitiesFolder
         let showSys = preferences.showSystemApps
 
-        let (scannedApps, index, thirdPartyPkgs) = await Task.detached(priority: .userInitiated) {
+        let (scannedApps, index, thirdPartyPkgs, ambiguous) = await Task.detached(priority: .userInitiated) {
             let index = LibraryIndex.build(safetyGuard: guardCopy)
             let scanner = AppScanner(
                 includeUtilities: includeUtil,
@@ -195,18 +200,28 @@ final class AppState: ObservableObject {
             )
             let matcher = ServiceFileMatcher(safetyGuard: guardCopy)
             var found = scanner.scanApplications()
+            // Names claimed by ≥2 installed apps (e.g. shared executables) are never used for name matching.
+            let ambiguous = ServiceFileMatcher.ambiguousNameCandidates(across: found)
+            // Installed copies sharing one bundle ID share their data: never pre-select it for removal.
+            var bundleIDCounts: [String: Int] = [:]
+            for app in found { bundleIDCounts[app.bundleID.lowercased(), default: 0] += 1 }
             for i in found.indices {
-                let matched = matcher.matchInMemory(app: found[i], index: index)
+                var matched = matcher.matchInMemory(app: found[i], index: index, ambiguousNames: ambiguous)
+                if (bundleIDCounts[found[i].bundleID.lowercased()] ?? 0) > 1 {
+                    found[i].sharesBundleIDWithOtherApp = true
+                    for j in matched.indices { matched[j].isSelected = false }
+                }
                 found[i].serviceFiles = matched
                 found[i].scanState = .ready
             }
             let pkgs = ServiceFileMatcher.listThirdPartyPackages()
-            return (found, index, pkgs)
+            return (found, index, pkgs, ambiguous)
         }.value
 
         guard gen == scanGeneration else { return }
         self.libraryIndex = index
         self.cachedThirdPartyPackages = thirdPartyPkgs
+        self.ambiguousNames = ambiguous
         self.apps = scannedApps
         self.isScanningApps = false
 
@@ -285,18 +300,28 @@ final class AppState: ObservableObject {
         }
         let guardCopy = safetyGuard
         let sizerRef = sizer
+        let ambiguous = ambiguousNames
+        let shared = targetApp.sharesBundleIDWithOtherApp
 
         Task.detached(priority: .userInitiated) { [weak self] in
             let matcher = ServiceFileMatcher(safetyGuard: guardCopy)
-            let result = matcher.matchWithPackages(app: targetApp, index: index, allPackageIDs: allPkgs)
+            let result = matcher.matchWithPackages(
+                app: targetApp,
+                index: index,
+                allPackageIDs: allPkgs,
+                ambiguousNames: ambiguous
+            )
             let allURLs = [targetApp.url] + result.files.map(\.url)
             let sizeMap = await sizerRef.sizes(of: allURLs, maxConcurrency: 6)
 
             var sizedFiles = result.files
             for i in sizedFiles.indices {
                 sizedFiles[i].size = sizeMap[sizedFiles[i].url.standardizedFileURL.path] ?? 0
+                if shared { sizedFiles[i].isSelected = false }
             }
             let bundleSize = sizeMap[targetApp.url.standardizedFileURL.path] ?? targetApp.bundleSize ?? 0
+            // A duplicate copy must not forget the shared installer receipt.
+            let pkgIDs = shared ? [] : result.matchedPackageIDs
 
             let immutableSized = sizedFiles
             await MainActor.run { [weak self] in
@@ -312,7 +337,7 @@ final class AppState: ObservableObject {
                 }
                 self.apps[liveIdx].bundleSize = bundleSize
                 self.apps[liveIdx].serviceFiles = merged
-                self.apps[liveIdx].matchedPackageIDs = result.matchedPackageIDs
+                self.apps[liveIdx].matchedPackageIDs = pkgIDs
                 self.apps[liveIdx].isRunning = AppScanner.runningBundleIDs().contains(
                     self.apps[liveIdx].bundleID.lowercased()
                 )
@@ -336,25 +361,38 @@ final class AppState: ObservableObject {
         let existingIndex = libraryIndex
         let existingPkgs = cachedThirdPartyPackages
         let sizerRef = sizer
+        let installedApps = apps
 
         Task.detached(priority: .userInitiated) { [weak self] in
             let scanner = AppScanner(safetyGuard: guardCopy)
             guard var inspected = scanner.inspectApp(at: url) else { return }
             let index = existingIndex ?? LibraryIndex.build(safetyGuard: guardCopy)
             let pkgs = existingPkgs ?? ServiceFileMatcher.listThirdPartyPackages()
+            let ambiguous = ServiceFileMatcher.ambiguousNameCandidates(across: installedApps + [inspected])
+            let shared = installedApps.contains {
+                $0.bundleID.lowercased() == inspected.bundleID.lowercased()
+                    && $0.url.standardizedFileURL.path != inspected.url.standardizedFileURL.path
+            }
             let matcher = ServiceFileMatcher(safetyGuard: guardCopy)
-            let matched = matcher.matchWithPackages(app: inspected, index: index, allPackageIDs: pkgs)
+            let matched = matcher.matchWithPackages(
+                app: inspected,
+                index: index,
+                allPackageIDs: pkgs,
+                ambiguousNames: ambiguous
+            )
 
             let urls = [inspected.url] + matched.files.map(\.url)
             let sizes = await sizerRef.sizes(of: urls, maxConcurrency: 6)
 
             inspected.bundleSize = sizes[inspected.url.standardizedFileURL.path] ?? 0
+            inspected.sharesBundleIDWithOtherApp = shared
             inspected.serviceFiles = matched.files.map { sf in
                 var copy = sf
                 copy.size = sizes[sf.url.standardizedFileURL.path] ?? 0
+                if shared { copy.isSelected = false }
                 return copy
             }
-            inspected.matchedPackageIDs = matched.matchedPackageIDs
+            inspected.matchedPackageIDs = shared ? [] : matched.matchedPackageIDs
             inspected.scanState = .ready
 
             let finalInspected = inspected
@@ -592,7 +630,8 @@ final class AppState: ObservableObject {
             affectedAppIDs: affectedIDs,
             affectedStartupIDs: [],
             affectedExtensionIDs: [],
-            affectedLeftoverIDs: []
+            affectedLeftoverIDs: [],
+            resetBundleIDs: isReset ? [app.bundleID] : []
         )
     }
 
@@ -601,40 +640,77 @@ final class AppState: ObservableObject {
         pendingConfirmation = nil
         isPerformingRemoval = true
 
-        // Quit running apps first (mandatory before reset to prevent cfprefsd writeback)
+        // 1. Quit running apps gracefully first. Never force-quit silently and never delete files of an
+        //    app that is still running (it may hold unsaved documents, and cfprefsd could write back).
         if !conf.runningAppBundleIDs.isEmpty {
             let stillRunning = await RemovalEngine.terminateRunningApps(
                 bundleIDs: conf.runningAppBundleIDs,
-                forceAfterTimeout: conf.isReset
+                forceAfterTimeout: false
             )
-            if !stillRunning.isEmpty && conf.isReset {
+            if !stillRunning.isEmpty {
                 isPerformingRemoval = false
                 banner = OperationBanner(
                     isError: true,
-                    message: l10n.t("无法退出正在运行的应用，已取消重置以防偏好回写。", "Could not quit running app; reset cancelled to avoid cfprefsd writeback."),
+                    message: l10n.t(
+                        "应用未能正常退出（可能有未保存的文档），已取消操作，未删除任何文件。请先手动退出，或确认后强制退出再重试。",
+                        "The app did not quit (it may have unsaved documents). Nothing was removed. Quit it manually, or force quit and retry."
+                    ),
                     showAppManagementLink: false,
-                    showFDALink: false
+                    showFDALink: false,
+                    forceQuitBundleIDs: stillRunning
                 )
                 return
-            }
-            // Brief settle for cfprefsd on reset
-            if conf.isReset {
-                try? await Task.sleep(nanoseconds: 250_000_000)
             }
         }
 
         let guardCopy = safetyGuard
         let histStore = historyStore
 
+        // 2. Unload launchd services whose plists are about to be removed (F2): bootout first, verify it is
+        //    no longer loaded, and only then allow the plist to be deleted.
+        let launchTargets = StartupController.launchTargets(for: conf.targets.map(\.url))
+        var targetsToRemove = conf.targets
+        var stillLoadedPlists = Set<String>()
+        if !launchTargets.isEmpty {
+            let unload = await Task.detached(priority: .userInitiated) {
+                StartupController(privilegedExecutor: PrivilegedExecutor(safetyGuard: guardCopy))
+                    .unloadBeforeRemoval(launchTargets)
+            }.value
+            if unload.cancelledByUser {
+                isPerformingRemoval = false
+                banner = OperationBanner(
+                    isError: false,
+                    message: l10n.t("已取消管理员授权，未删除任何文件。", "Administrator authorization cancelled. Nothing was removed."),
+                    showAppManagementLink: false,
+                    showFDALink: false
+                )
+                return
+            }
+            stillLoadedPlists = unload.stillLoadedPlists
+            targetsToRemove.removeAll { stillLoadedPlists.contains($0.url.standardizedFileURL.path) }
+        }
+
+        let removalTargets = targetsToRemove
         let report = await Task.detached(priority: .userInitiated) {
             let engine = RemovalEngine(safetyGuard: guardCopy, historyStore: histStore)
             return engine.remove(
-                targets: conf.targets,
+                targets: removalTargets,
                 mode: mode,
                 actionTitle: conf.title,
                 packageIDsToForget: conf.packageIDsToForget
             )
         }.value
+
+        // 3. Reset: flush cfprefsd's in-memory cache for the domain so stale values are not written back
+        //    or served on next launch. Best-effort and isolated (failure does not affect the removal result).
+        if conf.isReset && !report.succeededURLs.isEmpty {
+            let domains = conf.resetBundleIDs
+            await Task.detached(priority: .utility) {
+                for domain in domains {
+                    _ = ProcessRunner.run(executable: "/usr/bin/defaults", arguments: ["delete", domain])
+                }
+            }.value
+        }
 
         isPerformingRemoval = false
         cleanupHistory = historyStore.load()
@@ -654,7 +730,8 @@ final class AppState: ObservableObject {
         applyIncrementalRemoval(removedPaths: removedSet, confirmation: conf)
 
         // Show feedback banner
-        if report.failures.isEmpty {
+        let failureCount = report.failures.count + stillLoadedPlists.count
+        if failureCount == 0 {
             let freed = ByteFormatter.format(report.freedBytes)
             let msg = l10n.isChinese
                 ? "已完成：移除了 \(report.succeededURLs.count) 个项目，释放 \(freed)"
@@ -666,10 +743,11 @@ final class AppState: ObservableObject {
                 showFDALink: false
             )
         } else {
-            let firstErr = report.failures.first?.reason ?? ""
+            let firstErr = report.failures.first?.reason
+                ?? l10n.t("后台服务仍在运行，已保留其配置文件", "Launch service still loaded; its plist was kept")
             let msg = l10n.isChinese
-                ? "部分项目移除失败（成功 \(report.succeededURLs.count) 项，失败 \(report.failures.count) 项）：\(firstErr)"
-                : "Partial failure (\(report.succeededURLs.count) removed, \(report.failures.count) failed): \(firstErr)"
+                ? "部分项目移除失败（成功 \(report.succeededURLs.count) 项，失败 \(failureCount) 项）：\(firstErr)"
+                : "Partial failure (\(report.succeededURLs.count) removed, \(failureCount) failed): \(firstErr)"
             banner = OperationBanner(
                 isError: true,
                 message: msg,
@@ -677,6 +755,23 @@ final class AppState: ObservableObject {
                 showFDALink: false
             )
         }
+    }
+
+    /// Explicit, user-initiated force quit offered by the banner after a graceful quit timed out.
+    func forceQuitApps(bundleIDs: [String]) async {
+        let still = await RemovalEngine.terminateRunningApps(bundleIDs: bundleIDs, forceAfterTimeout: true, timeoutSeconds: 0.5)
+        let running = AppScanner.runningBundleIDs()
+        for i in apps.indices {
+            apps[i].isRunning = running.contains(apps[i].bundleID.lowercased())
+        }
+        banner = OperationBanner(
+            isError: !still.isEmpty,
+            message: still.isEmpty
+                ? l10n.t("已强制退出，请重新执行移除。", "Force quit done. Please run the removal again.")
+                : l10n.t("仍无法退出：\(still.joined(separator: ", "))", "Still running: \(still.joined(separator: ", "))"),
+            showAppManagementLink: false,
+            showFDALink: false
+        )
     }
 
     private func applyIncrementalRemoval(removedPaths: Set<String>, confirmation: PendingConfirmation) {

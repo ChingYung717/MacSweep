@@ -186,10 +186,14 @@ public struct RemovalEngine: Sendable {
             }
         }
 
-        // Process privileged batch + pkgutil receipts
-        if !privilegedQueue.isEmpty || (!packageIDsToForget.isEmpty && allowElevation) {
+        // Process privileged batch (+ pkgutil receipts in permanent mode).
+        // Receipts are only forgotten when:
+        //  - mode is `.permanent` (in Trash mode the app can be "Put Back", so its receipt must stay valid), and
+        //  - every non-privileged removal so far succeeded (never orphan a receipt of an app still on disk).
+        let pkgIDsForThisRun: [String] = (mode == .permanent && failures.isEmpty) ? packageIDsToForget : []
+
+        if !privilegedQueue.isEmpty || (!pkgIDsForThisRun.isEmpty && allowElevation) {
             let privURLs = privilegedQueue.map { $0.url.standardizedFileURL }
-            let privBytes = privilegedQueue.reduce(Int64(0)) { $0 + $1.estimatedSize }
 
             if !allowElevation {
                 for item in privilegedQueue {
@@ -200,6 +204,7 @@ public struct RemovalEngine: Sendable {
                     ))
                 }
             } else {
+                var batchError: Error?
                 do {
                     switch mode {
                     case .trash:
@@ -211,37 +216,39 @@ public struct RemovalEngine: Sendable {
                                 try privilegedExecutor.moveToTrashPrivileged(urls: privURLs)
                             }
                         }
-                        if !packageIDsToForget.isEmpty {
-                            try privilegedExecutor.removePermanentlyPrivileged(
-                                urls: [],
-                                packageIDsToForget: packageIDsToForget
-                            )
-                        }
                     case .permanent:
                         try privilegedExecutor.removePermanentlyPrivileged(
                             urls: privURLs,
-                            packageIDsToForget: packageIDsToForget
+                            packageIDsToForget: pkgIDsForThisRun
                         )
-                    }
-
-                    succeeded.append(contentsOf: privURLs)
-                    freedBytes += privBytes
-                    // If Finder succeeded on an .app that previously returned EPERM, clear appMgmt warning.
-                    if privURLs.allSatisfy({ !fm.fileExists(atPath: $0.path) }) {
-                        needsAppMgmt = false
                     }
                 } catch PrivilegedError.userCancelled {
                     cancelled = true
                 } catch {
+                    batchError = error
+                }
+
+                // Reconcile per item against the filesystem instead of trusting the batch exit status:
+                // `rm -rf` returns 0 for already-missing paths and Finder/admin batches can partially succeed.
+                if !cancelled {
                     for item in privilegedQueue {
-                        if item.url.pathExtension.lowercased() == "app" {
-                            needsAppMgmt = true
+                        let url = item.url.standardizedFileURL
+                        if Self.entryExists(url) {
+                            if url.pathExtension.lowercased() == "app" {
+                                needsAppMgmt = true
+                            }
+                            failures.append(RemovalFailure(
+                                url: url,
+                                reason: batchError?.localizedDescription ?? "Item still exists after privileged removal",
+                                isPermissionDenied: true
+                            ))
+                        } else {
+                            succeeded.append(url)
+                            freedBytes += item.estimatedSize
                         }
-                        failures.append(RemovalFailure(
-                            url: item.url,
-                            reason: error.localizedDescription,
-                            isPermissionDenied: true
-                        ))
+                    }
+                    if !privURLs.isEmpty && privURLs.allSatisfy({ !Self.entryExists($0) }) {
+                        needsAppMgmt = false
                     }
                 }
             }
@@ -266,6 +273,12 @@ public struct RemovalEngine: Sendable {
             usedFinderFallbackToAdmin: usedFallback,
             cancelledByUser: cancelled
         )
+    }
+
+    /// `lstat`-based existence check (treats dangling symlinks as existing, never follows links).
+    public static func entryExists(_ url: URL) -> Bool {
+        var st = stat()
+        return lstat(url.path, &st) == 0
     }
 
     private static func isPermissionDenied(_ error: NSError) -> Bool {

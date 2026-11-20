@@ -27,7 +27,8 @@ public enum ProcessRunner {
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         if let environment {
-            process.environment = environment
+            // Merge (not replace) so PATH / HOME / TMPDIR etc. are preserved; caller values win on conflict.
+            process.environment = ProcessInfo.processInfo.environment.merging(environment) { _, new in new }
         }
 
         let outPipe = Pipe()

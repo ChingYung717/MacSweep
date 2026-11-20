@@ -51,26 +51,53 @@ public struct ServiceFileMatcher: Sendable {
         "apple", "google", "microsoft", "adobe", "oracle", "docker",
     ]
 
+    /// Executable names of shared runtimes / launch shims. Many unrelated apps ship the same
+    /// `CFBundleExecutable` (e.g. Electron apps, NW.js apps, Chrome PWAs), so these must never be
+    /// used for name-based matching (they caused cross-app claims such as `CrashReporter/Electron_*.plist`).
+    public static let genericExecutableNames: Set<String> = [
+        "electron", "nwjs", "nw", "app_mode_loader", "launcher", "stub", "main", "run", "start",
+        "applet", "droplet", "java", "javaapplicationstub", "universalJavaApplicationStub".lowercased(),
+        "python", "python3", "node", "wine", "wine64", "wineloader", "qtwebengineprocess",
+        "cefsharp", "chromium", "helper", "updater", "bootstrap", "loader", "wrapper",
+    ]
+
     public let safetyGuard: SafetyGuard
 
     public init(safetyGuard: SafetyGuard = SafetyGuard()) {
         self.safetyGuard = safetyGuard
     }
 
-    /// Fast in-memory match against `LibraryIndex` (no disk traversal).
-    public func matchInMemory(app: AppItem, index: LibraryIndex) -> [ServiceFile] {
+    /// Name candidates (claimed by ≥2 installed apps) that must not be used for name-based matching.
+    /// Bundle-ID / App-Group / launchd-binary matches are unaffected.
+    public static func ambiguousNameCandidates(across apps: [AppItem]) -> Set<String> {
+        var counts: [String: Int] = [:]
+        for app in apps {
+            for name in Set(nameCandidates(for: app)) {
+                counts[name, default: 0] += 1
+            }
+        }
+        return Set(counts.filter { $0.value > 1 }.keys)
+    }
+
+    /// Fast in-memory match against `LibraryIndex` (no disk traversal, no per-entry safety I/O).
+    public func matchInMemory(
+        app: AppItem,
+        index: LibraryIndex,
+        ambiguousNames: Set<String> = []
+    ) -> [ServiceFile] {
         let lowerBundleID = app.bundleID.lowercased()
         let hasValidBundleID = !lowerBundleID.isEmpty && !lowerBundleID.hasPrefix("unknown.")
         let appBundlePath = app.url.standardizedFileURL.path
-        let nameCandidates = buildSafeNameCandidates(for: app)
+        let nameCandidates = Self.nameCandidates(for: app).filter { !ambiguousNames.contains($0) }
 
         var matched: [ServiceFile] = []
         var seenPaths = Set<String>()
 
         for entry in index.entries {
-            let entryPath = entry.url.standardizedFileURL.path
+            // Safety validation was precomputed once per entry at index time.
+            guard entry.isRemovable else { continue }
+            let entryPath = entry.url.path
             guard !seenPaths.contains(entryPath) else { continue }
-            guard safetyGuard.validateForRemoval(entry.url).isAllowed else { continue }
 
             // Avoid matching Apple system files for non-Apple apps.
             if !app.isAppleAppStoreApp && entry.normalizedName.hasPrefix("com.apple.") {
@@ -110,9 +137,10 @@ public struct ServiceFileMatcher: Sendable {
     public func matchWithPackages(
         app: AppItem,
         index: LibraryIndex,
-        allPackageIDs: [String]
+        allPackageIDs: [String],
+        ambiguousNames: Set<String> = []
     ) -> ServiceMatchResult {
-        var files = matchInMemory(app: app, index: index)
+        var files = matchInMemory(app: app, index: index, ambiguousNames: ambiguousNames)
         var seenPaths = Set(files.map { $0.url.standardizedFileURL.path })
         seenPaths.insert(app.url.standardizedFileURL.path)
 
@@ -334,12 +362,13 @@ public struct ServiceFileMatcher: Sendable {
         return nil
     }
 
-    private func buildSafeNameCandidates(for app: AppItem) -> [String] {
+    public static func nameCandidates(for app: AppItem) -> [String] {
         var rawNames: [String] = [app.name]
         if app.localizedName != app.name {
             rawNames.append(app.localizedName)
         }
-        if let exec = app.executableName {
+        if let exec = app.executableName,
+           !genericExecutableNames.contains(exec.lowercased()) {
             rawNames.append(exec)
         }
 
