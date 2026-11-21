@@ -1,6 +1,19 @@
 import AppKit
 import CoreServices
 import Foundation
+import Security
+
+public struct RunningProcessMatch: Sendable, Equatable {
+    public let bundleID: String
+    public let name: String
+    public let pid: pid_t
+
+    public init(bundleID: String, name: String, pid: pid_t) {
+        self.bundleID = bundleID
+        self.name = name
+        self.pid = pid
+    }
+}
 
 public struct AppScanner: Sendable {
     public let searchRoots: [URL]
@@ -32,6 +45,14 @@ public struct AppScanner: Sendable {
         self.safetyGuard = safetyGuard
     }
 
+    /// Safely removes a trailing `.app` suffix (case-insensitive) without corrupting interior occurrences.
+    public static func strippingAppExtension(_ name: String) -> String {
+        if name.lowercased().hasSuffix(".app") {
+            return String(name.dropLast(4))
+        }
+        return name
+    }
+
     /// Returns bundle IDs of currently running macOS apps.
     public static func runningBundleIDs() -> Set<String> {
         var ids = Set<String>()
@@ -43,8 +64,41 @@ public struct AppScanner: Sendable {
         return ids
     }
 
+    /// Returns running processes matching any target bundle ID OR whose `bundleURL` lives inside
+    /// any target `.app` bundle (catches embedded MenuBar / Helper processes).
+    public static func runningProcesses(
+        matchingBundleIDs bundleIDs: [String],
+        bundleURLs: [URL]
+    ) -> [RunningProcessMatch] {
+        let lowerIDs = Set(bundleIDs.map { $0.lowercased() }.filter { !$0.isEmpty && !$0.hasPrefix("unknown.") })
+        let appPaths = bundleURLs.map { $0.standardizedFileURL.path }
+        guard !lowerIDs.isEmpty || !appPaths.isEmpty else { return [] }
+
+        var matches: [RunningProcessMatch] = []
+        var seenPIDs = Set<pid_t>()
+
+        for proc in NSWorkspace.shared.runningApplications where !proc.isTerminated {
+            let bid = proc.bundleIdentifier ?? ""
+            let procPath = proc.bundleURL?.standardizedFileURL.path
+            let matchedByID = !bid.isEmpty && lowerIDs.contains(bid.lowercased())
+            let matchedByPath = procPath.map { p in
+                appPaths.contains { base in p == base || p.hasPrefix(base + "/") }
+            } ?? false
+
+            if (matchedByID || matchedByPath), seenPIDs.insert(proc.processIdentifier).inserted {
+                matches.append(RunningProcessMatch(
+                    bundleID: bid,
+                    name: proc.localizedName ?? bid,
+                    pid: proc.processIdentifier
+                ))
+            }
+        }
+        return matches
+    }
+
     public func scanApplications(runningIDs: Set<String>? = nil) -> [AppItem] {
         let activeRunning = runningIDs ?? Self.runningBundleIDs()
+        let runningBundlePaths = Self.runningAppBundlePaths()
         var discoveredURLs: [URL] = []
         var seenPaths = Set<String>()
         let fm = FileManager.default
@@ -68,7 +122,6 @@ public struct AppScanner: Sendable {
                     continue
                 }
 
-                // Recurse 1 level into subfolders (e.g. Setapp, JetBrains, Utilities if enabled).
                 if depth == 0 {
                     let isUtilities = item.lastPathComponent == "Utilities"
                     if isUtilities && !includeUtilities {
@@ -90,12 +143,14 @@ public struct AppScanner: Sendable {
         apps.reserveCapacity(discoveredURLs.count)
 
         for appURL in discoveredURLs {
-            guard let item = inspectApp(at: appURL, runningIDs: activeRunning) else { continue }
-            if item.isSystemProtected && !showSystemApps {
+            guard let item = inspectApp(
+                at: appURL,
+                runningIDs: activeRunning,
+                runningBundlePaths: runningBundlePaths
+            ) else {
                 continue
             }
-            // Hide MacSweep itself from accidental self-uninstall list.
-            if item.bundleID.lowercased() == "local.macsweep" {
+            if item.isSystemProtected && !showSystemApps {
                 continue
             }
             apps.append(item)
@@ -105,14 +160,18 @@ public struct AppScanner: Sendable {
     }
 
     /// Inspects any single `.app` bundle (used both by scanner and Drag & Drop quick uninstall).
-    public func inspectApp(at appURL: URL, runningIDs: Set<String>? = nil) -> AppItem? {
+    /// Returns `nil` for MacSweep itself to prevent self-uninstall/self-reset via drag & drop.
+    public func inspectApp(
+        at appURL: URL,
+        runningIDs: Set<String>? = nil,
+        runningBundlePaths: [String]? = nil
+    ) -> AppItem? {
         let fm = FileManager.default
         guard appURL.pathExtension.lowercased() == "app",
               fm.fileExists(atPath: appURL.path) else {
             return nil
         }
 
-        let activeRunning = runningIDs ?? Self.runningBundleIDs()
         let rawName = appURL.deletingPathExtension().lastPathComponent
         let bundle = Bundle(url: appURL)
         let info = bundle?.infoDictionary ?? [:]
@@ -120,6 +179,14 @@ public struct AppScanner: Sendable {
 
         let bundleID = (info["CFBundleIdentifier"] as? String)
             ?? "unknown.\(rawName.lowercased().replacingOccurrences(of: " ", with: "-"))"
+
+        // Block MacSweep itself everywhere (both normal scan and Drag & Drop).
+        if safetyGuard.isSelfApp(bundleID: bundleID, url: appURL) {
+            return nil
+        }
+
+        let activeRunning = runningIDs ?? Self.runningBundleIDs()
+        let activePaths = runningBundlePaths ?? Self.runningAppBundlePaths()
         let version = (info["CFBundleShortVersionString"] as? String)
             ?? (info["CFBundleVersion"] as? String)
             ?? ""
@@ -131,11 +198,10 @@ public struct AppScanner: Sendable {
             ?? (info["CFBundleName"] as? String)
             ?? rawName
 
-        let localizedViaFS = fm.displayName(atPath: appURL.path)
-            .replacingOccurrences(of: ".app", with: "")
+        let localizedViaFS = Self.strippingAppExtension(fm.displayName(atPath: appURL.path))
         let finalLocalizedName = !localizedViaFS.isEmpty ? localizedViaFS : displayName
 
-        let teamID = Self.extractTeamIdentifier(from: info)
+        let teamID = Self.extractTeamIdentifier(at: appURL)
         let resVals = try? appURL.resourceValues(forKeys: [.contentModificationDateKey, .contentAccessDateKey])
         let spotlightLastUsed = Self.spotlightLastUsedDate(for: appURL)
         let lastUsed = spotlightLastUsed ?? resVals?.contentAccessDate
@@ -145,7 +211,9 @@ public struct AppScanner: Sendable {
         let isAppleAppStoreApp = !isSystemProtected && safetyGuard.isAppleBundleID(bundleID)
         let isUserProtected = safetyGuard.isUserProtected(bundleID: bundleID, url: appURL)
         let requiresAdmin = safetyGuard.requiresAdmin(for: appURL)
+        let stdAppPath = appURL.standardizedFileURL.path
         let isRunning = activeRunning.contains(bundleID.lowercased())
+            || activePaths.contains { $0 == stdAppPath || $0.hasPrefix(stdAppPath + "/") }
 
         return AppItem(
             url: appURL,
@@ -170,6 +238,10 @@ public struct AppScanner: Sendable {
         )
     }
 
+    private static func runningAppBundlePaths() -> [String] {
+        NSWorkspace.shared.runningApplications.compactMap { $0.bundleURL?.standardizedFileURL.path }
+    }
+
     private static func spotlightLastUsedDate(for url: URL) -> Date? {
         guard let item = MDItemCreateWithURL(kCFAllocatorDefault, url as CFURL) else {
             return nil
@@ -180,13 +252,21 @@ public struct AppScanner: Sendable {
         return value as? Date
     }
 
-    private static func extractTeamIdentifier(from info: [String: Any]) -> String? {
-        if let groups = info["AppGroups"] as? [String], let first = groups.first {
-            let parts = first.split(separator: ".")
-            if let team = parts.first, team.count == 10 {
-                return String(team)
-            }
+    /// Reads the real code-signing Team Identifier via Security framework (no subprocess overhead).
+    private static func extractTeamIdentifier(at appURL: URL) -> String? {
+        var staticCode: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(appURL as CFURL, SecCSFlags(), &staticCode) == errSecSuccess,
+              let code = staticCode else {
+            return nil
         }
-        return nil
+        var infoRef: CFDictionary?
+        let flags = SecCSFlags(rawValue: kSecCSSigningInformation)
+        guard SecCodeCopySigningInformation(code, flags, &infoRef) == errSecSuccess,
+              let dict = infoRef as? [String: Any],
+              let team = dict[kSecCodeInfoTeamIdentifier as String] as? String,
+              !team.isEmpty else {
+            return nil
+        }
+        return team
     }
 }

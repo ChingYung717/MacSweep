@@ -48,6 +48,8 @@ public struct AppItem: Identifiable, Hashable, Sendable {
     /// Another installed copy uses the same bundle ID (e.g. a renamed duplicate), so its
     /// service files are shared and must not be pre-selected for removal.
     public var sharesBundleIDWithOtherApp: Bool = false
+    /// Prevents redundant `pkgutil` re-enrichment on repeated selection of apps without receipts.
+    public var hasEnrichedPackages: Bool = false
 
     public init(
         url: URL,

@@ -81,6 +81,25 @@ public struct LibraryIndex: Sendable {
         self.createdAt = createdAt
     }
 
+    /// Returns a new index with any entries matching `paths` (or nested under them) pruned.
+    public func removing(paths: Set<String>) -> LibraryIndex {
+        guard !paths.isEmpty else { return self }
+        let filtered = entries.filter { entry in
+            let p = entry.url.standardizedFileURL.path
+            if paths.contains(p) { return false }
+            for removed in paths where p.hasPrefix(removed + "/") {
+                return false
+            }
+            return true
+        }
+        return LibraryIndex(
+            entries: filtered,
+            userLibraryURL: userLibraryURL,
+            systemLibraryURL: systemLibraryURL,
+            createdAt: createdAt
+        )
+    }
+
     public static func build(
         userLibraryURL: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library"),
         systemLibraryURL: URL = URL(fileURLWithPath: "/Library"),
@@ -143,6 +162,12 @@ public struct LibraryIndex: Sendable {
                 }
                 // Skip ByHost inside Preferences since it has its own spec.
                 if relPath == "Preferences" && lowerName == "byhost" {
+                    continue
+                }
+
+                // Never index or expand macOS's own `Apple` support/caches directories
+                // (e.g. `/Library/Application Support/Apple/{BezelServices,Remote Desktop,EmbeddedOSInstall}`).
+                if lowerName == "apple" {
                     continue
                 }
 

@@ -44,6 +44,8 @@ public struct ServiceFile: Identifiable, Hashable, Sendable {
     public var isSelected: Bool
     public let requiresAdmin: Bool
     public let requiresReboot: Bool
+    public let isSystemScope: Bool
+    public let confidence: LeftoverConfidence?
     public let matchReason: String
 
     public init(
@@ -53,6 +55,8 @@ public struct ServiceFile: Identifiable, Hashable, Sendable {
         isSelected: Bool = true,
         requiresAdmin: Bool = false,
         requiresReboot: Bool = false,
+        isSystemScope: Bool = false,
+        confidence: LeftoverConfidence? = nil,
         matchReason: String = ""
     ) {
         self.id = url.path
@@ -62,6 +66,8 @@ public struct ServiceFile: Identifiable, Hashable, Sendable {
         self.isSelected = isSelected
         self.requiresAdmin = requiresAdmin
         self.requiresReboot = requiresReboot
+        self.isSystemScope = isSystemScope
+        self.confidence = confidence
         self.matchReason = matchReason
     }
 

@@ -144,14 +144,29 @@ struct L10n {
     var adminAuthNote: String { t("包含系统/受限目录项，确认后将弹出系统授权（优先委托 Finder 保留「放回原处」）。", "Includes root/protected paths. System authorization will be requested (delegating to Finder first to preserve Put Back).") }
     var chromiumSyncNote: String { t("提示：若浏览器开启了账号云同步，移除的扩展可能会在下次同步时自动恢复。", "Note: If browser account sync is enabled, removed extensions may be restored automatically on next sync.") }
 
+    @MainActor
+    private static let zhDateFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "zh_CN")
+        df.dateFormat = "yyyy年M月d日"
+        return df
+    }()
+
+    @MainActor
+    private static let enDateFormatter: DateFormatter = {
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US")
+        df.dateFormat = "MMM d, yyyy"
+        return df
+    }()
+
+    @MainActor
     func formatDate(_ date: Date?) -> String {
         guard let date else { return t("未知日期", "Unknown") }
-        let df = DateFormatter()
-        df.locale = Locale(identifier: isChinese ? "zh_CN" : "en_US")
-        df.dateFormat = isChinese ? "yyyy年M月d日" : "MMM d, yyyy"
-        return df.string(from: date)
+        return isChinese ? Self.zhDateFormatter.string(from: date) : Self.enDateFormatter.string(from: date)
     }
 
+    @MainActor
     func selectedSummary(count: Int, bytes: Int64) -> String {
         if isChinese {
             return "已选 \(count) 项 · \(ByteFormatter.format(bytes))"

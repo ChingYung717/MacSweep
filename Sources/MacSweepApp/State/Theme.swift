@@ -97,12 +97,18 @@ struct AppPalette {
 }
 
 enum ByteFormatter {
-    static func format(_ bytes: Int64) -> String {
+    @MainActor
+    private static let shared: ByteCountFormatter = {
         let formatter = ByteCountFormatter()
         formatter.allowedUnits = [.useBytes, .useKB, .useMB, .useGB, .useTB]
         formatter.countStyle = .file
         formatter.includesUnit = true
         formatter.isAdaptive = true
-        return formatter.string(fromByteCount: max(0, bytes))
+        return formatter
+    }()
+
+    @MainActor
+    static func format(_ bytes: Int64) -> String {
+        shared.string(fromByteCount: max(0, bytes))
     }
 }

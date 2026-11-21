@@ -43,6 +43,8 @@ public struct ExtensionItem: Identifiable, Hashable, Sendable {
     public let path: URL
     public let profileName: String?
     public let hostAppPath: URL?
+    public let hostAppExists: Bool
+    public let pathExists: Bool
     public let browserBundleID: String?
     public var size: Int64
     public var isEnabled: Bool
@@ -60,6 +62,8 @@ public struct ExtensionItem: Identifiable, Hashable, Sendable {
         path: URL,
         profileName: String? = nil,
         hostAppPath: URL? = nil,
+        hostAppExists: Bool = false,
+        pathExists: Bool = true,
         browserBundleID: String? = nil,
         size: Int64 = 0,
         isEnabled: Bool = true,
@@ -77,6 +81,8 @@ public struct ExtensionItem: Identifiable, Hashable, Sendable {
         self.path = path
         self.profileName = profileName
         self.hostAppPath = hostAppPath
+        self.hostAppExists = hostAppExists
+        self.pathExists = pathExists
         self.browserBundleID = browserBundleID
         self.size = size
         self.isEnabled = isEnabled

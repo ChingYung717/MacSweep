@@ -60,9 +60,44 @@ public struct ExtensionScanner: Sendable {
         self.safetyGuard = safetyGuard
     }
 
-    public func scanAll(
+    /// Scans all browser & macOS extensions, computing directory sizes concurrently via `sizer`.
+    public func scanAllAsync(
+        sizer: DirectorySizer = DirectorySizer(),
         includePluginkit: Bool = true
-    ) -> ExtensionScanResult {
+    ) async -> ExtensionScanResult {
+        var result = scanMetadataOnly(includePluginkit: includePluginkit)
+        let urls = result.items.filter(\.pathExists).map(\.path)
+        let sizeMap = await sizer.sizes(of: urls, maxConcurrency: 6)
+        var sizedItems = result.items
+        for i in sizedItems.indices {
+            if let sz = sizeMap[sizedItems[i].path.standardizedFileURL.path] {
+                sizedItems[i].size = sz
+            }
+        }
+        result = ExtensionScanResult(
+            items: sizedItems,
+            needsFullDiskAccessForBrowsers: result.needsFullDiskAccessForBrowsers,
+            blockedBrowserNames: result.blockedBrowserNames
+        )
+        return result
+    }
+
+    /// Synchronous convenience entry point (computes sizes sequentially; used by CLI audits/tests).
+    public func scanAll(includePluginkit: Bool = true) -> ExtensionScanResult {
+        let meta = scanMetadataOnly(includePluginkit: includePluginkit)
+        let sized = meta.items.map { item -> ExtensionItem in
+            var copy = item
+            copy.size = item.pathExists ? DirectorySizer.computeSizeSync(of: item.path) : 0
+            return copy
+        }
+        return ExtensionScanResult(
+            items: sized,
+            needsFullDiskAccessForBrowsers: meta.needsFullDiskAccessForBrowsers,
+            blockedBrowserNames: meta.blockedBrowserNames
+        )
+    }
+
+    private func scanMetadataOnly(includePluginkit: Bool) -> ExtensionScanResult {
         var items: [ExtensionItem] = []
         var blockedBrowsers: [String] = []
         var needsFDA = false
@@ -87,28 +122,29 @@ public struct ExtensionScanner: Sendable {
             items.append(contentsOf: scanChromiumUserData(
                 at: rootURL,
                 category: browser.category,
-                browserBundleID: browser.bundleID
+                browserBundleID: browser.bundleID,
+                computeSize: false
             ))
         }
 
-        // 2. Firefox
-        let firefoxProfilesURL = homeDirectory.appendingPathComponent("Library/Application Support/Firefox/Profiles")
-        if fm.fileExists(atPath: firefoxProfilesURL.path) {
-            if !PermissionChecker.canReadDirectory(firefoxProfilesURL) {
+        // 2. Firefox (supports `profiles.ini` custom paths + fallback to `Profiles/`)
+        let firefoxBaseURL = homeDirectory.appendingPathComponent("Library/Application Support/Firefox")
+        if fm.fileExists(atPath: firefoxBaseURL.path) {
+            if !PermissionChecker.canReadDirectory(firefoxBaseURL) {
                 needsFDA = true
                 blockedBrowsers.append("Firefox")
             } else {
-                items.append(contentsOf: scanFirefoxProfiles(at: firefoxProfilesURL))
+                items.append(contentsOf: scanFirefoxBase(at: firefoxBaseURL, computeSize: false))
             }
         }
 
-        // 3. Safari & macOS App Extensions via pluginkit (always works without FDA; .appex canRemove = false)
+        // 3. Safari & macOS App Extensions via pluginkit
         if includePluginkit {
-            items.append(contentsOf: scanPluginkitExtensions())
+            items.append(contentsOf: scanPluginkitExtensions(computeSize: false))
         }
 
         // 4. macOS System Plugin Directories (~/Library and /Library)
-        items.append(contentsOf: scanSystemPluginDirectories())
+        items.append(contentsOf: scanSystemPluginDirectories(computeSize: false))
 
         let sorted = items.sorted { lhs, rhs in
             if lhs.category != rhs.category {
@@ -129,7 +165,8 @@ public struct ExtensionScanner: Sendable {
     public func scanChromiumUserData(
         at userDataURL: URL,
         category: ExtensionCategory,
-        browserBundleID: String
+        browserBundleID: String,
+        computeSize: Bool = true
     ) -> [ExtensionItem] {
         let fm = FileManager.default
         guard let children = try? fm.contentsOfDirectory(
@@ -155,14 +192,14 @@ public struct ExtensionScanner: Sendable {
             let profileName = profileDir.lastPathComponent
             for extDir in extDirs {
                 let extID = extDir.lastPathComponent
-                // Skip Chromium built-in temp folder
                 if extID == "Temp" { continue }
                 guard let parsed = Self.parseChromiumExtensionDirectory(
                     extDir,
                     extID: extID,
                     profileName: profileName,
                     category: category,
-                    browserBundleID: browserBundleID
+                    browserBundleID: browserBundleID,
+                    computeSize: computeSize
                 ) else {
                     continue
                 }
@@ -177,7 +214,8 @@ public struct ExtensionScanner: Sendable {
         extID: String,
         profileName: String,
         category: ExtensionCategory,
-        browserBundleID: String
+        browserBundleID: String,
+        computeSize: Bool = true
     ) -> ExtensionItem? {
         let fm = FileManager.default
         guard let versionDirs = try? fm.contentsOfDirectory(
@@ -188,7 +226,6 @@ public struct ExtensionScanner: Sendable {
             return nil
         }
 
-        // Pick latest version directory containing manifest.json
         let sortedVersions = versionDirs
             .filter { fm.fileExists(atPath: $0.appendingPathComponent("manifest.json").path) }
             .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedDescending }
@@ -217,8 +254,10 @@ public struct ExtensionScanner: Sendable {
             path: extDir,
             profileName: profileName,
             hostAppPath: nil,
+            hostAppExists: false,
+            pathExists: true,
             browserBundleID: browserBundleID,
-            size: DirectorySizer.computeSizeSync(of: extDir),
+            size: computeSize ? DirectorySizer.computeSizeSync(of: extDir) : 0,
             isEnabled: true,
             canToggle: false,
             canRemove: true,
@@ -255,7 +294,6 @@ public struct ExtensionScanner: Sendable {
                   let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 continue
             }
-            // Chromium message keys are case-insensitive
             if let entry = dict[key] as? [String: Any], let msg = entry["message"] as? String, !msg.isEmpty {
                 return msg
             }
@@ -269,31 +307,96 @@ public struct ExtensionScanner: Sendable {
         return raw
     }
 
-    // MARK: - Firefox Scanner
+    // MARK: - Firefox Scanner (profiles.ini + Profiles/ fallback)
 
-    public func scanFirefoxProfiles(at profilesRoot: URL) -> [ExtensionItem] {
+    public func scanFirefoxBase(at firefoxBaseURL: URL, computeSize: Bool = true) -> [ExtensionItem] {
         let fm = FileManager.default
-        guard let profiles = try? fm.contentsOfDirectory(
+        var profileDirs: [URL] = []
+        var seenPaths = Set<String>()
+
+        let iniURL = firefoxBaseURL.appendingPathComponent("profiles.ini")
+        if let iniText = try? String(contentsOf: iniURL, encoding: .utf8) {
+            for dir in Self.parseFirefoxProfilesINI(iniText, firefoxBaseURL: firefoxBaseURL) {
+                let p = dir.standardizedFileURL.path
+                if fm.fileExists(atPath: p), seenPaths.insert(p).inserted {
+                    profileDirs.append(dir)
+                }
+            }
+        }
+
+        // Also include any folders inside `Profiles/` not listed in `profiles.ini`
+        let profilesRoot = firefoxBaseURL.appendingPathComponent("Profiles")
+        if let dirs = try? fm.contentsOfDirectory(
             at: profilesRoot,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
-        ) else {
-            return []
+        ) {
+            for dir in dirs {
+                let p = dir.standardizedFileURL.path
+                if seenPaths.insert(p).inserted {
+                    profileDirs.append(dir)
+                }
+            }
         }
 
         var results: [ExtensionItem] = []
-        for profile in profiles {
+        for profile in profileDirs {
             let extJSON = profile.appendingPathComponent("extensions.json")
             guard let data = try? Data(contentsOf: extJSON) else { continue }
             results.append(contentsOf: Self.parseFirefoxExtensionsJSON(
                 data,
-                profileName: profile.lastPathComponent
+                profileName: profile.lastPathComponent,
+                computeSize: computeSize
             ))
         }
         return results
     }
 
-    public static func parseFirefoxExtensionsJSON(_ data: Data, profileName: String) -> [ExtensionItem] {
+    /// Parses Mozilla `profiles.ini` sections (`[Profile*]`) into resolved profile directory URLs.
+    public static func parseFirefoxProfilesINI(_ content: String, firefoxBaseURL: URL) -> [URL] {
+        var results: [URL] = []
+        var inProfileSection = false
+        var currentPath: String?
+        var currentIsRelative = true
+
+        func flushSection() {
+            guard inProfileSection, let path = currentPath, !path.isEmpty else { return }
+            if currentIsRelative {
+                results.append(firefoxBaseURL.appendingPathComponent(path).standardizedFileURL)
+            } else {
+                results.append(URL(fileURLWithPath: path).standardizedFileURL)
+            }
+        }
+
+        for rawLine in content.split(whereSeparator: \.isNewline) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty || line.hasPrefix(";") || line.hasPrefix("#") { continue }
+            if line.hasPrefix("[") && line.hasSuffix("]") {
+                flushSection()
+                let header = String(line.dropFirst().dropLast()).lowercased()
+                inProfileSection = header.hasPrefix("profile")
+                currentPath = nil
+                currentIsRelative = true
+                continue
+            }
+            guard inProfileSection, let eq = line.firstIndex(of: "=") else { continue }
+            let key = line[..<eq].trimmingCharacters(in: .whitespaces).lowercased()
+            let val = line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+            switch key {
+            case "path": currentPath = val
+            case "isrelative": currentIsRelative = (val != "0")
+            default: break
+            }
+        }
+        flushSection()
+        return results
+    }
+
+    public static func parseFirefoxExtensionsJSON(
+        _ data: Data,
+        profileName: String,
+        computeSize: Bool = true
+    ) -> [ExtensionItem] {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let addons = root["addons"] as? [[String: Any]] else {
             return []
@@ -329,8 +432,10 @@ public struct ExtensionScanner: Sendable {
                 path: url,
                 profileName: profileName,
                 hostAppPath: nil,
+                hostAppExists: false,
+                pathExists: exists,
                 browserBundleID: "org.mozilla.firefox",
-                size: exists ? DirectorySizer.computeSizeSync(of: url) : 0,
+                size: (computeSize && exists) ? DirectorySizer.computeSizeSync(of: url) : 0,
                 isEnabled: active,
                 canToggle: false,
                 canRemove: exists,
@@ -343,7 +448,7 @@ public struct ExtensionScanner: Sendable {
 
     // MARK: - Safari & macOS App Extensions (pluginkit)
 
-    private func scanPluginkitExtensions() -> [ExtensionItem] {
+    private func scanPluginkitExtensions(computeSize: Bool) -> [ExtensionItem] {
         let safariWebRes = ProcessRunner.run(executable: "/usr/bin/pluginkit", arguments: ["-m", "-v", "-p", "com.apple.Safari.web-extension"])
         let safariLegacyRes = ProcessRunner.run(executable: "/usr/bin/pluginkit", arguments: ["-m", "-v", "-p", "com.apple.Safari.extension"])
         let allRes = ProcessRunner.run(executable: "/usr/bin/pluginkit", arguments: ["-m", "-v"])
@@ -354,6 +459,7 @@ public struct ExtensionScanner: Sendable {
         }
 
         let allEntries = Self.parsePluginkitOutput(allRes.stdout)
+        let fm = FileManager.default
         var results: [ExtensionItem] = []
         var seen = Set<String>()
 
@@ -364,6 +470,8 @@ public struct ExtensionScanner: Sendable {
             let url = URL(fileURLWithPath: entry.path)
             let isSafari = safariIDs.contains(entry.identifier)
             let hostApp = StartupScanner.extractEnclosingApp(from: [entry.path]).map { URL(fileURLWithPath: $0.path) }
+            let hostExists = hostApp.map { fm.fileExists(atPath: $0.path) } ?? false
+            let pathExists = fm.fileExists(atPath: url.path)
 
             let bundle = Bundle(url: url)
             let displayName = (bundle?.localizedInfoDictionary?["CFBundleDisplayName"] as? String)
@@ -379,8 +487,10 @@ public struct ExtensionScanner: Sendable {
                 path: url,
                 profileName: hostApp?.deletingPathExtension().lastPathComponent,
                 hostAppPath: hostApp,
+                hostAppExists: hostExists,
+                pathExists: pathExists,
                 browserBundleID: isSafari ? "com.apple.Safari" : nil,
-                size: DirectorySizer.computeSizeSync(of: url),
+                size: (computeSize && pathExists) ? DirectorySizer.computeSizeSync(of: url) : 0,
                 isEnabled: entry.isEnabled,
                 canToggle: true,
                 canRemove: false, // Embedded .appex MUST NOT be individually deleted (breaks host app signature)
@@ -399,11 +509,20 @@ public struct ExtensionScanner: Sendable {
     }
 
     /// Parses `pluginkit -m -v` lines, excluding `/System/` Apple system extensions.
+    ///
+    /// Documented `pluginkit` status flags (`man pluginkit`):
+    /// - `+` : explicitly enabled (`isEnabled = true`)
+    /// - `-` : explicitly disabled (`isEnabled = false`)
+    /// - `!` : has sole-decision / error state (`isEnabled = false`)
+    /// - `=` : superseded by newer version (`isEnabled = false`)
+    /// - `?` : unknown election state (`isEnabled = false`)
+    /// - blank: default (not opted-in by user -> `isEnabled = false`)
     public static func parsePluginkitOutput(_ output: String) -> [PluginkitEntry] {
+        let statusChars: Set<Character> = ["+", "-", "!", "=", "?"]
         var entries: [PluginkitEntry] = []
+
         for rawLine in output.split(whereSeparator: \.isNewline) {
             let line = String(rawLine)
-            // Lines with extensions have tab-separated columns: `<flags><id>(<ver>)\t<uuid>\t<date>\t<path>`
             let columns = line.split(separator: "\t", omittingEmptySubsequences: false)
             guard columns.count >= 4 else { continue }
 
@@ -415,18 +534,15 @@ public struct ExtensionScanner: Sendable {
                 continue
             }
 
-            let trimmedHead = head.trimmingCharacters(in: .whitespaces)
-            var isEnabled = true
-            var idAndVer = trimmedHead
-            if trimmedHead.hasPrefix("+") {
-                isEnabled = true
-                idAndVer = String(trimmedHead.dropFirst()).trimmingCharacters(in: .whitespaces)
-            } else if trimmedHead.hasPrefix("-") {
-                isEnabled = false
-                idAndVer = String(trimmedHead.dropFirst()).trimmingCharacters(in: .whitespaces)
-            } else if trimmedHead.hasPrefix("!") {
-                isEnabled = false
-                idAndVer = String(trimmedHead.dropFirst()).trimmingCharacters(in: .whitespaces)
+            var idAndVer = head.trimmingCharacters(in: .whitespaces)
+            var isEnabled = false
+
+            // Strip any leading documented status markers (`+`, `-`, `!`, `=`, `?`)
+            while let first = idAndVer.first, statusChars.contains(first) {
+                if first == "+" {
+                    isEnabled = true
+                }
+                idAndVer = String(idAndVer.dropFirst()).trimmingCharacters(in: .whitespaces)
             }
 
             var identifier = idAndVer
@@ -452,7 +568,7 @@ public struct ExtensionScanner: Sendable {
 
     // MARK: - System Plugin Directories
 
-    public func scanSystemPluginDirectories() -> [ExtensionItem] {
+    public func scanSystemPluginDirectories(computeSize: Bool = true) -> [ExtensionItem] {
         let userLib = homeDirectory.appendingPathComponent("Library")
         let specs: [(dir: URL, category: ExtensionCategory, isHAL: Bool)] = [
             (userLib.appendingPathComponent("PreferencePanes"), .preferencePane, false),
@@ -506,8 +622,10 @@ public struct ExtensionScanner: Sendable {
                     path: itemURL,
                     profileName: spec.isHAL ? "HAL Audio Driver" : nil,
                     hostAppPath: nil,
+                    hostAppExists: false,
+                    pathExists: true,
                     browserBundleID: nil,
-                    size: DirectorySizer.computeSizeSync(of: itemURL),
+                    size: computeSize ? DirectorySizer.computeSizeSync(of: itemURL) : 0,
                     isEnabled: true,
                     canToggle: false,
                     canRemove: true,

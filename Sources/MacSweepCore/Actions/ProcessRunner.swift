@@ -72,10 +72,41 @@ public enum ProcessRunner {
     }
 
     /// Escapes a string literal for embedding inside an AppleScript double-quoted string.
+    /// Note: For strings that may contain CR/LF (e.g. `Icon\r`), prefer `appleScriptExpression(_:)`.
     public static func appleScriptEscape(_ value: String) -> String {
         value
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    /// Produces a complete AppleScript string expression preserving literal `\r` and `\n`
+    /// (AppleScript compiler otherwise silently normalizes raw `\r` inside quotes into `\n`).
+    public static func appleScriptExpression(_ value: String) -> String {
+        var parts: [String] = []
+        var buffer = ""
+
+        func flushBuffer() {
+            if !buffer.isEmpty || parts.isEmpty {
+                parts.append("\"\(appleScriptEscape(buffer))\"")
+                buffer = ""
+            }
+        }
+
+        for scalar in value.unicodeScalars {
+            if scalar == "\r" {
+                if !buffer.isEmpty { flushBuffer() }
+                parts.append("return")
+            } else if scalar == "\n" {
+                if !buffer.isEmpty { flushBuffer() }
+                parts.append("linefeed")
+            } else {
+                buffer.unicodeScalars.append(scalar)
+            }
+        }
+        if !buffer.isEmpty || parts.isEmpty {
+            flushBuffer()
+        }
+        return parts.joined(separator: " & ")
     }
 }
 

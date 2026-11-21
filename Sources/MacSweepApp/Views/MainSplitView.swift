@@ -59,7 +59,8 @@ struct MainSplitView: View {
                     if !banner.forceQuitBundleIDs.isEmpty {
                         Button(state.l10n.t("强制退出", "Force Quit")) {
                             let ids = banner.forceQuitBundleIDs
-                            Task { await state.forceQuitApps(bundleIDs: ids) }
+                            let urls = banner.forceQuitBundleURLs
+                            Task { await state.forceQuitApps(bundleIDs: ids, bundleURLs: urls) }
                         }
                         .buttonStyle(.borderedProminent)
                         .tint(.red)

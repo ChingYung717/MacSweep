@@ -16,22 +16,43 @@ if CommandLine.arguments.contains("--live-audit") {
     print("Applications found: \(apps.count) (Safari hidden/protected: \(!hasSafari), Apple App Store apps: \(appleStoreApps))")
 
     let matcher = ServiceFileMatcher(safetyGuard: sg)
-    let sampleApps = apps.prefix(5)
-    for app in sampleApps {
-        let sf = matcher.matchInMemory(app: app, index: index)
-        print("  - \(app.localizedName) [\(app.bundleID)]: \(sf.count) service files")
+    let allPkgs = ServiceFileMatcher.listThirdPartyPackages()
+    let allIDs = Set(apps.map { $0.bundleID.lowercased() }.filter { !$0.hasPrefix("unknown.") })
+    let allPaths = Set(apps.map { $0.url.standardizedFileURL.path })
+    for probeName in ["AweSun", "Google Drive", "印象笔记", "aDrive"] {
+        if let app = apps.first(where: { $0.name == probeName || $0.localizedName == probeName }) {
+            let res = matcher.matchWithPackages(
+                app: app,
+                index: index,
+                allPackageIDs: allPkgs,
+                allInstalledBundleIDs: allIDs,
+                otherInstalledAppPaths: allPaths.subtracting([app.url.standardizedFileURL.path])
+            )
+            let badPaths = res.files.map(\.url.path).filter {
+                $0 == "/Library/StartupItems" || $0 == "/Library/Printers" || $0 == "/etc/paths.d" || $0.hasPrefix("/Applications/Google Docs")
+            }
+            print("  - \(app.localizedName) [\(app.bundleID)]: \(res.files.count) files, pkgs=\(res.matchedPackageIDs.count), badSharedHits=\(badPaths)")
+        }
     }
 
     let startups = StartupScanner(safetyGuard: sg).scanAll()
     let disabledCount = startups.filter { !$0.isEnabled }.count
     let orphanedCount = startups.filter(\.isOrphanedBinary).count
-    print("Startup items: \(startups.count) (disabled: \(disabledCount), orphaned: \(orphanedCount))")
+    let loginCount = startups.filter { $0.scope == .appLoginItem }.count
+    print("Startup items: \(startups.count) (disabled: \(disabledCount), orphaned: \(orphanedCount), appLoginItems: \(loginCount))")
 
     let inventory = InstalledAppInventory.build(libraryIndex: index)
     let leftovers = LeftoverScanner(safetyGuard: sg).scan(index: index, inventory: inventory)
     let highLeft = leftovers.filter { $0.confidence == .high }
     let medLeft = leftovers.filter { $0.confidence == .medium }
-    print("Leftovers: \(leftovers.count) groups (high: \(highLeft.count), medium: \(medLeft.count))")
+    let allLeftPaths = leftovers.flatMap { $0.files.map(\.url.path) }
+    let osLeakCheck = allLeftPaths.filter {
+        $0.contains("/Apple/") || $0.contains("org.cups.") || $0.contains("net.java.openjdk")
+            || $0.contains("com.plausiblelabs.crashreporter") || $0.hasSuffix("/BTServer")
+            || $0.hasSuffix("/ApplePushService") || $0.hasSuffix("/livefsd")
+            || $0 == "/Library/Logs/DiagnosticReports"
+    }
+    print("Leftovers: \(leftovers.count) groups (high: \(highLeft.count), medium: \(medLeft.count), containmentNames: \(inventory.containmentNames.count), osLeakHits: \(osLeakCheck))")
     for g in highLeft.prefix(5) {
         print("  - [HIGH] \(g.groupName) (\(g.suspectedBundleID ?? g.id)): \(g.files.count) files")
     }
@@ -41,7 +62,9 @@ if CommandLine.arguments.contains("--live-audit") {
 
     let extRes = ExtensionScanner(safetyGuard: sg).scanAll()
     let byCat = Dictionary(grouping: extRes.items, by: \.category).mapValues(\.count)
-    print("Extensions: \(extRes.items.count) total (needsFDAForBrowsers: \(extRes.needsFullDiskAccessForBrowsers), blocked: \(extRes.blockedBrowserNames))")
+    let pluginkitItems = extRes.items.filter { $0.category == .browserSafari || $0.category == .appExtension }
+    let enabledPluginkit = pluginkitItems.filter(\.isEnabled).count
+    print("Extensions: \(extRes.items.count) total (pluginkit enabled: \(enabledPluginkit)/\(pluginkitItems.count), needsFDAForBrowsers: \(extRes.needsFullDiskAccessForBrowsers), blocked: \(extRes.blockedBrowserNames))")
     for (cat, count) in byCat.sorted(by: { $0.key.rawValue < $1.key.rawValue }) {
         print("  - \(cat.rawValue): \(count)")
     }
@@ -56,4 +79,5 @@ runStartupChecks(runner)
 runLeftoverChecks(runner)
 runExtensionChecks(runner)
 runReviewRegressionChecks(runner)
+runAuditFixChecks(runner)
 runner.summaryAndExit()

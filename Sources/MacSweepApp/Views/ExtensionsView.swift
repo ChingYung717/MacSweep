@@ -242,10 +242,11 @@ struct ExtensionsView: View {
 
     private func extensionRow(_ item: ExtensionItem) -> some View {
         let isSelected = selectedIDBox.value == item.id
+        let isToggling = state.togglingExtensionIDs.contains(item.id)
         return HStack(spacing: 10) {
-            if let host = item.hostAppPath, FileManager.default.fileExists(atPath: host.path) {
+            if let host = item.hostAppPath, item.hostAppExists {
                 AppIconView(path: host.path, size: 28)
-            } else if FileManager.default.fileExists(atPath: item.path.path) && !item.category.isBrowser {
+            } else if item.pathExists && !item.category.isBrowser {
                 AppIconView(path: item.path.path, size: 28)
             } else {
                 ZStack {
@@ -291,6 +292,7 @@ struct ExtensionsView: View {
                 .toggleStyle(.switch)
                 .controlSize(.mini)
                 .labelsHidden()
+                .disabled(isToggling)
             } else if item.size > 0 {
                 Text(ByteFormatter.format(item.size))
                     .font(.system(size: 11.5, design: .rounded))
@@ -394,8 +396,8 @@ struct ExtensionsView: View {
                             )
                         }
 
-                        // Running Chromium browser notice (Decision B1)
-                        if item.category.isChromium && browserRunning {
+                        // Running browser notice (applies to Chromium AND Firefox removable extensions)
+                        if item.canRemove && item.category.isBrowser && browserRunning {
                             noticeBox(
                                 icon: "exclamationmark.triangle.fill",
                                 color: palette.warning,
@@ -474,22 +476,25 @@ struct ExtensionsView: View {
 
                 // Bottom bar
                 HStack {
+                    let isBusy = state.togglingExtensionIDs.contains(item.id) || state.isPerformingRemoval
                     if item.canToggle {
                         Button(item.isEnabled ? l10n.t("禁用扩展", "Disable Extension") : l10n.t("启用扩展", "Enable Extension")) {
                             Task { await state.toggleExtensionItem(item, enable: !item.isEnabled) }
                         }
                         .buttonStyle(.bordered)
+                        .disabled(isBusy)
                     }
 
                     Spacer()
 
                     if item.canRemove {
-                        if item.category.isChromium && browserRunning {
+                        if item.category.isBrowser && browserRunning {
                             Button(l10n.t("先退出浏览器", "Quit Browser First")) {
                                 Task { await state.quitBrowser(for: item) }
                             }
                             .buttonStyle(.borderedProminent)
                             .tint(palette.warning)
+                            .disabled(isBusy)
                         } else {
                             Button {
                                 state.prepareRemovalForExtension(item)
@@ -504,6 +509,8 @@ struct ExtensionsView: View {
                                     )
                             }
                             .buttonStyle(.plain)
+                            .disabled(isBusy)
+                            .opacity(isBusy ? 0.55 : 1)
                         }
                     }
                 }

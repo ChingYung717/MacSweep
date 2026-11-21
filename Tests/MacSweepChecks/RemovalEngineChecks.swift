@@ -29,18 +29,29 @@ func runRemovalEngineChecks(_ runner: CheckRunner) {
         try runner.expect(fm.fileExists(atPath: realFile.path), "Symlink TARGET must remain intact!")
     }
 
-    runner.run("Trash removal moves sandbox file cleanly to Trash and records cleanup history") {
+    runner.run("Trash removal moves sandbox file cleanly to Trash and records cleanup history (isolated from real ~/.Trash)") {
         let sandbox = try runner.makeTempSandbox(prefix: "rm-trash")
         defer { try? FileManager.default.removeItem(at: sandbox) }
 
         let fm = FileManager.default
+        let mockTrash = sandbox.appendingPathComponent("MockTrash")
+        try fm.createDirectory(at: mockTrash, withIntermediateDirectories: true)
         let sampleFile = sandbox.appendingPathComponent("macsweep-trash-probe-\(UUID().uuidString).txt")
         try Data("hello trash".utf8).write(to: sampleFile)
 
         let histURL = sandbox.appendingPathComponent("history.json")
         let historyStore = CleanupHistoryStore(fileURL: histURL)
         let sg = SafetyGuard(homeDirectory: sandbox)
-        let engine = RemovalEngine(safetyGuard: sg, historyStore: historyStore)
+        let engine = RemovalEngine(
+            safetyGuard: sg,
+            historyStore: historyStore,
+            localTrashHandler: { url in
+                try FileManager.default.moveItem(
+                    at: url,
+                    to: mockTrash.appendingPathComponent(url.lastPathComponent)
+                )
+            }
+        )
 
         let report = engine.remove(
             targets: [RemovalTarget(url: sampleFile, estimatedSize: 11)],
@@ -51,18 +62,11 @@ func runRemovalEngineChecks(_ runner: CheckRunner) {
 
         try runner.expect(report.isFullSuccess, "Trash move should succeed")
         try runner.expect(!fm.fileExists(atPath: sampleFile.path), "Original file should no longer exist")
+        try runner.expect(fm.fileExists(atPath: mockTrash.appendingPathComponent(sampleFile.lastPathComponent).path), "File should be inside isolated mock trash")
 
         let records = historyStore.load()
         try runner.expectEqual(records.count, 1, "Cleanup history should record 1 entry")
         try runner.expectEqual(records.first?.mode, .trash)
-
-        // Clean up the probe file we placed in ~/.Trash so user's Trash stays clean
-        let trashedProbe = fm.homeDirectoryForCurrentUser
-            .appendingPathComponent(".Trash")
-            .appendingPathComponent(sampleFile.lastPathComponent)
-        if fm.fileExists(atPath: trashedProbe.path) {
-            try? fm.removeItem(at: trashedProbe)
-        }
     }
 
     runner.run("SafetyGuard blocks removal of protected system paths inside RemovalEngine") {

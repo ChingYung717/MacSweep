@@ -3,10 +3,27 @@ import SwiftUI
 
 struct FileRowView: View {
     let file: ServiceFile
+    let isDisabled: Bool
     let palette: AppPalette
     let l10n: L10n
     let onToggle: () -> Void
     let onReveal: () -> Void
+
+    init(
+        file: ServiceFile,
+        isDisabled: Bool = false,
+        palette: AppPalette,
+        l10n: L10n,
+        onToggle: @escaping () -> Void,
+        onReveal: @escaping () -> Void
+    ) {
+        self.file = file
+        self.isDisabled = isDisabled
+        self.palette = palette
+        self.l10n = l10n
+        self.onToggle = onToggle
+        self.onReveal = onReveal
+    }
 
     @StateObject private var hoverState = LocalState(false)
 
@@ -14,7 +31,7 @@ struct FileRowView: View {
         HStack(spacing: 10) {
             SweepCheckbox(
                 isChecked: file.isSelected,
-                isDisabled: false,
+                isDisabled: isDisabled,
                 palette: palette,
                 action: onToggle
             )

@@ -20,6 +20,8 @@ public struct StartupItem: Identifiable, Hashable, Sendable {
     public let isOrphanedBinary: Bool
     public let associatedAppPath: String?
     public let associatedAppName: String?
+    public let associatedAppExists: Bool
+    public let labelFromPlist: String?
     public let requiresAdmin: Bool
     public let canToggle: Bool
     public let canRemove: Bool
@@ -37,6 +39,8 @@ public struct StartupItem: Identifiable, Hashable, Sendable {
         isOrphanedBinary: Bool = false,
         associatedAppPath: String? = nil,
         associatedAppName: String? = nil,
+        associatedAppExists: Bool = false,
+        labelFromPlist: String? = nil,
         requiresAdmin: Bool = false,
         canToggle: Bool = true,
         canRemove: Bool = true,
@@ -54,6 +58,8 @@ public struct StartupItem: Identifiable, Hashable, Sendable {
         self.isOrphanedBinary = isOrphanedBinary
         self.associatedAppPath = associatedAppPath
         self.associatedAppName = associatedAppName
+        self.associatedAppExists = associatedAppExists
+        self.labelFromPlist = labelFromPlist
         self.requiresAdmin = requiresAdmin
         self.canToggle = canToggle
         self.canRemove = canRemove

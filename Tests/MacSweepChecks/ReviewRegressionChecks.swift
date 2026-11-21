@@ -190,7 +190,7 @@ func runReviewRegressionChecks(_ runner: CheckRunner) {
         try runner.expect(ProcessRunner.run(executable: "/bin/launchctl", arguments: ["print", target]).succeeded,
                           "test setup: service should be loaded")
 
-        let targets = StartupController.launchTargets(for: [plist])
+        let targets = StartupController.launchTargets(for: [plist], allowedLaunchDirs: [agentsDir])
         try runner.expectEqual(targets.count, 1)
         try runner.expectEqual(targets.first?.serviceTarget, target)
         let report = StartupController().unloadBeforeRemoval(targets)
