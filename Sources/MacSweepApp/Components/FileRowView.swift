@@ -46,6 +46,15 @@ struct FileRowView: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
 
+                    if file.isSystemScope {
+                        Label(l10n.t("系统级", "System"), systemImage: "shield.lefthalf.filled")
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .foregroundStyle(palette.warning)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1.5)
+                            .background(Capsule().fill(palette.warning.opacity(0.16)))
+                    }
+
                     if file.requiresAdmin {
                         Label(l10n.adminBadge, systemImage: "lock.fill")
                             .font(.system(size: 9.5, weight: .semibold))

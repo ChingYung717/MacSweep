@@ -130,7 +130,7 @@ public struct ServiceFileMatcher: Sendable {
 
         for entry in index.entries {
             guard entry.isRemovable else { continue }
-            let entryPath = entry.url.path
+            let entryPath = entry.url.standardizedFileURL.path
             guard !seenPaths.contains(entryPath) else { continue }
 
             // Avoid matching Apple system files for non-Apple apps.

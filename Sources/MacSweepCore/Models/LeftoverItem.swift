@@ -45,4 +45,43 @@ public struct LeftoverGroup: Identifiable, Hashable, Sendable {
     public var requiresAdmin: Bool {
         files.contains(where: { $0.isSelected && $0.requiresAdmin })
     }
+
+    public var hasSystemScopeFiles: Bool {
+        files.contains(where: \.isSystemScope)
+    }
+
+    public var hasUserScopeFiles: Bool {
+        files.contains(where: { !$0.isSystemScope })
+    }
+
+    public var systemScopeFileCount: Int {
+        files.filter(\.isSystemScope).count
+    }
+
+    /// Group-level toggle obeying F5:
+    /// - Turning OFF unchecks every file in the group.
+    /// - Turning ON checks ONLY user-scope (`!isSystemScope`) files; `/Library` system-scope entries
+    ///   must always be opted into individually at the file row level.
+    public mutating func applyGroupToggle(_ newChecked: Bool) {
+        if !newChecked {
+            for idx in files.indices {
+                files[idx].isSelected = false
+            }
+            isChecked = false
+            return
+        }
+        for idx in files.indices where !files[idx].isSystemScope {
+            files[idx].isSelected = true
+        }
+        isChecked = files.contains(where: \.isSelected)
+    }
+
+    /// Selects ONLY per-file high-confidence, user-scope entries (never selects `/Library` system-scope files [F5]).
+    public mutating func selectHighConfidenceOnly() {
+        for idx in files.indices {
+            let file = files[idx]
+            files[idx].isSelected = !file.isSystemScope && file.confidence == .high
+        }
+        isChecked = files.contains(where: \.isSelected)
+    }
 }
