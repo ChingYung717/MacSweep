@@ -317,7 +317,7 @@ struct ApplicationsView: View {
     @ViewBuilder
     private var rightDetailPane: some View {
         let checked = state.checkedApps
-        if !checked.isEmpty && state.droppedApp == nil {
+        if checked.count >= 2 && state.droppedApp == nil {
             batchSummaryDetailPane(apps: checked)
         } else if let app = state.activeDetailApp {
             singleAppDetailPane(app: app)
@@ -619,11 +619,10 @@ struct ApplicationsView: View {
                                     .foregroundStyle(palette.secondaryText)
                             }
                             Spacer()
-                            if let sz = app.totalSize {
-                                Text(ByteFormatter.format(sz))
-                                    .font(.system(size: 12.5, weight: .medium, design: .rounded))
-                                    .foregroundStyle(palette.secondaryText)
-                            }
+                            let appSelectedBytes = (app.bundleSize ?? 0) + app.serviceFiles.filter(\.isSelected).reduce(0) { $0 + ($1.size ?? 0) }
+                            Text(ByteFormatter.format(appSelectedBytes))
+                                .font(.system(size: 12.5, weight: .medium, design: .rounded))
+                                .foregroundStyle(palette.secondaryText)
                             Button {
                                 state.toggleAppChecked(app.id)
                             } label: {
@@ -723,6 +722,7 @@ struct ApplicationsView: View {
                     ForEach(files) { file in
                         FileRowView(
                             file: file,
+                            isDisabled: disabled,
                             palette: palette,
                             l10n: l10n,
                             onToggle: {

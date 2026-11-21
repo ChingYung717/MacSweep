@@ -7,8 +7,8 @@ public struct InstalledAppInventory: Sendable {
     public let compactAppNames: Set<String>
     /// 2-part reverse-DNS vendor prefixes (e.g. `com.baidu`, `com.tencent`) of installed apps / live services.
     public let vendorPrefixes: Set<String>
-    /// Compact (lowercased, no spaces/hyphens) names ≥ 5 chars used for containment checks
-    /// such as `com.baidu.baidunetdisk-mac` ⊃ `baidunetdisk`.
+    /// Tightened compact names from top-level third-party apps (excluding generic OS/UI words & plugins)
+    /// used for containment checks such as `com.baidu.baidunetdisk-mac` ⊃ `baidunetdisk`.
     public let containmentNames: Set<String>
 
     public init(
@@ -34,12 +34,13 @@ public struct InstalledAppInventory: Sendable {
             .replacingOccurrences(of: "_", with: "")
     }
 
-    /// Strips a trailing `_<UUID>` / `-<UUID>` suffix, e.g. `企业微信_269F5995-70FC-5B55-BCF5-D7E491D2E457`.
+    /// Strips a trailing `_<UUID>`, `-<UUID>`, or `.<UUID>` suffix
+    /// (e.g. `企业微信_269F5995-70FC-5B55-BCF5-D7E491D2E457` or ByHost `com.foo.bar.<UUID>`).
     public static func stripUUIDSuffix(_ name: String) -> String {
         guard name.count > 37 else { return name }
         let suffix = String(name.suffix(36))
         let sep = name[name.index(name.endIndex, offsetBy: -37)]
-        if (sep == "_" || sep == "-"), UUID(uuidString: suffix) != nil {
+        if (sep == "_" || sep == "-" || sep == "."), UUID(uuidString: suffix) != nil {
             return String(name.dropLast(37))
         }
         return name
@@ -105,39 +106,52 @@ public struct InstalledAppInventory: Sendable {
             }
         }
 
-        func recordName(_ raw: String) {
+        func recordName(_ raw: String, allowContainment: Bool) {
             let val = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             guard !val.isEmpty,
                   !ServiceFileMatcher.genericExecutableNames.contains(val) else { return }
             names.insert(val)
             compactNames.insert(val.replacingOccurrences(of: " ", with: ""))
+            guard allowContainment else { return }
             let c = compact(val)
-            if c.count >= 5 && !SafetyGuard.sharedVendorFolderNames.contains(c) {
+            let hasNonASCII = c.unicodeScalars.contains { !$0.isASCII }
+            let minLen = hasNonASCII ? 4 : 6
+            if c.count >= minLen,
+               !ServiceFileMatcher.genericStopWords.contains(val),
+               !ServiceFileMatcher.genericStopWords.contains(c),
+               !SafetyGuard.sharedVendorFolderNames.contains(c),
+               !SafetyGuard.leftoverSafeIgnoreNames.contains(c) {
                 containment.insert(c)
             }
         }
 
-        func recordBundle(at url: URL, includeLocalized: Bool) {
-            recordName(url.deletingPathExtension().lastPathComponent)
+        func recordBundle(at url: URL, includeLocalized: Bool, isSystemRoot: Bool, bundleIDOnly: Bool = false) {
+            let allowContainment = !isSystemRoot && !bundleIDOnly
+            if !bundleIDOnly {
+                recordName(url.deletingPathExtension().lastPathComponent, allowContainment: allowContainment)
+            }
             if let bundle = Bundle(url: url), let info = bundle.infoDictionary {
                 if let bid = info["CFBundleIdentifier"] as? String {
                     recordBundleID(bid)
                 }
-                for key in ["CFBundleName", "CFBundleDisplayName", "CFBundleExecutable"] {
-                    if let val = info[key] as? String {
-                        recordName(val)
+                if !bundleIDOnly {
+                    for key in ["CFBundleName", "CFBundleDisplayName", "CFBundleExecutable"] {
+                        if let val = info[key] as? String {
+                            recordName(val, allowContainment: allowContainment)
+                        }
                     }
                 }
             }
-            if includeLocalized {
+            if includeLocalized && !bundleIDOnly {
                 for localized in localizedBundleNames(at: url) {
-                    recordName(localized)
+                    recordName(localized, allowContainment: allowContainment)
                 }
-                recordName(fm.displayName(atPath: url.path).replacingOccurrences(of: ".app", with: ""))
+                let fsDisplay = AppScanner.strippingAppExtension(fm.displayName(atPath: url.path))
+                recordName(fsDisplay, allowContainment: allowContainment)
             }
         }
 
-        func scanDir(_ dir: URL, depth: Int) {
+        func scanDir(_ dir: URL, depth: Int, isSystemRoot: Bool) {
             guard let items = try? fm.contentsOfDirectory(
                 at: dir,
                 includingPropertiesForKeys: [.isDirectoryKey, .isPackageKey],
@@ -148,12 +162,14 @@ public struct InstalledAppInventory: Sendable {
 
             for item in items {
                 if item.pathExtension.lowercased() == "app" {
-                    recordBundle(at: item, includeLocalized: true)
+                    recordBundle(at: item, includeLocalized: true, isSystemRoot: isSystemRoot)
+                    // Embedded plugins/helpers record ONLY their CFBundleIdentifier (never loose names like
+                    // "Share Extension" or "QuickLookPreview" that would pollute `containmentNames`).
                     for subDir in ["Contents/Library/LoginItems", "Contents/PlugIns", "Contents/XPCServices", "Contents/Applications"] {
                         let nested = item.appendingPathComponent(subDir)
                         if let nestedItems = try? fm.contentsOfDirectory(at: nested, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
                             for nestedItem in nestedItems {
-                                recordBundle(at: nestedItem, includeLocalized: false)
+                                recordBundle(at: nestedItem, includeLocalized: false, isSystemRoot: isSystemRoot, bundleIDOnly: true)
                             }
                         }
                     }
@@ -163,14 +179,15 @@ public struct InstalledAppInventory: Sendable {
                 if depth == 0 {
                     let vals = try? item.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
                     if vals?.isDirectory == true && vals?.isPackage != true {
-                        scanDir(item, depth: 1)
+                        scanDir(item, depth: 1, isSystemRoot: isSystemRoot)
                     }
                 }
             }
         }
 
         for root in roots {
-            scanDir(root, depth: 0)
+            let isSys = root.standardizedFileURL.path.hasPrefix("/System/")
+            scanDir(root, depth: 0, isSystemRoot: isSys)
         }
 
         // Also record active (non-orphaned) LaunchAgents/LaunchDaemons so live system updaters/drivers
@@ -186,7 +203,12 @@ public struct InstalledAppInventory: Sendable {
                     recordBundleID(label)
                 }
                 if let enclosing = StartupScanner.extractEnclosingApp(from: entry.launchProgramPaths) {
-                    recordBundle(at: URL(fileURLWithPath: enclosing.path), includeLocalized: false)
+                    recordBundle(
+                        at: URL(fileURLWithPath: enclosing.path),
+                        includeLocalized: false,
+                        isSystemRoot: enclosing.path.hasPrefix("/System/"),
+                        bundleIDOnly: false
+                    )
                 }
             }
         }
@@ -201,8 +223,8 @@ public struct InstalledAppInventory: Sendable {
         )
     }
 
-    /// True if a reverse-DNS identifier's product part contains an installed app name,
-    /// e.g. `com.baidu.baidunetdisk-mac` while `BaiduNetdisk.app` (bundle id `com.baidu.netdisk`) is installed.
+    /// True if a reverse-DNS identifier's product part contains an installed third-party app name,
+    /// e.g. `com.baidu.baidunetdisk-mac` while `BaiduNetdisk.app` (`com.baidu.netdisk`) is installed.
     public func productPartContainsInstalledName(_ reverseDNS: String) -> Bool {
         let parts = reverseDNS.lowercased().split(separator: ".")
         guard parts.count >= 3 else { return false }
@@ -211,7 +233,7 @@ public struct InstalledAppInventory: Sendable {
         return containmentNames.contains { product.contains($0) }
     }
 
-    /// True if a plain (non reverse-DNS) folder/file name contains an installed app name,
+    /// True if a plain (non reverse-DNS) folder/file name contains an installed third-party app name,
     /// e.g. CrashReporter `BaiduNetdisk_mac` while `BaiduNetdisk.app` is installed.
     public func plainNameContainsInstalledName(_ name: String) -> Bool {
         let c = Self.compact(name)
@@ -237,7 +259,6 @@ public struct InstalledAppInventory: Sendable {
 
         let idCandidates = [lowerStem, lowerFull, launchLabel?.lowercased()].compactMap { $0 }
         for candidate in idCandidates {
-            // Strip leading TeamID / `group.` prefix for Group Containers matching
             let stripped = Self.stripContainerPrefixes(candidate)
             if bundleIDs.contains(stripped) {
                 return true
@@ -248,7 +269,6 @@ public struct InstalledAppInventory: Sendable {
                     return true
                 }
             }
-            // Also check if an installed app shares the same 3-part base bundle ID (e.g. helper plist)
             let parts = stripped.split(separator: ".")
             if parts.count >= 3 {
                 let p3 = parts.prefix(3).joined(separator: ".")
@@ -303,14 +323,17 @@ public struct LeftoverScanner: Sendable {
         var groupedFiles: [String: (displayName: String, bundleID: String?, confidence: LeftoverConfidence, files: [ServiceFile])] = [:]
 
         for entry in index.entries {
-            // Safety validation was precomputed once per entry at index time.
             guard entry.isRemovable else { continue }
 
             let stem = InstalledAppInventory.stripUUIDSuffix(entry.stem)
             let strippedID = InstalledAppInventory.stripContainerPrefixes(stem.lowercased())
 
-            // Skip Apple system, CLI/dev tools, shared vendor dirs, and user-ignored leftovers
-            if safetyGuard.isProtectedFromLeftoverScan(name: stem, bundleID: entry.launchLabel ?? strippedID) {
+            // Skip Apple system (incl. parentVendorName == "apple"), CUPS, OpenJDK, CLI/dev tools, and user-ignored leftovers
+            if safetyGuard.isProtectedFromLeftoverScan(
+                name: stem,
+                bundleID: entry.launchLabel ?? strippedID,
+                parentVendorName: entry.parentVendorName
+            ) {
                 continue
             }
             if ignoredLeftoverIDs.contains(strippedID) || ignoredLeftoverIDs.contains(entry.normalizedName) {
@@ -340,12 +363,9 @@ public struct LeftoverScanner: Sendable {
                 continue
             }
 
-            // Determine confidence level
             let isReverseDNS = Self.looksLikeReverseDNSBundleID(strippedID)
             let isOrphanedLaunch = (entry.category == .launchAgents || entry.category == .launchDaemons)
 
-            // Reverse-DNS data whose product part names an installed app (e.g. `com.baidu.baidunetdisk-mac`
-            // while BaiduNetdisk.app with bundle id `com.baidu.netdisk` is installed) is NOT a leftover.
             if isReverseDNS && !isOrphanedLaunch && inventory.productPartContainsInstalledName(strippedID) {
                 continue
             }
@@ -354,7 +374,6 @@ public struct LeftoverScanner: Sendable {
             if isOrphanedLaunch {
                 confidence = .high
             } else if isReverseDNS {
-                // High confidence for reverse-DNS app identifiers in well-known app-owned folders
                 switch entry.category {
                 case .containers, .groupContainers, .savedState, .preferences, .caches, .webData, .applicationSupport:
                     confidence = .high
@@ -362,12 +381,9 @@ public struct LeftoverScanner: Sendable {
                     confidence = .medium
                 }
             } else {
-                // Non-reverse-DNS folder names (e.g. `~/Library/Application Support/SomeTool`):
-                // only surface Application Support & Caches & Logs as medium-confidence ("Review Recommended").
                 guard entry.category == .applicationSupport || entry.category == .caches || entry.category == .logs else {
                     continue
                 }
-                // Skip scoped npm/agent package caches (`@scope`), internal UUID/temp folders (`_UUID`), and literal `(null)`
                 guard stem.count >= 4,
                       !stem.hasPrefix("@"),
                       !stem.hasPrefix("_"),
@@ -375,11 +391,9 @@ public struct LeftoverScanner: Sendable {
                       UUID(uuidString: stem) == nil else {
                     continue
                 }
-                // e.g. `BaiduNetdisk_mac` (crash reporter state) belongs to installed BaiduNetdisk.app
                 if inventory.plainNameContainsInstalledName(stem) {
                     continue
                 }
-                // e.g. `accountsd`: data of a macOS system daemon / tool that ships with the OS
                 if Self.isSystemExecutableName(stem) {
                     continue
                 }
@@ -387,9 +401,8 @@ public struct LeftoverScanner: Sendable {
             }
 
             // Never pre-select (default-check) items that are risky to remove blindly:
-            //  - system-wide `/Library/...` entries (shared by all users, need admin)        [F5]
-            //  - data of a vendor that still has installed apps / live services (shared SDK data such as
-            //    `com.tencent.bugly`, or a renamed bundle id of an installed product)
+            //  - system-wide `/Library/...` entries (shared by all users, need admin) [F5]
+            //  - data of a vendor that still has installed apps / live services
             if confidence == .high {
                 if entry.isSystemScope {
                     confidence = .medium
@@ -413,9 +426,11 @@ public struct LeftoverScanner: Sendable {
                 url: entry.url,
                 category: entry.category,
                 size: nil,
-                isSelected: confidence == .high,
+                isSelected: confidence == .high && !entry.isSystemScope,
                 requiresAdmin: entry.requiresAdmin,
                 requiresReboot: entry.url.path.contains("/Audio/Plug-Ins/HAL/"),
+                isSystemScope: entry.isSystemScope,
+                confidence: confidence,
                 matchReason: confidence == .high ? "Orphaned app identifier" : "Unmatched directory (review)"
             )
 
@@ -436,20 +451,20 @@ public struct LeftoverScanner: Sendable {
         }
 
         let groups: [LeftoverGroup] = groupedFiles.map { key, val in
-            // If group was promoted to .high because one file is high confidence, keep medium files unchecked unless selected.
             let sortedFiles = val.files.sorted {
                 if $0.category.sortOrder != $1.category.sortOrder {
                     return $0.category.sortOrder < $1.category.sortOrder
                 }
                 return $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
             }
+            let anySelected = sortedFiles.contains(where: \.isSelected)
             return LeftoverGroup(
                 id: key,
                 groupName: val.displayName,
                 suspectedBundleID: val.bundleID,
                 confidence: val.confidence,
                 files: sortedFiles,
-                isChecked: val.confidence == .high
+                isChecked: anySelected
             )
         }
 
@@ -461,28 +476,43 @@ public struct LeftoverScanner: Sendable {
         }
     }
 
-    /// Names of macOS-bundled launchd services (label tail + program basename), read once from the
-    /// read-only system volume. Covers daemons living inside frameworks, e.g.
-    /// `Accounts.framework/.../Support/accountsd` (label `com.apple.accountsd`).
+    /// Names of macOS-bundled launchd services (meaningful label segment + program basename), read once
+    /// from the read-only system volume. Handles dotted suffixes such as `com.apple.BTServer.le` → `btserver`.
     public static let systemServiceNames: Set<String> = {
+        let genericSuffixes: Set<String> = [
+            "le", "xpc", "agent", "helper", "daemon", "service", "mac", "osx", "app", "ui", "user", "system",
+        ]
         var names = Set<String>()
         let fm = FileManager.default
         for dir in ["/System/Library/LaunchAgents", "/System/Library/LaunchDaemons"] {
             guard let files = try? fm.contentsOfDirectory(atPath: dir) else { continue }
             for file in files where file.hasSuffix(".plist") {
                 let meta = LibraryIndex.parseLaunchPlistMetadata(at: URL(fileURLWithPath: "\(dir)/\(file)"))
-                if let label = meta.label?.lowercased(), let tail = label.split(separator: ".").last {
-                    names.insert(String(tail))
+                if let label = meta.label?.lowercased() {
+                    let parts = label.split(separator: ".").map(String.init)
+                    if let last = parts.last, last.count >= 4 {
+                        names.insert(last)
+                    }
+                    // For `com.apple.BTServer.le`, the 3rd segment (`btserver`) is the actual service name
+                    if parts.count >= 3, parts[0] == "com", parts[1] == "apple" {
+                        let candidate = parts[2]
+                        if candidate.count >= 4 && !genericSuffixes.contains(candidate) {
+                            names.insert(candidate)
+                        }
+                    }
                 }
                 if let prog = meta.programs.first {
-                    names.insert(URL(fileURLWithPath: prog).lastPathComponent.lowercased())
+                    let exe = URL(fileURLWithPath: prog).lastPathComponent.lowercased()
+                    if exe.count >= 4 {
+                        names.insert(exe)
+                    }
                 }
             }
         }
         return names
     }()
 
-    /// True if `name` is an executable / launchd service shipped with macOS (e.g. `accountsd`).
+    /// True if `name` is an executable / launchd service shipped with macOS (e.g. `accountsd`, `BTServer`, `livefsd`).
     public static func isSystemExecutableName(_ name: String) -> Bool {
         guard !name.isEmpty, !name.contains("/") else { return false }
         if systemServiceNames.contains(name.lowercased()) {

@@ -5,6 +5,7 @@ public enum PrivilegedError: Error, LocalizedError, Sendable, Equatable {
     case blockedBySafetyGuard(path: String, reason: String)
     case userCancelled
     case finderAutomationDenied(detail: String)
+    case finderOperationFailed(detail: String)
     case commandFailed(detail: String)
 
     public var errorDescription: String? {
@@ -15,6 +16,8 @@ public enum PrivilegedError: Error, LocalizedError, Sendable, Equatable {
             return "Administrator authentication was cancelled"
         case let .finderAutomationDenied(detail):
             return "Finder automation permission denied: \(detail)"
+        case let .finderOperationFailed(detail):
+            return "Finder delete failed: \(detail)"
         case let .commandFailed(detail):
             return detail
         }
@@ -47,10 +50,11 @@ public struct PrivilegedExecutor: Sendable {
     // MARK: - Command Builders (Pure & Unit-Testable)
 
     /// Builds an injection-safe AppleScript delegating Trash move to Finder (preserves Put Back metadata).
+    /// Uses `appleScriptExpression` so paths containing CR/LF (e.g. `Icon\r`) are preserved accurately.
     public func buildFinderTrashAppleScript(urls: [URL]) throws -> String {
         let validated = try validatePaths(urls)
         let posixItems = validated.map { path in
-            "(POSIX file \"\(ProcessRunner.appleScriptEscape(path))\")"
+            "(POSIX file (\(ProcessRunner.appleScriptExpression(path))))"
         }.joined(separator: ", ")
 
         return """
@@ -65,8 +69,9 @@ public struct PrivilegedExecutor: Sendable {
     /// Error-propagation contract:
     /// - Each item is processed independently inside its own `{ ...; } || fail=1` group, so one failure never
     ///   skips later items and is never masked: the script exits non-zero if ANY item failed.
-    /// - `chown -R -P` recursively hands ownership of moved directories back to the user without following
-    ///   symlinks (so the user can later empty the Trash without another admin prompt).
+    /// - `/usr/sbin/chown -R -P -- <owner> <path>` places `--` BEFORE `<owner>` (BSD `chown` otherwise
+    ///   interprets `--` as a filename!), recursively handing ownership back without following symlinks.
+    /// - Uses a short UUID suffix when resolving collisions so same-second duplicates never collide.
     public func buildPrivilegedTrashShellCommand(
         urls: [URL],
         trashDirectory: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".Trash"),
@@ -75,7 +80,7 @@ public struct PrivilegedExecutor: Sendable {
         timestamp: String? = nil
     ) throws -> String {
         let validated = try validatePaths(urls)
-        let stamp = timestamp ?? String(Int(Date().timeIntervalSince1970))
+        let suffix = timestamp ?? String(UUID().uuidString.prefix(8).lowercased())
         let trashPath = trashDirectory.standardizedFileURL.path
         let quotedTrash = ProcessRunner.posixQuote(trashPath)
 
@@ -87,14 +92,17 @@ public struct PrivilegedExecutor: Sendable {
             let base = URL(fileURLWithPath: path).lastPathComponent
             let qSrc = ProcessRunner.posixQuote(path)
             let qDest = ProcessRunner.posixQuote("\(trashPath)/\(base)")
-            let qFallback = ProcessRunner.posixQuote("\(trashPath)/\(base)_\(stamp)_\(idx)")
-            let owner = "\(uid):\(gid)"
+            let qFallback = ProcessRunner.posixQuote("\(trashPath)/\(base)_\(suffix)_\(idx)")
+            let qOwner = ProcessRunner.posixQuote("\(uid):\(gid)")
 
             // `mv` renames the entry itself (never follows a symlink operand).
+            // BSD `chown`: options first, then `--`, then `<owner>`, then `<file>`.
             statements.append(
-                "{ if [ -e \(qDest) ] || [ -L \(qDest) ]; then "
-                    + "/bin/mv -- \(qSrc) \(qFallback) && /usr/sbin/chown -R -P \(owner) -- \(qFallback); "
-                    + "else /bin/mv -- \(qSrc) \(qDest) && /usr/sbin/chown -R -P \(owner) -- \(qDest); fi; } || fail=1"
+                "{ target=\(qDest); "
+                    + "if [ -e \(qDest) ] || [ -L \(qDest) ]; then target=\(qFallback); fi; "
+                    + "/bin/mv -- \(qSrc) \"$target\" && "
+                    + "{ /usr/sbin/chown -R -P -- \(qOwner) \"$target\" || { echo \"chown-failed:$target\" >&2; fail=1; }; }; "
+                    + "} || fail=1"
             )
         }
         statements.append("exit $fail")
@@ -103,7 +111,7 @@ public struct PrivilegedExecutor: Sendable {
 
     /// Builds a POSIX-quoted permanent delete script plus optional `pkgutil --forget`.
     ///
-    /// Error-propagation contract (fixes `a && b || true` masking `rm` failures):
+    /// Error-propagation contract:
     /// - The exit status of `rm` is captured into `ec` and is the exit status of the whole script.
     /// - Receipt forgetting is best-effort, runs ONLY when `rm` succeeded, and lives in its own group so its
     ///   `|| true` can never swallow the `rm` status.
@@ -130,12 +138,13 @@ public struct PrivilegedExecutor: Sendable {
         return statements.joined(separator: "; ")
     }
 
+    /// Excludes all `com.apple.*` packages (not only `com.apple.pkg.*`) and rejects shell metacharacters.
     public static func sanitizedPackageIDs(_ ids: [String]) -> [String] {
         var result: [String] = []
         for pkgID in ids {
             let trimmed = pkgID.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty,
-                  !trimmed.lowercased().hasPrefix("com.apple.pkg."),
+                  !trimmed.lowercased().hasPrefix("com.apple."),
                   trimmed.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "." || $0 == "-" || $0 == "_") }),
                   !result.contains(trimmed) else {
                 continue
@@ -163,10 +172,11 @@ public struct PrivilegedExecutor: Sendable {
         if err.contains("(-1743)") || err.localizedCaseInsensitiveContains("Not authorized to send Apple events") {
             throw PrivilegedError.finderAutomationDenied(detail: err)
         }
-        throw PrivilegedError.commandFailed(detail: err.isEmpty ? "Finder delete failed" : err)
+        throw PrivilegedError.finderOperationFailed(detail: err.isEmpty ? "Finder delete failed" : err)
     }
 
-    /// Fallback for Option A1 if Finder automation is denied: elevated single-prompt `mv` to `~/.Trash` + `chown`.
+    /// Fallback for Option A1 if Finder automation is denied or Finder cannot handle an entry:
+    /// elevated single-prompt `mv` to `~/.Trash` + recursive `chown -R -P --`.
     public func moveToTrashPrivileged(urls: [URL]) throws {
         guard !urls.isEmpty else { return }
         let shellCmd = try buildPrivilegedTrashShellCommand(urls: urls, trashDirectory: trashDirectory)
@@ -187,8 +197,8 @@ public struct PrivilegedExecutor: Sendable {
         if let adminShellRunner {
             res = adminShellRunner(shellCommand)
         } else {
-            let escaped = ProcessRunner.appleScriptEscape(shellCommand)
-            let script = "do shell script \"\(escaped)\" with administrator privileges"
+            let expr = ProcessRunner.appleScriptExpression(shellCommand)
+            let script = "do shell script (\(expr)) with administrator privileges"
             res = ProcessRunner.run(executable: "/usr/bin/osascript", arguments: ["-e", script])
         }
         if res.succeeded { return }

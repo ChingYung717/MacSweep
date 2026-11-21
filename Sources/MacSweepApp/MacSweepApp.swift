@@ -2,11 +2,25 @@ import AppKit
 import MacSweepCore
 import SwiftUI
 
+@MainActor
 final class MacSweepAppDelegate: NSObject, NSApplicationDelegate {
-    var onOpenURLs: (([URL]) -> Void)?
+    private var pendingOpenURLs: [URL] = []
+    var onOpenURLs: (([URL]) -> Void)? {
+        didSet {
+            if let handler = onOpenURLs, !pendingOpenURLs.isEmpty {
+                let queued = pendingOpenURLs
+                pendingOpenURLs.removeAll()
+                handler(queued)
+            }
+        }
+    }
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        onOpenURLs?(urls)
+        if let handler = onOpenURLs {
+            handler(urls)
+        } else {
+            pendingOpenURLs.append(contentsOf: urls)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

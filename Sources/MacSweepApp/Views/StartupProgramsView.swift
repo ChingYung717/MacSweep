@@ -8,6 +8,7 @@ struct StartupProgramsView: View {
     @StateObject private var selectedIDBox = LocalState<String?>(nil)
     @StateObject private var filterBox = LocalState<StartupFilter>(.all)
     @StateObject private var collapsedScopesBox = LocalState<Set<StartupScope>>([])
+    @StateObject private var plistPreviewBox = LocalState<(id: String?, text: String?)>((nil, nil))
 
     enum StartupFilter: String, CaseIterable, Identifiable {
         case all
@@ -208,8 +209,9 @@ struct StartupProgramsView: View {
 
     private func startupRow(_ item: StartupItem) -> some View {
         let isSelected = selectedIDBox.value == item.id
+        let isToggling = state.togglingStartupIDs.contains(item.id)
         return HStack(spacing: 10) {
-            if let appPath = item.associatedAppPath, FileManager.default.fileExists(atPath: appPath) {
+            if let appPath = item.associatedAppPath, item.associatedAppExists {
                 AppIconView(path: appPath, size: 30)
             } else {
                 ZStack {
@@ -258,6 +260,7 @@ struct StartupProgramsView: View {
                 .toggleStyle(.switch)
                 .controlSize(.mini)
                 .labelsHidden()
+                .disabled(isToggling)
             } else {
                 Text(l10n.t("系统管理", "System"))
                     .font(.system(size: 10, weight: .medium))
@@ -288,7 +291,7 @@ struct StartupProgramsView: View {
             VStack(spacing: 0) {
                 VStack(alignment: .leading, spacing: 12) {
                     HStack(spacing: 12) {
-                        if let appPath = item.associatedAppPath, FileManager.default.fileExists(atPath: appPath) {
+                        if let appPath = item.associatedAppPath, item.associatedAppExists {
                             AppIconView(path: appPath, size: 46)
                         } else {
                             ZStack {
@@ -389,7 +392,8 @@ struct StartupProgramsView: View {
                         }
 
                         if item.plistURL.pathExtension.lowercased() == "plist",
-                           let preview = loadPlistText(item.plistURL) {
+                           plistPreviewBox.value.id == item.id,
+                           let preview = plistPreviewBox.value.text {
                             infoCard(title: "Plist XML") {
                                 ScrollView(.horizontal) {
                                     Text(preview)
@@ -402,6 +406,18 @@ struct StartupProgramsView: View {
                         }
                     }
                     .padding(18)
+                }
+                .task(id: item.id) {
+                    let targetURL = item.plistURL
+                    let targetID = item.id
+                    guard targetURL.pathExtension.lowercased() == "plist" else {
+                        plistPreviewBox.value = (targetID, nil)
+                        return
+                    }
+                    let text = await Task.detached(priority: .utility) {
+                        Self.loadPlistTextOffMain(targetURL)
+                    }.value
+                    plistPreviewBox.value = (targetID, text)
                 }
 
                 // Bottom Action Bar
@@ -416,10 +432,12 @@ struct StartupProgramsView: View {
                         }
                         .buttonStyle(.borderedProminent)
                     } else {
+                        let isBusy = state.togglingStartupIDs.contains(item.id) || state.isPerformingRemoval
                         Button(item.isEnabled ? l10n.t("禁用此启动项", "Disable Item") : l10n.t("启用此启动项", "Enable Item")) {
                             Task { await state.toggleStartupItem(item, enable: !item.isEnabled) }
                         }
                         .buttonStyle(.bordered)
+                        .disabled(isBusy)
 
                         Spacer()
 
@@ -437,6 +455,8 @@ struct StartupProgramsView: View {
                                 )
                         }
                         .buttonStyle(.plain)
+                        .disabled(isBusy)
+                        .opacity(isBusy ? 0.55 : 1)
                     }
                 }
                 .padding(.horizontal, 18)
@@ -497,12 +517,11 @@ struct StartupProgramsView: View {
         }
     }
 
-    private func loadPlistText(_ url: URL) -> String? {
+    nonisolated private static func loadPlistTextOffMain(_ url: URL) -> String? {
         guard let data = try? Data(contentsOf: url) else { return nil }
         if let str = String(data: data, encoding: .utf8), str.contains("<?xml") {
             return String(str.prefix(6000))
         }
-        // Convert binary plist to XML for readable preview
         if let obj = try? PropertyListSerialization.propertyList(from: data, format: nil),
            let xml = try? PropertyListSerialization.data(fromPropertyList: obj, format: .xml, options: 0),
            let str = String(data: xml, encoding: .utf8) {

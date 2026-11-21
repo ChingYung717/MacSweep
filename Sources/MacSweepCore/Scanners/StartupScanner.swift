@@ -87,8 +87,9 @@ public struct StartupScanner: Sendable {
         }
 
         let fallbackLabel = url.deletingPathExtension().lastPathComponent
-        let label = (dict["Label"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let finalLabel = (label?.isEmpty == false) ? label! : fallbackLabel
+        let plistLabel = (dict["Label"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedPlistLabel = (plistLabel?.isEmpty == false) ? plistLabel : nil
+        let finalLabel = resolvedPlistLabel ?? fallbackLabel
 
         let program = dict["Program"] as? String
         let programArgs = dict["ProgramArguments"] as? [String] ?? []
@@ -112,9 +113,9 @@ public struct StartupScanner: Sendable {
             isOrphaned = !fm.fileExists(atPath: exe)
         }
 
-        // Attempt to identify enclosing .app from program or arguments
         let allCandidates = ([program].compactMap { $0 }) + programArgs
         let associated = Self.extractEnclosingApp(from: allCandidates)
+        let associatedExists = associated.map { fm.fileExists(atPath: $0.path) } ?? false
         let fileSize = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? Int64(data.count)
         let requiresAdmin = (scope != .userAgent) || safetyGuard.requiresAdmin(for: url)
 
@@ -130,6 +131,8 @@ public struct StartupScanner: Sendable {
             isOrphanedBinary: isOrphaned,
             associatedAppPath: associated?.path,
             associatedAppName: associated?.name,
+            associatedAppExists: associatedExists,
+            labelFromPlist: resolvedPlistLabel,
             requiresAdmin: requiresAdmin,
             canToggle: true,
             canRemove: true,
@@ -137,44 +140,105 @@ public struct StartupScanner: Sendable {
         )
     }
 
+    /// Scans both `Contents/Library/LoginItems/*.app` and `Contents/Library/LaunchAgents/*.plist`
+    /// across top-level apps and 1-level subfolders under `appSearchRoots`.
     private func scanAppEmbeddedLoginItems() -> [StartupItem] {
         let fm = FileManager.default
         var items: [StartupItem] = []
+        var seenIDs = Set<String>()
 
-        for root in appSearchRoots {
-            guard let children = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else {
-                continue
-            }
-            for appURL in children where appURL.pathExtension.lowercased() == "app" {
-                if safetyGuard.isSystemProtectedApp(at: appURL) { continue }
-                let appName = appURL.deletingPathExtension().lastPathComponent
+        func inspectEmbedded(in appURL: URL) {
+            if safetyGuard.isSystemProtectedApp(at: appURL) { return }
+            let appName = appURL.deletingPathExtension().lastPathComponent
 
-                // Contents/Library/LoginItems/*.app
-                let loginItemsDir = appURL.appendingPathComponent("Contents/Library/LoginItems")
-                if let helpers = try? fm.contentsOfDirectory(at: loginItemsDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
-                    for helper in helpers where helper.pathExtension.lowercased() == "app" {
-                        let helperBundle = Bundle(url: helper)
-                        let helperID = helperBundle?.bundleIdentifier ?? helper.deletingPathExtension().lastPathComponent
-                        items.append(StartupItem(
-                            label: helperID,
-                            plistURL: helper,
-                            programPath: helper.path,
-                            programArguments: [helper.path],
-                            scope: .appLoginItem,
-                            isEnabled: true,
-                            runAtLoad: true,
-                            keepAlive: false,
-                            isOrphanedBinary: false,
-                            associatedAppPath: appURL.path,
-                            associatedAppName: appName,
-                            requiresAdmin: false,
-                            canToggle: false,
-                            canRemove: false,
-                            fileSize: 0
-                        ))
+            // 1. Contents/Library/LoginItems/*.app
+            let loginItemsDir = appURL.appendingPathComponent("Contents/Library/LoginItems")
+            if let helpers = try? fm.contentsOfDirectory(at: loginItemsDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+                for helper in helpers where helper.pathExtension.lowercased() == "app" {
+                    let helperBundle = Bundle(url: helper)
+                    let helperID = helperBundle?.bundleIdentifier ?? helper.deletingPathExtension().lastPathComponent
+                    let item = StartupItem(
+                        label: helperID,
+                        plistURL: helper,
+                        programPath: helper.path,
+                        programArguments: [helper.path],
+                        scope: .appLoginItem,
+                        isEnabled: true,
+                        runAtLoad: true,
+                        keepAlive: false,
+                        isOrphanedBinary: false,
+                        associatedAppPath: appURL.path,
+                        associatedAppName: appName,
+                        associatedAppExists: true,
+                        labelFromPlist: helperID,
+                        requiresAdmin: false,
+                        canToggle: false,
+                        canRemove: false,
+                        fileSize: 0
+                    )
+                    if seenIDs.insert(item.id).inserted {
+                        items.append(item)
                     }
                 }
             }
+
+            // 2. Contents/Library/LaunchAgents/*.plist (modern SMAppService embedded agents)
+            let embeddedAgentsDir = appURL.appendingPathComponent("Contents/Library/LaunchAgents")
+            if let plists = try? fm.contentsOfDirectory(at: embeddedAgentsDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+                for plistURL in plists where plistURL.pathExtension.lowercased() == "plist" {
+                    let meta = LibraryIndex.parseLaunchPlistMetadata(at: plistURL)
+                    let label = meta.label ?? plistURL.deletingPathExtension().lastPathComponent
+                    if label.lowercased().hasPrefix("com.apple.") { continue }
+                    let item = StartupItem(
+                        label: label,
+                        plistURL: plistURL,
+                        programPath: meta.programs.first,
+                        programArguments: meta.programs,
+                        scope: .appLoginItem,
+                        isEnabled: true,
+                        runAtLoad: true,
+                        keepAlive: false,
+                        isOrphanedBinary: false,
+                        associatedAppPath: appURL.path,
+                        associatedAppName: appName,
+                        associatedAppExists: true,
+                        labelFromPlist: meta.label,
+                        requiresAdmin: false,
+                        canToggle: false,
+                        canRemove: false,
+                        fileSize: 0
+                    )
+                    if seenIDs.insert(item.id).inserted {
+                        items.append(item)
+                    }
+                }
+            }
+        }
+
+        func walkApps(in dir: URL, depth: Int) {
+            guard let children = try? fm.contentsOfDirectory(
+                at: dir,
+                includingPropertiesForKeys: [.isDirectoryKey, .isPackageKey, .isSymbolicLinkKey],
+                options: [.skipsHiddenFiles]
+            ) else {
+                return
+            }
+            for child in children {
+                if child.pathExtension.lowercased() == "app" {
+                    inspectEmbedded(in: child)
+                    continue
+                }
+                if depth == 0 {
+                    let vals = try? child.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey, .isSymbolicLinkKey])
+                    if vals?.isDirectory == true, vals?.isPackage != true, vals?.isSymbolicLink != true {
+                        walkApps(in: child, depth: 1)
+                    }
+                }
+            }
+        }
+
+        for root in appSearchRoots {
+            walkApps(in: root, depth: 0)
         }
         return items
     }
@@ -209,14 +273,22 @@ public struct StartupScanner: Sendable {
         return result
     }
 
+    /// Extracts the outermost enclosing `.app` bundle using strict path-component boundaries
+    /// (never mis-splits `.application`, `.appex`, or `com.apple.*` substrings).
     public static func extractEnclosingApp(from paths: [String]) -> (path: String, name: String)? {
-        for raw in paths {
-            guard let range = raw.range(of: ".app", options: .caseInsensitive) else { continue }
-            let appPath = String(raw[..<range.upperBound])
-            let appURL = URL(fileURLWithPath: appPath)
-            let name = appURL.deletingPathExtension().lastPathComponent
-            if !name.isEmpty {
-                return (appPath, name)
+        for raw in paths where raw.hasPrefix("/") {
+            let components = URL(fileURLWithPath: raw).pathComponents
+            var built = ""
+            for comp in components {
+                if comp == "/" {
+                    built = "/"
+                    continue
+                }
+                built = (built == "/") ? "/\(comp)" : "\(built)/\(comp)"
+                if comp.lowercased().hasSuffix(".app") && comp.count > 4 {
+                    let name = String(comp.dropLast(4))
+                    return (built, name)
+                }
             }
         }
         return nil

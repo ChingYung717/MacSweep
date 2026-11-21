@@ -34,8 +34,12 @@ struct ConfirmationSheet: View {
         confirmation.targets.reduce(0) { $0 + $1.estimatedSize }
     }
 
+    private var effectivePackageIDs: [String] {
+        selectedMode == .permanent ? confirmation.packageIDsToForget : []
+    }
+
     private var hasAdminItems: Bool {
-        confirmation.targets.contains(where: \.requiresAdmin) || !confirmation.packageIDsToForget.isEmpty
+        confirmation.targets.contains(where: \.requiresAdmin) || !effectivePackageIDs.isEmpty
     }
 
     var body: some View {
@@ -147,9 +151,9 @@ struct ConfirmationSheet: View {
                             .padding(.vertical, 2)
                         }
 
-                        if !confirmation.packageIDsToForget.isEmpty {
+                        if !effectivePackageIDs.isEmpty {
                             Divider().opacity(0.3).padding(.vertical, 4)
-                            Text("\(l10n.pkgReceiptsNote): \(confirmation.packageIDsToForget.joined(separator: ", "))")
+                            Text("\(l10n.pkgReceiptsNote): \(effectivePackageIDs.joined(separator: ", "))")
                                 .font(.system(size: 11, design: .monospaced))
                                 .foregroundStyle(palette.secondaryText)
                         }

@@ -54,6 +54,9 @@ struct PendingConfirmation: Identifiable {
     let packageIDsToForget: [String]
     let runningAppBundleIDs: [String]
     let runningAppNames: [String]
+    let targetAppBundleIDs: [String]
+    let targetAppURLs: [URL]
+    let browserBundleIDsToRequireClosed: [String]
     let hasAppleAppStoreApp: Bool
     let hasChromiumExtension: Bool
     let sourceTab: MainTab
@@ -61,7 +64,8 @@ struct PendingConfirmation: Identifiable {
     let affectedStartupIDs: [String]
     let affectedExtensionIDs: [String]
     let affectedLeftoverIDs: [String]
-    /// Preference domains to flush from cfprefsd after a successful reset.
+    /// Preference domains eligible for `cfprefsd` cache flush after a successful reset (only flushed if
+    /// their preference `.plist` was actually removed).
     var resetBundleIDs: [String] = []
 }
 
@@ -73,6 +77,7 @@ struct OperationBanner: Identifiable, Equatable {
     let showFDALink: Bool
     /// Apps that did not quit gracefully; the banner offers an explicit (user-confirmed) Force Quit.
     var forceQuitBundleIDs: [String] = []
+    var forceQuitBundleURLs: [URL] = []
 }
 
 @MainActor
@@ -95,6 +100,8 @@ final class AppState: ObservableObject {
     private var libraryIndex: LibraryIndex?
     private var cachedThirdPartyPackages: [String]?
     private var ambiguousNames: Set<String> = []
+    private var allInstalledBundleIDs: Set<String> = []
+    private var allInstalledAppPaths: Set<String> = []
 
     // Tab 1: Applications
     @Published var apps: [AppItem] = []
@@ -108,19 +115,21 @@ final class AppState: ObservableObject {
     @Published var includeAppBundleInRemoval: Bool = true
     @Published var isPerformingRemoval: Bool = false
 
-    // Tab 2: Startup (wired in M2)
+    // Tab 2: Startup
     @Published var startupItems: [StartupItem] = []
     @Published var isScanningStartup: Bool = false
     @Published var startupSearchText: String = ""
+    @Published var togglingStartupIDs: Set<String> = []
 
-    // Tab 3: Extensions (M4)
+    // Tab 3: Extensions
     @Published var extensionItems: [ExtensionItem] = []
     @Published var isScanningExtensions: Bool = false
     @Published var extensionsNeedFDAForBrowsers: Bool = false
     @Published var blockedBrowserNames: [String] = []
     @Published var extensionSearchText: String = ""
+    @Published var togglingExtensionIDs: Set<String> = []
 
-    // Tab 4: Leftovers (wired in M3)
+    // Tab 4: Leftovers
     @Published var leftoverGroups: [LeftoverGroup] = []
     @Published var isScanningLeftovers: Bool = false
     @Published var leftoverSearchText: String = ""
@@ -170,7 +179,7 @@ final class AppState: ObservableObject {
         cleanupHistory = []
     }
 
-    // MARK: - Applications Scanning (M1)
+    // MARK: - Applications Scanning
 
     func loadInitialDataIfNeeded() async {
         refreshPermissionStatus()
@@ -191,7 +200,7 @@ final class AppState: ObservableObject {
         let includeUtil = preferences.includeUtilitiesFolder
         let showSys = preferences.showSystemApps
 
-        let (scannedApps, index, thirdPartyPkgs, ambiguous) = await Task.detached(priority: .userInitiated) {
+        let (scannedApps, index, thirdPartyPkgs, ambiguous, installedIDs, installedPaths) = await Task.detached(priority: .userInitiated) {
             let index = LibraryIndex.build(safetyGuard: guardCopy)
             let scanner = AppScanner(
                 includeUtilities: includeUtil,
@@ -200,13 +209,19 @@ final class AppState: ObservableObject {
             )
             let matcher = ServiceFileMatcher(safetyGuard: guardCopy)
             var found = scanner.scanApplications()
-            // Names claimed by ≥2 installed apps (e.g. shared executables) are never used for name matching.
             let ambiguous = ServiceFileMatcher.ambiguousNameCandidates(across: found)
-            // Installed copies sharing one bundle ID share their data: never pre-select it for removal.
+            let installedIDs = Set(found.map { $0.bundleID.lowercased() }.filter { !$0.hasPrefix("unknown.") })
+            let installedPaths = Set(found.map { $0.url.standardizedFileURL.path })
+
             var bundleIDCounts: [String: Int] = [:]
             for app in found { bundleIDCounts[app.bundleID.lowercased(), default: 0] += 1 }
             for i in found.indices {
-                var matched = matcher.matchInMemory(app: found[i], index: index, ambiguousNames: ambiguous)
+                var matched = matcher.matchInMemory(
+                    app: found[i],
+                    index: index,
+                    ambiguousNames: ambiguous,
+                    allInstalledBundleIDs: installedIDs
+                )
                 if (bundleIDCounts[found[i].bundleID.lowercased()] ?? 0) > 1 {
                     found[i].sharesBundleIDWithOtherApp = true
                     for j in matched.indices { matched[j].isSelected = false }
@@ -215,22 +230,22 @@ final class AppState: ObservableObject {
                 found[i].scanState = .ready
             }
             let pkgs = ServiceFileMatcher.listThirdPartyPackages()
-            return (found, index, pkgs, ambiguous)
+            return (found, index, pkgs, ambiguous, installedIDs, installedPaths)
         }.value
 
         guard gen == scanGeneration else { return }
         self.libraryIndex = index
         self.cachedThirdPartyPackages = thirdPartyPkgs
         self.ambiguousNames = ambiguous
+        self.allInstalledBundleIDs = installedIDs
+        self.allInstalledAppPaths = installedPaths
         self.apps = scannedApps
         self.isScanningApps = false
 
-        // Keep selection valid if still present
         if let sel = selectedAppID, !apps.contains(where: { $0.id == sel }) {
             selectedAppID = nil
         }
 
-        // Start bounded concurrent size calculation in background
         startBackgroundSizeCalculation(generation: gen)
     }
 
@@ -240,7 +255,6 @@ final class AppState: ObservableObject {
         let sizerRef = self.sizer
 
         sizeTask = Task.detached(priority: .utility) { [weak self] in
-            // Process in small batches so UI updates progressively.
             let batchSize = 8
             for start in stride(from: 0, to: currentApps.count, by: batchSize) {
                 if Task.isCancelled { return }
@@ -280,7 +294,7 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// Lazy pkgutil enrichment + fresh size computation when an app is selected.
+    /// Lazy pkgutil enrichment (idempotent via `hasEnrichedPackages` and guarded by `scanGeneration`).
     func selectApp(id: String?) {
         droppedApp = nil
         selectedAppID = id
@@ -293,14 +307,17 @@ final class AppState: ObservableObject {
     private func enrichSelectedAppWithPackages(appID: String) {
         guard let idx = apps.firstIndex(where: { $0.id == appID }) else { return }
         let targetApp = apps[idx]
-        guard targetApp.matchedPackageIDs.isEmpty,
+        guard !targetApp.hasEnrichedPackages,
               let index = libraryIndex,
               let allPkgs = cachedThirdPartyPackages else {
             return
         }
+        let gen = scanGeneration
         let guardCopy = safetyGuard
         let sizerRef = sizer
         let ambiguous = ambiguousNames
+        let installedIDs = allInstalledBundleIDs
+        let otherPaths = allInstalledAppPaths.subtracting([targetApp.url.standardizedFileURL.path])
         let shared = targetApp.sharesBundleIDWithOtherApp
 
         Task.detached(priority: .userInitiated) { [weak self] in
@@ -309,23 +326,33 @@ final class AppState: ObservableObject {
                 app: targetApp,
                 index: index,
                 allPackageIDs: allPkgs,
-                ambiguousNames: ambiguous
+                ambiguousNames: ambiguous,
+                allInstalledBundleIDs: installedIDs,
+                otherInstalledAppPaths: otherPaths
             )
-            let allURLs = [targetApp.url] + result.files.map(\.url)
+            // Keep only entries still present on disk so deleted files can never resurrect.
+            let liveFiles = result.files.filter { RemovalEngine.entryExists($0.url) }
+            let allURLs = [targetApp.url] + liveFiles.map(\.url)
             let sizeMap = await sizerRef.sizes(of: allURLs, maxConcurrency: 6)
 
-            var sizedFiles = result.files
+            var sizedFiles = liveFiles
             for i in sizedFiles.indices {
                 sizedFiles[i].size = sizeMap[sizedFiles[i].url.standardizedFileURL.path] ?? 0
                 if shared { sizedFiles[i].isSelected = false }
             }
             let bundleSize = sizeMap[targetApp.url.standardizedFileURL.path] ?? targetApp.bundleSize ?? 0
-            // A duplicate copy must not forget the shared installer receipt.
             let pkgIDs = shared ? [] : result.matchedPackageIDs
+            let isRunningNow = !AppScanner.runningProcesses(
+                matchingBundleIDs: [targetApp.bundleID],
+                bundleURLs: [targetApp.url]
+            ).isEmpty
 
             let immutableSized = sizedFiles
             await MainActor.run { [weak self] in
-                guard let self, let liveIdx = self.apps.firstIndex(where: { $0.id == appID }) else { return }
+                guard let self, self.scanGeneration == gen,
+                      let liveIdx = self.apps.firstIndex(where: { $0.id == appID }) else {
+                    return
+                }
                 let existingSelection = Dictionary(
                     uniqueKeysWithValues: self.apps[liveIdx].serviceFiles.map { ($0.id, $0.isSelected) }
                 )
@@ -338,9 +365,8 @@ final class AppState: ObservableObject {
                 self.apps[liveIdx].bundleSize = bundleSize
                 self.apps[liveIdx].serviceFiles = merged
                 self.apps[liveIdx].matchedPackageIDs = pkgIDs
-                self.apps[liveIdx].isRunning = AppScanner.runningBundleIDs().contains(
-                    self.apps[liveIdx].bundleID.lowercased()
-                )
+                self.apps[liveIdx].hasEnrichedPackages = true
+                self.apps[liveIdx].isRunning = isRunningNow
             }
         }
     }
@@ -348,9 +374,17 @@ final class AppState: ObservableObject {
     /// Handles Drag & Drop of any `.app` bundle (even outside `/Applications`) or Dock drop.
     func inspectDroppedApp(at url: URL) {
         guard url.pathExtension.lowercased() == "app" else { return }
+        if safetyGuard.isSelfApp(bundleID: nil, url: url) {
+            banner = OperationBanner(
+                isError: true,
+                message: l10n.t("MacSweep 受自我保护，无法卸载或重置自身。", "MacSweep is self-protected and cannot uninstall or reset itself."),
+                showAppManagementLink: false,
+                showFDALink: false
+            )
+            return
+        }
         activeTab = .applications
 
-        // If already in scanned list, select it directly!
         let stdPath = url.standardizedFileURL.path
         if let existing = apps.first(where: { $0.url.standardizedFileURL.path == stdPath }) {
             selectApp(id: existing.id)
@@ -361,24 +395,36 @@ final class AppState: ObservableObject {
         let existingIndex = libraryIndex
         let existingPkgs = cachedThirdPartyPackages
         let sizerRef = sizer
-        let installedApps = apps
+        let knownApps = apps
+        let includeUtil = preferences.includeUtilitiesFolder
+        let showSys = preferences.showSystemApps
 
         Task.detached(priority: .userInitiated) { [weak self] in
-            let scanner = AppScanner(safetyGuard: guardCopy)
+            let scanner = AppScanner(
+                includeUtilities: includeUtil,
+                showSystemApps: showSys,
+                safetyGuard: guardCopy
+            )
             guard var inspected = scanner.inspectApp(at: url) else { return }
+            let installedApps = knownApps.isEmpty ? scanner.scanApplications() : knownApps
             let index = existingIndex ?? LibraryIndex.build(safetyGuard: guardCopy)
             let pkgs = existingPkgs ?? ServiceFileMatcher.listThirdPartyPackages()
-            let ambiguous = ServiceFileMatcher.ambiguousNameCandidates(across: installedApps + [inspected])
+            let allApps = installedApps + [inspected]
+            let ambiguous = ServiceFileMatcher.ambiguousNameCandidates(across: allApps)
+            let installedIDs = Set(allApps.map { $0.bundleID.lowercased() }.filter { !$0.hasPrefix("unknown.") })
+            let otherPaths = Set(installedApps.map { $0.url.standardizedFileURL.path }).subtracting([stdPath])
             let shared = installedApps.contains {
                 $0.bundleID.lowercased() == inspected.bundleID.lowercased()
-                    && $0.url.standardizedFileURL.path != inspected.url.standardizedFileURL.path
+                    && $0.url.standardizedFileURL.path != stdPath
             }
             let matcher = ServiceFileMatcher(safetyGuard: guardCopy)
             let matched = matcher.matchWithPackages(
                 app: inspected,
                 index: index,
                 allPackageIDs: pkgs,
-                ambiguousNames: ambiguous
+                ambiguousNames: ambiguous,
+                allInstalledBundleIDs: installedIDs,
+                otherInstalledAppPaths: otherPaths
             )
 
             let urls = [inspected.url] + matched.files.map(\.url)
@@ -386,6 +432,7 @@ final class AppState: ObservableObject {
 
             inspected.bundleSize = sizes[inspected.url.standardizedFileURL.path] ?? 0
             inspected.sharesBundleIDWithOtherApp = shared
+            inspected.hasEnrichedPackages = true
             inspected.serviceFiles = matched.files.map { sf in
                 var copy = sf
                 copy.size = sizes[sf.url.standardizedFileURL.path] ?? 0
@@ -410,8 +457,14 @@ final class AppState: ObservableObject {
 
     var activeDetailApp: AppItem? {
         if let droppedApp { return droppedApp }
-        guard let selectedAppID else { return nil }
-        return apps.first(where: { $0.id == selectedAppID })
+        if let selectedAppID, let found = apps.first(where: { $0.id == selectedAppID }) {
+            return found
+        }
+        // If exactly 1 app is checked and no explicit row selected, show its full detail tree.
+        if checkedApps.count == 1 {
+            return checkedApps.first
+        }
+        return nil
     }
 
     var checkedApps: [AppItem] {
@@ -469,6 +522,7 @@ final class AppState: ObservableObject {
 
     func toggleServiceFile(appID: String, fileID: String) {
         if var dropped = droppedApp, dropped.id == appID {
+            guard dropped.canUninstall else { return }
             if let sfIdx = dropped.serviceFiles.firstIndex(where: { $0.id == fileID }) {
                 dropped.serviceFiles[sfIdx].isSelected.toggle()
                 droppedApp = dropped
@@ -476,6 +530,7 @@ final class AppState: ObservableObject {
             return
         }
         guard let appIdx = apps.firstIndex(where: { $0.id == appID }),
+              apps[appIdx].canUninstall,
               let sfIdx = apps[appIdx].serviceFiles.firstIndex(where: { $0.id == fileID }) else {
             return
         }
@@ -484,13 +539,14 @@ final class AppState: ObservableObject {
 
     func toggleServiceCategory(appID: String, category: ServiceFileCategory, selected: Bool) {
         if var dropped = droppedApp, dropped.id == appID {
+            guard dropped.canUninstall else { return }
             for i in dropped.serviceFiles.indices where dropped.serviceFiles[i].category == category {
                 dropped.serviceFiles[i].isSelected = selected
             }
             droppedApp = dropped
             return
         }
-        guard let appIdx = apps.firstIndex(where: { $0.id == appID }) else { return }
+        guard let appIdx = apps.firstIndex(where: { $0.id == appID }), apps[appIdx].canUninstall else { return }
         for i in apps[appIdx].serviceFiles.indices where apps[appIdx].serviceFiles[i].category == category {
             apps[appIdx].serviceFiles[i].isSelected = selected
         }
@@ -507,26 +563,33 @@ final class AppState: ObservableObject {
     }
 
     private func refreshAppProtectionFlags() {
-        let protectedIDs = Set(preferences.protectedBundleIDs.map { $0.lowercased() })
+        let guardCopy = safetyGuard
         for i in apps.indices {
-            let isProt = protectedIDs.contains(apps[i].bundleID.lowercased())
+            let isProt = guardCopy.isUserProtected(bundleID: apps[i].bundleID, url: apps[i].url)
             apps[i].isProtected = isProt
             if isProt { apps[i].isChecked = false }
         }
         if var dropped = droppedApp {
-            dropped.isProtected = protectedIDs.contains(dropped.bundleID.lowercased())
+            dropped.isProtected = guardCopy.isUserProtected(bundleID: dropped.bundleID, url: dropped.url)
             droppedApp = dropped
         }
     }
 
     func quitApp(_ app: AppItem) async {
-        _ = await RemovalEngine.terminateRunningApps(bundleIDs: [app.bundleID], forceAfterTimeout: false)
-        let running = AppScanner.runningBundleIDs()
+        _ = await RemovalEngine.terminateRunningApps(
+            bundleIDs: [app.bundleID],
+            bundleURLs: [app.url],
+            forceAfterTimeout: false
+        )
+        let stillRunning = !AppScanner.runningProcesses(
+            matchingBundleIDs: [app.bundleID],
+            bundleURLs: [app.url]
+        ).isEmpty
         if let idx = apps.firstIndex(where: { $0.id == app.id }) {
-            apps[idx].isRunning = running.contains(apps[idx].bundleID.lowercased())
+            apps[idx].isRunning = stillRunning
         }
         if var dropped = droppedApp, dropped.id == app.id {
-            dropped.isRunning = running.contains(dropped.bundleID.lowercased())
+            dropped.isRunning = stillRunning
             droppedApp = dropped
         }
     }
@@ -534,31 +597,36 @@ final class AppState: ObservableObject {
     // MARK: - Removal Preparation & Execution
 
     func prepareRemovalForCurrentApps() {
-        let runningNow = AppScanner.runningBundleIDs()
         var targets: [RemovalTarget] = []
+        var seenPaths = Set<String>()
         var pkgIDs: [String] = []
-        var runningBundleIDs: [String] = []
-        var runningNames: [String] = []
+        var targetBundleIDs: [String] = []
+        var targetAppURLs: [URL] = []
         var hasAppleStore = false
         var affectedIDs: [String] = []
 
-        // Batch mode if multiple apps checked; otherwise active single/dropped app.
+        func appendTarget(_ target: RemovalTarget) {
+            let key = target.url.standardizedFileURL.path
+            if seenPaths.insert(key).inserted {
+                targets.append(target)
+            }
+        }
+
+        // Batch mode only when 2+ apps are checked (or 1 checked app with no distinct single detail).
         let batch = checkedApps
-        if !batch.isEmpty && droppedApp == nil {
+        if batch.count >= 2 && droppedApp == nil {
             for app in batch {
                 affectedIDs.append(app.id)
+                targetBundleIDs.append(app.bundleID)
+                targetAppURLs.append(app.url)
                 if app.isAppleAppStoreApp { hasAppleStore = true }
-                if runningNow.contains(app.bundleID.lowercased()) {
-                    runningBundleIDs.append(app.bundleID)
-                    runningNames.append(app.localizedName)
-                }
-                targets.append(RemovalTarget(
+                appendTarget(RemovalTarget(
                     url: app.url,
                     estimatedSize: app.bundleSize ?? 0,
                     requiresAdmin: app.requiresAdmin
                 ))
                 for sf in app.serviceFiles where sf.isSelected {
-                    targets.append(RemovalTarget(
+                    appendTarget(RemovalTarget(
                         url: sf.url,
                         estimatedSize: sf.size ?? 0,
                         requiresAdmin: sf.requiresAdmin
@@ -567,14 +635,20 @@ final class AppState: ObservableObject {
                 pkgIDs.append(contentsOf: app.matchedPackageIDs)
             }
             guard !targets.isEmpty else { return }
-            let title = l10n.isChinese ? "批量卸载 \(batch.count) 个应用" : "Uninstall \(batch.count) apps"
+            let running = AppScanner.runningProcesses(matchingBundleIDs: targetBundleIDs, bundleURLs: targetAppURLs)
+            let title = l10n.isChinese
+                ? "批量卸载 \(batch.count) 个应用"
+                : (batch.count == 1 ? "Uninstall 1 app" : "Uninstall \(batch.count) apps")
             pendingConfirmation = PendingConfirmation(
                 title: title,
                 isReset: false,
                 targets: targets,
                 packageIDsToForget: Array(Set(pkgIDs)),
-                runningAppBundleIDs: runningBundleIDs,
-                runningAppNames: runningNames,
+                runningAppBundleIDs: Array(Set(running.map(\.bundleID).filter { !$0.isEmpty })),
+                runningAppNames: Array(Set(running.map(\.name))),
+                targetAppBundleIDs: targetBundleIDs,
+                targetAppURLs: targetAppURLs,
+                browserBundleIDsToRequireClosed: [],
                 hasAppleAppStoreApp: hasAppleStore,
                 hasChromiumExtension: false,
                 sourceTab: .applications,
@@ -589,14 +663,12 @@ final class AppState: ObservableObject {
         guard let app = activeDetailApp, app.canUninstall else { return }
         let isReset = (appActionMode == .reset)
         affectedIDs = [app.id]
+        targetBundleIDs = [app.bundleID]
+        targetAppURLs = [app.url]
         if app.isAppleAppStoreApp && !isReset { hasAppleStore = true }
-        if runningNow.contains(app.bundleID.lowercased()) {
-            runningBundleIDs = [app.bundleID]
-            runningNames = [app.localizedName]
-        }
 
         if !isReset && includeAppBundleInRemoval {
-            targets.append(RemovalTarget(
+            appendTarget(RemovalTarget(
                 url: app.url,
                 estimatedSize: app.bundleSize ?? 0,
                 requiresAdmin: app.requiresAdmin
@@ -605,7 +677,7 @@ final class AppState: ObservableObject {
         }
 
         for sf in app.serviceFiles where sf.isSelected {
-            targets.append(RemovalTarget(
+            appendTarget(RemovalTarget(
                 url: sf.url,
                 estimatedSize: sf.size ?? 0,
                 requiresAdmin: sf.requiresAdmin
@@ -613,6 +685,7 @@ final class AppState: ObservableObject {
         }
 
         guard !targets.isEmpty else { return }
+        let running = AppScanner.runningProcesses(matchingBundleIDs: targetBundleIDs, bundleURLs: targetAppURLs)
         let title = isReset
             ? (l10n.isChinese ? "重置 \(app.localizedName)" : "Reset \(app.localizedName)")
             : (l10n.isChinese ? "卸载 \(app.localizedName)" : "Uninstall \(app.localizedName)")
@@ -622,8 +695,11 @@ final class AppState: ObservableObject {
             isReset: isReset,
             targets: targets,
             packageIDsToForget: pkgIDs,
-            runningAppBundleIDs: runningBundleIDs,
-            runningAppNames: runningNames,
+            runningAppBundleIDs: Array(Set(running.map(\.bundleID).filter { !$0.isEmpty })),
+            runningAppNames: Array(Set(running.map(\.name))),
+            targetAppBundleIDs: targetBundleIDs,
+            targetAppURLs: targetAppURLs,
+            browserBundleIDsToRequireClosed: [],
             hasAppleAppStoreApp: hasAppleStore,
             hasChromiumExtension: false,
             sourceTab: .applications,
@@ -640,37 +716,68 @@ final class AppState: ObservableObject {
         pendingConfirmation = nil
         isPerformingRemoval = true
 
-        // 1. Quit running apps gracefully first. Never force-quit silently and never delete files of an
-        //    app that is still running (it may hold unsaved documents, and cfprefsd could write back).
-        if !conf.runningAppBundleIDs.isEmpty {
-            let stillRunning = await RemovalEngine.terminateRunningApps(
-                bundleIDs: conf.runningAppBundleIDs,
-                forceAfterTimeout: false
+        // 0. TOCTOU guard for browser extensions (Chromium & Firefox): abort if browser launched while sheet was open.
+        if !conf.browserBundleIDsToRequireClosed.isEmpty {
+            let liveBrowsers = AppScanner.runningProcesses(
+                matchingBundleIDs: conf.browserBundleIDsToRequireClosed,
+                bundleURLs: []
             )
-            if !stillRunning.isEmpty {
+            if !liveBrowsers.isEmpty {
                 isPerformingRemoval = false
+                let names = liveBrowsers.map(\.name).joined(separator: ", ")
                 banner = OperationBanner(
                     isError: true,
                     message: l10n.t(
-                        "应用未能正常退出（可能有未保存的文档），已取消操作，未删除任何文件。请先手动退出，或确认后强制退出再重试。",
-                        "The app did not quit (it may have unsaved documents). Nothing was removed. Quit it manually, or force quit and retry."
+                        "检测到浏览器（\(names)）正在运行，已中止移除扩展，请先退出浏览器后再试。",
+                        "Browser (\(names)) is currently running. Extension removal aborted — quit the browser first and retry."
                     ),
                     showAppManagementLink: false,
-                    showFDALink: false,
-                    forceQuitBundleIDs: stillRunning
+                    showFDALink: false
                 )
                 return
+            }
+        }
+
+        // 1. TOCTOU re-check & graceful quit for target apps AND embedded Helpers/MenuBar processes.
+        if !conf.targetAppBundleIDs.isEmpty || !conf.targetAppURLs.isEmpty {
+            let liveProcesses = AppScanner.runningProcesses(
+                matchingBundleIDs: conf.targetAppBundleIDs,
+                bundleURLs: conf.targetAppURLs
+            )
+            if !liveProcesses.isEmpty {
+                let idsToQuit = Array(Set(conf.targetAppBundleIDs + liveProcesses.map(\.bundleID)))
+                let stillRunning = await RemovalEngine.terminateRunningApps(
+                    bundleIDs: idsToQuit,
+                    bundleURLs: conf.targetAppURLs,
+                    forceAfterTimeout: false
+                )
+                if !stillRunning.isEmpty {
+                    isPerformingRemoval = false
+                    banner = OperationBanner(
+                        isError: true,
+                        message: l10n.t(
+                            "应用未能正常退出（可能有未保存的文档），已取消操作，未删除任何文件。请先手动退出，或确认后强制退出再重试。",
+                            "The app did not quit (it may have unsaved documents). Nothing was removed. Quit it manually, or force quit and retry."
+                        ),
+                        showAppManagementLink: false,
+                        showFDALink: false,
+                        forceQuitBundleIDs: stillRunning,
+                        forceQuitBundleURLs: conf.targetAppURLs
+                    )
+                    return
+                }
             }
         }
 
         let guardCopy = safetyGuard
         let histStore = historyStore
 
-        // 2. Unload launchd services whose plists are about to be removed (F2): bootout first, verify it is
-        //    no longer loaded, and only then allow the plist to be deleted.
+        // 2. Unload launchd services whose plists are about to be removed (F2).
         let launchTargets = StartupController.launchTargets(for: conf.targets.map(\.url))
         var targetsToRemove = conf.targets
         var stillLoadedPlists = Set<String>()
+        var unloadErrorMessage: String?
+
         if !launchTargets.isEmpty {
             let unload = await Task.detached(priority: .userInitiated) {
                 StartupController(privilegedExecutor: PrivilegedExecutor(safetyGuard: guardCopy))
@@ -687,9 +794,12 @@ final class AppState: ObservableObject {
                 return
             }
             stillLoadedPlists = unload.stillLoadedPlists
+            unloadErrorMessage = unload.errorMessage
             targetsToRemove.removeAll { stillLoadedPlists.contains($0.url.standardizedFileURL.path) }
         }
 
+        // F1 + F2 interaction: NEVER forget pkg receipts if any launchd service failed to unload and stayed on disk.
+        let safePkgIDs = stillLoadedPlists.isEmpty ? conf.packageIDsToForget : []
         let removalTargets = targetsToRemove
         let report = await Task.detached(priority: .userInitiated) {
             let engine = RemovalEngine(safetyGuard: guardCopy, historyStore: histStore)
@@ -697,53 +807,64 @@ final class AppState: ObservableObject {
                 targets: removalTargets,
                 mode: mode,
                 actionTitle: conf.title,
-                packageIDsToForget: conf.packageIDsToForget
+                packageIDsToForget: safePkgIDs
             )
         }.value
-
-        // 3. Reset: flush cfprefsd's in-memory cache for the domain so stale values are not written back
-        //    or served on next launch. Best-effort and isolated (failure does not affect the removal result).
-        if conf.isReset && !report.succeededURLs.isEmpty {
-            let domains = conf.resetBundleIDs
-            await Task.detached(priority: .utility) {
-                for domain in domains {
-                    _ = ProcessRunner.run(executable: "/usr/bin/defaults", arguments: ["delete", domain])
-                }
-            }.value
-        }
 
         isPerformingRemoval = false
         cleanupHistory = historyStore.load()
 
+        // Always sync UI for any paths that were actually removed (even if user cancelled partway).
+        let removedSet = Set(report.succeededURLs.map { $0.standardizedFileURL.path })
+        if !removedSet.isEmpty {
+            let forgottenPkgs = (mode == .permanent && report.isFullSuccess) ? safePkgIDs : []
+            applyIncrementalRemoval(removedPaths: removedSet, forgottenPackageIDs: forgottenPkgs)
+        }
+
         if report.cancelledByUser {
             banner = OperationBanner(
                 isError: false,
-                message: l10n.t("已取消管理员授权，未删除受保护项。", "Administrator authorization cancelled."),
+                message: removedSet.isEmpty
+                    ? l10n.t("已取消管理员授权，未删除任何文件。", "Administrator authorization cancelled. Nothing was removed.")
+                    : l10n.t("已取消管理员授权，受保护项未删除。", "Administrator authorization cancelled; protected items were not removed."),
                 showAppManagementLink: false,
                 showFDALink: false
             )
             return
         }
 
-        // Apply incremental UI updates for succeeded paths
-        let removedSet = Set(report.succeededURLs.map { $0.standardizedFileURL.path })
-        applyIncrementalRemoval(removedPaths: removedSet, confirmation: conf)
+        // 3. Reset: ONLY flush `cfprefsd` for domains whose preference `.plist` was ACTUALLY removed!
+        if conf.isReset && !report.succeededURLs.isEmpty {
+            let removedPrefDomains = Self.preferenceDomainsRemoved(
+                in: report.succeededURLs,
+                candidateDomains: conf.resetBundleIDs
+            )
+            if !removedPrefDomains.isEmpty {
+                await Task.detached(priority: .utility) {
+                    for domain in removedPrefDomains {
+                        _ = ProcessRunner.run(executable: "/usr/bin/defaults", arguments: ["delete", domain])
+                    }
+                }.value
+            }
+        }
 
-        // Show feedback banner
+        // Feedback banner
         let failureCount = report.failures.count + stillLoadedPlists.count
         if failureCount == 0 {
             let freed = ByteFormatter.format(report.freedBytes)
+            let warningSuffix = report.warnings.isEmpty ? "" : "（\(report.warnings.joined(separator: "；"))）"
             let msg = l10n.isChinese
-                ? "已完成：移除了 \(report.succeededURLs.count) 个项目，释放 \(freed)"
-                : "Completed: removed \(report.succeededURLs.count) items, freed \(freed)"
+                ? "已完成：移除了 \(report.succeededURLs.count) 个项目，释放 \(freed)\(warningSuffix)"
+                : "Completed: removed \(report.succeededURLs.count) items, freed \(freed)\(warningSuffix)"
             banner = OperationBanner(
-                isError: false,
+                isError: !report.warnings.isEmpty,
                 message: msg,
                 showAppManagementLink: false,
                 showFDALink: false
             )
         } else {
             let firstErr = report.failures.first?.reason
+                ?? unloadErrorMessage
                 ?? l10n.t("后台服务仍在运行，已保留其配置文件", "Launch service still loaded; its plist was kept")
             let msg = l10n.isChinese
                 ? "部分项目移除失败（成功 \(report.succeededURLs.count) 项，失败 \(failureCount) 项）：\(firstErr)"
@@ -757,12 +878,43 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Returns only candidate bundle IDs (excluding synthetic `unknown.*`) that had a matching
+    /// preference `.plist` actually removed under a `/Preferences/` directory.
+    static func preferenceDomainsRemoved(in removedURLs: [URL], candidateDomains: [String]) -> [String] {
+        let removedPrefFilenames = removedURLs.compactMap { url -> String? in
+            let p = url.standardizedFileURL.path
+            guard p.contains("/Preferences/"), url.pathExtension.lowercased() == "plist" else { return nil }
+            return url.lastPathComponent.lowercased()
+        }
+        guard !removedPrefFilenames.isEmpty else { return [] }
+
+        return candidateDomains.filter { domain in
+            let lower = domain.lowercased()
+            guard !lower.isEmpty, !lower.hasPrefix("unknown.") else { return false }
+            return removedPrefFilenames.contains { file in
+                file == "\(lower).plist" || file.hasPrefix("\(lower).")
+            }
+        }
+    }
+
     /// Explicit, user-initiated force quit offered by the banner after a graceful quit timed out.
-    func forceQuitApps(bundleIDs: [String]) async {
-        let still = await RemovalEngine.terminateRunningApps(bundleIDs: bundleIDs, forceAfterTimeout: true, timeoutSeconds: 0.5)
+    func forceQuitApps(bundleIDs: [String], bundleURLs: [URL] = []) async {
+        let still = await RemovalEngine.terminateRunningApps(
+            bundleIDs: bundleIDs,
+            bundleURLs: bundleURLs,
+            forceAfterTimeout: true,
+            timeoutSeconds: 0.5
+        )
         let running = AppScanner.runningBundleIDs()
         for i in apps.indices {
             apps[i].isRunning = running.contains(apps[i].bundleID.lowercased())
+        }
+        if var dropped = droppedApp {
+            dropped.isRunning = !AppScanner.runningProcesses(
+                matchingBundleIDs: [dropped.bundleID],
+                bundleURLs: [dropped.url]
+            ).isEmpty
+            droppedApp = dropped
         }
         banner = OperationBanner(
             isError: !still.isEmpty,
@@ -774,49 +926,77 @@ final class AppState: ObservableObject {
         )
     }
 
-    private func applyIncrementalRemoval(removedPaths: Set<String>, confirmation: PendingConfirmation) {
+    /// Synchronizes ALL caches and ALL four tabs after any removal so deleted entries can never resurrect.
+    private func applyIncrementalRemoval(removedPaths: Set<String>, forgottenPackageIDs: [String]) {
         guard !removedPaths.isEmpty else { return }
 
-        // Invalidate sizer cache for removed paths
+        // Prune cached index & packages
+        if let idx = libraryIndex {
+            libraryIndex = idx.removing(paths: removedPaths)
+        }
+        if !forgottenPackageIDs.isEmpty, var pkgs = cachedThirdPartyPackages {
+            let forgottenSet = Set(forgottenPackageIDs.map { $0.lowercased() })
+            pkgs.removeAll { forgottenSet.contains($0.lowercased()) }
+            cachedThirdPartyPackages = pkgs
+        }
+
         Task {
             for path in removedPaths {
                 await sizer.invalidate(path: path)
             }
         }
 
-        switch confirmation.sourceTab {
-        case .applications:
-            if var dropped = droppedApp {
-                if removedPaths.contains(dropped.url.standardizedFileURL.path) {
-                    droppedApp = nil
-                } else {
-                    dropped.serviceFiles.removeAll { removedPaths.contains($0.url.standardizedFileURL.path) }
-                    droppedApp = dropped
-                }
+        // 1. Sync Applications tab & dropped app
+        if var dropped = droppedApp {
+            if removedPaths.contains(dropped.url.standardizedFileURL.path) {
+                droppedApp = nil
+            } else {
+                dropped.serviceFiles.removeAll { removedPaths.contains($0.url.standardizedFileURL.path) }
+                droppedApp = dropped
             }
-            apps.removeAll { removedPaths.contains($0.url.standardizedFileURL.path) }
-            for i in apps.indices {
-                apps[i].serviceFiles.removeAll { removedPaths.contains($0.url.standardizedFileURL.path) }
-                if removedPaths.contains(apps[i].url.standardizedFileURL.path) {
-                    apps[i].isChecked = false
-                }
-            }
-            if let sel = selectedAppID, !apps.contains(where: { $0.id == sel }) {
-                selectedAppID = nil
-            }
-        case .startup:
-            startupItems.removeAll { removedPaths.contains($0.plistURL.standardizedFileURL.path) }
-        case .extensions:
-            extensionItems.removeAll { removedPaths.contains($0.path.standardizedFileURL.path) }
-        case .leftovers:
-            for i in leftoverGroups.indices {
-                leftoverGroups[i].files.removeAll { removedPaths.contains($0.url.standardizedFileURL.path) }
-            }
-            leftoverGroups.removeAll { $0.files.isEmpty }
         }
+        apps.removeAll { removedPaths.contains($0.url.standardizedFileURL.path) }
+        var bundleCounts: [String: Int] = [:]
+        for app in apps { bundleCounts[app.bundleID.lowercased(), default: 0] += 1 }
+        for i in apps.indices {
+            apps[i].serviceFiles.removeAll { removedPaths.contains($0.url.standardizedFileURL.path) }
+            apps[i].sharesBundleIDWithOtherApp = (bundleCounts[apps[i].bundleID.lowercased()] ?? 0) > 1
+        }
+        allInstalledBundleIDs = Set(apps.map { $0.bundleID.lowercased() }.filter { !$0.hasPrefix("unknown.") })
+        allInstalledAppPaths = Set(apps.map { $0.url.standardizedFileURL.path })
+        if let sel = selectedAppID, !apps.contains(where: { $0.id == sel }) {
+            selectedAppID = nil
+        }
+
+        // 2. Sync Startup tab (direct plist removal OR parent app removal)
+        startupItems.removeAll { item in
+            let plistPath = item.plistURL.standardizedFileURL.path
+            if removedPaths.contains(plistPath) { return true }
+            if let assoc = item.associatedAppPath, removedPaths.contains(assoc) {
+                return item.scope == .appLoginItem
+            }
+            return false
+        }
+
+        // 3. Sync Extensions tab (direct removal OR host app removal)
+        extensionItems.removeAll { item in
+            let extPath = item.path.standardizedFileURL.path
+            if removedPaths.contains(extPath) { return true }
+            if let host = item.hostAppPath?.standardizedFileURL.path, removedPaths.contains(host) {
+                return true
+            }
+            return false
+        }
+
+        // 4. Sync Leftovers tab
+        for i in leftoverGroups.indices {
+            leftoverGroups[i].files.removeAll { removedPaths.contains($0.url.standardizedFileURL.path) }
+            leftoverGroups[i].isChecked = leftoverGroups[i].files.contains(where: \.isSelected)
+        }
+        leftoverGroups.removeAll { $0.files.isEmpty }
     }
 
-    // MARK: - Startup Programs (M2)
+    // MARK: - Startup Programs
 
     func loadStartupIfNeeded() async {
         if startupItems.isEmpty && !isScanningStartup {
@@ -835,6 +1015,10 @@ final class AppState: ObservableObject {
     }
 
     func toggleStartupItem(_ item: StartupItem, enable: Bool) async {
+        guard !togglingStartupIDs.contains(item.id) else { return }
+        togglingStartupIDs.insert(item.id)
+        defer { togglingStartupIDs.remove(item.id) }
+
         let guardCopy = safetyGuard
         let result: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
             do {
@@ -870,7 +1054,7 @@ final class AppState: ObservableObject {
     }
 
     func prepareRemovalForStartupItem(_ item: StartupItem) {
-        guard item.canRemove else { return }
+        guard item.canRemove, !isPerformingRemoval else { return }
         pendingConfirmation = PendingConfirmation(
             title: l10n.isChinese ? "移除启动项 \(item.label)" : "Remove startup item \(item.label)",
             isReset: false,
@@ -878,6 +1062,9 @@ final class AppState: ObservableObject {
             packageIDsToForget: [],
             runningAppBundleIDs: [],
             runningAppNames: [],
+            targetAppBundleIDs: [],
+            targetAppURLs: [],
+            browserBundleIDsToRequireClosed: [],
             hasAppleAppStoreApp: false,
             hasChromiumExtension: false,
             sourceTab: .startup,
@@ -888,7 +1075,7 @@ final class AppState: ObservableObject {
         )
     }
 
-    // MARK: - Leftovers (M3)
+    // MARK: - Leftovers
 
     func loadLeftoversIfNeeded() async {
         if leftoverGroups.isEmpty && !isScanningLeftovers {
@@ -896,15 +1083,15 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Always rebuilds a fresh `LibraryIndex` from disk so manual refresh accurately reflects recent removals/changes.
     func scanLeftovers() async {
         isScanningLeftovers = true
         let guardCopy = safetyGuard
         let ignored = preferences.ignoredLeftoverIDs
-        let existingIndex = libraryIndex
         let sizerRef = sizer
 
         let (groups, freshIndex) = await Task.detached(priority: .userInitiated) {
-            let idx = existingIndex ?? LibraryIndex.build(safetyGuard: guardCopy)
+            let idx = LibraryIndex.build(safetyGuard: guardCopy)
             let inventory = InstalledAppInventory.build(libraryIndex: idx)
             let scanner = LeftoverScanner(safetyGuard: guardCopy, ignoredLeftoverIDs: ignored)
             var found = scanner.scan(index: idx, inventory: inventory)
@@ -952,13 +1139,15 @@ final class AppState: ObservableObject {
         leftoverGroups[gIdx].isChecked = leftoverGroups[gIdx].files.contains(where: \.isSelected)
     }
 
+    /// Selects ONLY per-file high-confidence, user-scope entries (never selects `/Library` system-scope files [F5]).
     func selectHighConfidenceLeftoversOnly() {
         for idx in leftoverGroups.indices {
-            let isHigh = leftoverGroups[idx].confidence == .high
-            leftoverGroups[idx].isChecked = isHigh
             for fIdx in leftoverGroups[idx].files.indices {
-                leftoverGroups[idx].files[fIdx].isSelected = isHigh
+                let file = leftoverGroups[idx].files[fIdx]
+                let select = !file.isSystemScope && file.confidence == .high
+                leftoverGroups[idx].files[fIdx].isSelected = select
             }
+            leftoverGroups[idx].isChecked = leftoverGroups[idx].files.contains(where: \.isSelected)
         }
     }
 
@@ -972,27 +1161,36 @@ final class AppState: ObservableObject {
 
     func prepareRemovalForCheckedLeftovers() {
         var targets: [RemovalTarget] = []
+        var seen = Set<String>()
         var groupIDs: [String] = []
         for group in leftoverGroups where group.isChecked {
             let selected = group.files.filter(\.isSelected)
             guard !selected.isEmpty else { continue }
             groupIDs.append(group.id)
             for file in selected {
-                targets.append(RemovalTarget(
-                    url: file.url,
-                    estimatedSize: file.size ?? 0,
-                    requiresAdmin: file.requiresAdmin
-                ))
+                let key = file.url.standardizedFileURL.path
+                if seen.insert(key).inserted {
+                    targets.append(RemovalTarget(
+                        url: file.url,
+                        estimatedSize: file.size ?? 0,
+                        requiresAdmin: file.requiresAdmin
+                    ))
+                }
             }
         }
         guard !targets.isEmpty else { return }
         pendingConfirmation = PendingConfirmation(
-            title: l10n.isChinese ? "清理 \(groupIDs.count) 组残留文件" : "Clean \(groupIDs.count) leftover groups",
+            title: l10n.isChinese
+                ? "清理 \(groupIDs.count) 组残留文件"
+                : (groupIDs.count == 1 ? "Clean 1 leftover group" : "Clean \(groupIDs.count) leftover groups"),
             isReset: false,
             targets: targets,
             packageIDsToForget: [],
             runningAppBundleIDs: [],
             runningAppNames: [],
+            targetAppBundleIDs: [],
+            targetAppURLs: [],
+            browserBundleIDsToRequireClosed: [],
             hasAppleAppStoreApp: false,
             hasChromiumExtension: false,
             sourceTab: .leftovers,
@@ -1003,7 +1201,7 @@ final class AppState: ObservableObject {
         )
     }
 
-    // MARK: - Extensions (M4)
+    // MARK: - Extensions
 
     func loadExtensionsIfNeeded() async {
         if extensionItems.isEmpty && !isScanningExtensions {
@@ -1014,8 +1212,9 @@ final class AppState: ObservableObject {
     func scanExtensions() async {
         isScanningExtensions = true
         let guardCopy = safetyGuard
+        let sizerRef = sizer
         let result = await Task.detached(priority: .userInitiated) {
-            ExtensionScanner(safetyGuard: guardCopy).scanAll()
+            await ExtensionScanner(safetyGuard: guardCopy).scanAllAsync(sizer: sizerRef)
         }.value
         extensionItems = result.items
         extensionsNeedFDAForBrowsers = result.needsFullDiskAccessForBrowsers
@@ -1024,7 +1223,10 @@ final class AppState: ObservableObject {
     }
 
     func toggleExtensionItem(_ item: ExtensionItem, enable: Bool) async {
-        guard item.canToggle else { return }
+        guard item.canToggle, !togglingExtensionIDs.contains(item.id) else { return }
+        togglingExtensionIDs.insert(item.id)
+        defer { togglingExtensionIDs.remove(item.id) }
+
         let res: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
             do {
                 try ExtensionController.setPluginEnabled(enable, identifier: item.identifier)
@@ -1069,8 +1271,12 @@ final class AppState: ObservableObject {
     }
 
     func prepareRemovalForExtension(_ item: ExtensionItem) {
-        guard item.canRemove else { return }
-        if item.category.isChromium && isBrowserRunning(for: item) {
+        guard item.canRemove, !isPerformingRemoval else { return }
+        // Require browser quit for ALL removable browser extensions (Chromium AND Firefox).
+        let requiredClosedBrowser: [String] = (item.category.isBrowser && item.browserBundleID != nil)
+            ? [item.browserBundleID!]
+            : []
+        if !requiredClosedBrowser.isEmpty && isBrowserRunning(for: item) {
             banner = OperationBanner(
                 isError: true,
                 message: l10n.t("请先退出对应浏览器后再移除该扩展。", "Please quit the browser before removing this extension."),
@@ -1086,6 +1292,9 @@ final class AppState: ObservableObject {
             packageIDsToForget: [],
             runningAppBundleIDs: [],
             runningAppNames: [],
+            targetAppBundleIDs: [],
+            targetAppURLs: [],
+            browserBundleIDsToRequireClosed: requiredClosedBrowser,
             hasAppleAppStoreApp: false,
             hasChromiumExtension: item.category.isChromium,
             sourceTab: .extensions,

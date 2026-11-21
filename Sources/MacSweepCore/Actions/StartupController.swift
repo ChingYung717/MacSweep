@@ -21,11 +21,15 @@ public enum StartupControlError: Error, LocalizedError, Sendable {
 /// A launchd job that must be unloaded (`bootout`) before its plist is removed.
 public struct LaunchServiceTarget: Sendable, Hashable {
     public let label: String
+    /// Nil when the plist could not be read as non-root (e.g. `0600 root:wheel`), so the elevated
+    /// script resolves `:Label` with `PlistBuddy` before calling `launchctl bootout`.
+    public let labelFromPlist: String?
     public let domain: String
     public let plistURL: URL
 
-    public init(label: String, domain: String, plistURL: URL) {
+    public init(label: String, domain: String, plistURL: URL, labelFromPlist: String? = nil) {
         self.label = label
+        self.labelFromPlist = labelFromPlist
         self.domain = domain
         self.plistURL = plistURL
     }
@@ -60,7 +64,8 @@ public struct StartupController: Sendable {
         guard !label.isEmpty,
               !label.lowercased().hasPrefix("com.apple."),
               !label.contains("/"),
-              !label.contains("\n") else {
+              !label.contains("\n"),
+              !label.contains("\r") else {
             throw StartupControlError.invalidLabel
         }
         return label
@@ -74,8 +79,9 @@ public struct StartupController: Sendable {
     ///
     /// - enable:  `enable` must succeed; `bootstrap` failure is tolerated ONLY if the service is
     ///            afterwards confirmed loaded via `launchctl print` (i.e. it was already loaded).
-    /// - disable: `disable` must succeed; `bootout` is best-effort (the job may simply not be loaded)
-    ///            and is isolated in its own `{ ...; }` group so it cannot mask the `disable` status.
+    /// - disable: `disable` must succeed; `bootout` failure is tolerated ONLY if the service is
+    ///            afterwards confirmed NOT loaded via `launchctl print` (distinguishes "not loaded"
+    ///            from "refused to unload").
     public static func buildToggleShellCommand(
         item: StartupItem,
         enable: Bool,
@@ -94,12 +100,13 @@ public struct StartupController: Sendable {
             let cmd = "\(qL) enable \(qTarget) && { \(qL) bootstrap \(qDomain) \(qPlist) || \(qL) print \(qTarget) >/dev/null 2>&1; }"
             return (domain, cmd)
         } else {
-            let cmd = "\(qL) disable \(qTarget) && { \(qL) bootout \(qTarget) >/dev/null 2>&1 || true; }"
+            let cmd = "\(qL) disable \(qTarget) && { \(qL) bootout \(qTarget) >/dev/null 2>&1 || ! \(qL) print \(qTarget) >/dev/null 2>&1; }"
             return (domain, cmd)
         }
     }
 
     /// Builds a script that boots out every target and then VERIFIES it is no longer loaded.
+    /// For unreadable root plists (`labelFromPlist == nil`), resolves `:Label` via PlistBuddy while root.
     /// Exits non-zero (and prints `still-loaded:<plist>` lines to stderr) if any service survived.
     public static func buildUnloadShellCommand(
         targets: [LaunchServiceTarget],
@@ -109,45 +116,80 @@ public struct StartupController: Sendable {
         let qL = ProcessRunner.posixQuote(launchctl)
         var statements = ["fail=0"]
         for t in targets {
-            let qTarget = ProcessRunner.posixQuote(t.serviceTarget)
-            let qMarker = ProcessRunner.posixQuote("still-loaded:\(t.plistURL.standardizedFileURL.path)")
-            statements.append("\(qL) bootout \(qTarget) >/dev/null 2>&1")
-            // A job that is mid-spawn (or KeepAlive-respawned) may survive a single bootout: re-check and
-            // retry for up to ~2 s before declaring it still loaded.
+            let plistPath = t.plistURL.standardizedFileURL.path
+            let qPlist = ProcessRunner.posixQuote(plistPath)
+            let qDomain = ProcessRunner.posixQuote(t.domain)
+            let qFallbackLabel = ProcessRunner.posixQuote(t.label)
+            let qMarker = ProcessRunner.posixQuote("still-loaded:\(plistPath)")
+
+            if t.labelFromPlist != nil {
+                let qTarget = ProcessRunner.posixQuote(t.serviceTarget)
+                statements.append("tgt=\(qTarget)")
+            } else {
+                // Dynamically read Label as root when non-root could not open a 0600 plist.
+                statements.append(
+                    "lbl=$(/usr/libexec/PlistBuddy -c 'Print :Label' \(qPlist) 2>/dev/null || true); "
+                        + "if [ -z \"$lbl\" ]; then lbl=\(qFallbackLabel); fi; "
+                        + "tgt=\(qDomain)/\"$lbl\""
+                )
+            }
+
+            statements.append("\(qL) bootout \"$tgt\" >/dev/null 2>&1")
+            // A job that is mid-spawn (or KeepAlive-respawned) may survive a single bootout:
+            // re-check and retry for up to ~2 s before declaring it still loaded.
             statements.append(
-                "n=0; while \(qL) print \(qTarget) >/dev/null 2>&1 && [ $n -lt 10 ]; do "
-                    + "/bin/sleep 0.2; \(qL) bootout \(qTarget) >/dev/null 2>&1; n=$((n+1)); done"
+                "n=0; while \(qL) print \"$tgt\" >/dev/null 2>&1 && [ $n -lt 10 ]; do "
+                    + "/bin/sleep 0.2; \(qL) bootout \"$tgt\" >/dev/null 2>&1; n=$((n+1)); done"
             )
-            statements.append("if \(qL) print \(qTarget) >/dev/null 2>&1; then echo \(qMarker) >&2; fail=1; fi")
+            statements.append("if \(qL) print \"$tgt\" >/dev/null 2>&1; then echo \(qMarker) >&2; fail=1; fi")
         }
         statements.append("exit $fail")
         return statements.joined(separator: "; ")
     }
 
-    /// Derives launchd targets from plists located in LaunchAgents / LaunchDaemons directories.
-    public static func launchTargets(for urls: [URL], uid: uid_t = getuid()) -> [LaunchServiceTarget] {
+    /// Default macOS launchd plist directories.
+    public static func defaultLaunchDirectories(
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> [URL] {
+        [
+            homeDirectory.appendingPathComponent("Library/LaunchAgents").standardizedFileURL,
+            URL(fileURLWithPath: "/Library/LaunchAgents").standardizedFileURL,
+            URL(fileURLWithPath: "/Library/LaunchDaemons").standardizedFileURL,
+        ]
+    }
+
+    /// Derives launchd targets ONLY from plists located directly inside `allowedLaunchDirs`
+    /// (defaults to `~/Library/LaunchAgents`, `/Library/LaunchAgents`, `/Library/LaunchDaemons`).
+    /// Deduplicates by plist path (NOT by `serviceTarget`) so duplicate-label plists across user &
+    /// system LaunchAgents are BOTH tracked and protected.
+    public static func launchTargets(
+        for urls: [URL],
+        uid: uid_t = getuid(),
+        allowedLaunchDirs: [URL]? = nil
+    ) -> [LaunchServiceTarget] {
+        let allowed = Set((allowedLaunchDirs ?? defaultLaunchDirectories()).map { $0.standardizedFileURL.path })
         var result: [LaunchServiceTarget] = []
-        var seen = Set<String>()
+        var seenPlistPaths = Set<String>()
+
         for url in urls {
             let std = url.standardizedFileURL
             guard std.pathExtension.lowercased() == "plist" else { continue }
-            let parent = std.deletingLastPathComponent().lastPathComponent
-            let domain: String
-            switch parent {
-            case "LaunchDaemons":
-                domain = "system"
-            case "LaunchAgents":
-                domain = "gui/\(uid)"
-            default:
-                continue
-            }
+            let parentPath = std.deletingLastPathComponent().path
+            guard allowed.contains(parentPath) else { continue }
+            guard seenPlistPaths.insert(std.path).inserted else { continue }
+
+            let parentName = std.deletingLastPathComponent().lastPathComponent
+            let domain = (parentName == "LaunchDaemons") ? "system" : "gui/\(uid)"
             let parsed = LibraryIndex.parseLaunchPlistMetadata(at: std)
             let rawLabel = parsed.label ?? std.deletingPathExtension().lastPathComponent
             guard let label = try? validatedLabel(rawLabel) else { continue }
-            let target = LaunchServiceTarget(label: label, domain: domain, plistURL: std)
-            if seen.insert(target.serviceTarget).inserted {
-                result.append(target)
-            }
+
+            result.append(LaunchServiceTarget(
+                label: label,
+                domain: domain,
+                plistURL: std,
+                labelFromPlist: parsed.label
+            ))
         }
         return result
     }
@@ -190,15 +232,15 @@ public struct StartupController: Sendable {
         }
     }
 
-    /// Unloads launchd services BEFORE their plists are removed (user domain without prompt,
-    /// system domain in a single administrator prompt). Returns which plists are confirmed safe to delete.
+    /// Unloads launchd services BEFORE their plists are removed.
+    /// Runs `system` targets FIRST so cancelling the administrator dialog never prematurely boots out user agents.
     public func unloadBeforeRemoval(_ targets: [LaunchServiceTarget]) -> LaunchUnloadReport {
         var unloaded = Set<String>()
         var stillLoaded = Set<String>()
         var errors: [String] = []
 
-        let userTargets = targets.filter { !$0.needsAdmin }
         let systemTargets = targets.filter(\.needsAdmin)
+        let userTargets = targets.filter { !$0.needsAdmin }
 
         func record(_ batch: [LaunchServiceTarget], stderr: String, succeeded: Bool) {
             let survivors = Self.parseStillLoadedPlists(from: stderr)
@@ -212,13 +254,6 @@ public struct StartupController: Sendable {
             }
         }
 
-        if !userTargets.isEmpty {
-            let cmd = Self.buildUnloadShellCommand(targets: userTargets, launchctl: launchctlPath)
-            let res = ProcessRunner.run(executable: "/bin/sh", arguments: ["-c", cmd])
-            record(userTargets, stderr: res.stderr, succeeded: res.succeeded)
-            if !res.succeeded { errors.append(res.stderr) }
-        }
-
         if !systemTargets.isEmpty {
             let cmd = Self.buildUnloadShellCommand(targets: systemTargets, launchctl: launchctlPath)
             do {
@@ -226,8 +261,8 @@ public struct StartupController: Sendable {
                 record(systemTargets, stderr: "", succeeded: true)
             } catch PrivilegedError.userCancelled {
                 return LaunchUnloadReport(
-                    unloadedPlists: unloaded,
-                    stillLoadedPlists: stillLoaded.union(systemTargets.map { $0.plistURL.standardizedFileURL.path }),
+                    unloadedPlists: [],
+                    stillLoadedPlists: Set(targets.map { $0.plistURL.standardizedFileURL.path }),
                     cancelledByUser: true,
                     errorMessage: nil
                 )
@@ -238,6 +273,13 @@ public struct StartupController: Sendable {
                 record(systemTargets, stderr: "", succeeded: false)
                 errors.append(error.localizedDescription)
             }
+        }
+
+        if !userTargets.isEmpty {
+            let cmd = Self.buildUnloadShellCommand(targets: userTargets, launchctl: launchctlPath)
+            let res = ProcessRunner.run(executable: "/bin/sh", arguments: ["-c", cmd])
+            record(userTargets, stderr: res.stderr, succeeded: res.succeeded)
+            if !res.succeeded { errors.append(res.stderr) }
         }
 
         let message = errors
