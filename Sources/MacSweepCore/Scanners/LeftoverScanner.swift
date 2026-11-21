@@ -35,9 +35,9 @@ public struct InstalledAppInventory: Sendable {
     }
 
     /// Strips a trailing `_<UUID>`, `-<UUID>`, or `.<UUID>` suffix
-    /// (e.g. `企业微信_269F5995-70FC-5B55-BCF5-D7E491D2E457` or ByHost `com.foo.bar.<UUID>`).
+    /// (e.g. `企业微信_269F5995-70FC-5B55-BCF5-D7E491D2E457`, ByHost `com.foo.bar.<UUID>`, or bare 37-char `_<UUID>`).
     public static func stripUUIDSuffix(_ name: String) -> String {
-        guard name.count > 37 else { return name }
+        guard name.count >= 37 else { return name }
         let suffix = String(name.suffix(36))
         let sep = name[name.index(name.endIndex, offsetBy: -37)]
         if (sep == "_" || sep == "-" || sep == "."), UUID(uuidString: suffix) != nil {
@@ -401,8 +401,10 @@ public struct LeftoverScanner: Sendable {
             }
 
             // Never pre-select (default-check) items that are risky to remove blindly:
-            //  - system-wide `/Library/...` entries (shared by all users, need admin) [F5]
-            //  - data of a vendor that still has installed apps / live services
+            //  - system-wide `/Library/...` entries (shared by all users, require admin) [F5].
+            //    This intentionally includes orphaned system LaunchDaemons [N4]: they stay unchecked in
+            //    Leftovers (no surprise root prompts) and have a dedicated "Broken" filter in Startup Programs.
+            //  - data of a vendor that still has installed apps / live services.
             if confidence == .high {
                 if entry.isSystemScope {
                     confidence = .medium

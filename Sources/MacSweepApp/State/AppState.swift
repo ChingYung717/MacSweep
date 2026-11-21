@@ -1123,11 +1123,8 @@ final class AppState: ObservableObject {
 
     func toggleLeftoverGroupChecked(_ groupID: String) {
         guard let idx = leftoverGroups.firstIndex(where: { $0.id == groupID }) else { return }
-        leftoverGroups[idx].isChecked.toggle()
-        let newState = leftoverGroups[idx].isChecked
-        for fIdx in leftoverGroups[idx].files.indices {
-            leftoverGroups[idx].files[fIdx].isSelected = newState
-        }
+        let targetState = !leftoverGroups[idx].isChecked
+        leftoverGroups[idx].applyGroupToggle(targetState)
     }
 
     func toggleLeftoverFile(groupID: String, fileID: String) {
@@ -1142,12 +1139,7 @@ final class AppState: ObservableObject {
     /// Selects ONLY per-file high-confidence, user-scope entries (never selects `/Library` system-scope files [F5]).
     func selectHighConfidenceLeftoversOnly() {
         for idx in leftoverGroups.indices {
-            for fIdx in leftoverGroups[idx].files.indices {
-                let file = leftoverGroups[idx].files[fIdx]
-                let select = !file.isSystemScope && file.confidence == .high
-                leftoverGroups[idx].files[fIdx].isSelected = select
-            }
-            leftoverGroups[idx].isChecked = leftoverGroups[idx].files.contains(where: \.isSelected)
+            leftoverGroups[idx].selectHighConfidenceOnly()
         }
     }
 

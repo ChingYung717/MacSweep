@@ -375,4 +375,83 @@ func runAuditFixChecks(_ runner: CheckRunner) {
         try runner.expectEqual(dirs[0].path, "/Users/test/Library/Application Support/Firefox/Profiles/abc.default-release")
         try runner.expectEqual(dirs[1].path, "/tmp/custom-ff-profile")
     }
+
+    // MARK: N1 & N2 — Mixed user/system leftover group toggle protection & exact 37-char UUID suffix
+
+    runner.run("N1: Mixed user+system leftover group toggle and selectHighConfidenceOnly never auto-check /Library items") {
+        let sandbox = try runner.makeTempSandbox(prefix: "n1-mixed")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let fm = FileManager.default
+        let userLib = sandbox.appendingPathComponent("UserLib")
+        let sysLib = sandbox.appendingPathComponent("SysLib")
+
+        // Same >=4-segment reverse-DNS ID present in both User and System scope -> merges into one group
+        try fm.createDirectory(at: userLib.appendingPathComponent("Caches/com.gone.tool.editor"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: sysLib.appendingPathComponent("Caches/com.gone.tool.editor"), withIntermediateDirectories: true)
+
+        let sg = SafetyGuard(homeDirectory: sandbox)
+        let idx = LibraryIndex.build(userLibraryURL: userLib, systemLibraryURL: sysLib, safetyGuard: sg)
+        let inv = InstalledAppInventory.build(searchRoots: [], libraryIndex: idx)
+        let groups = LeftoverScanner(safetyGuard: sg).scan(index: idx, inventory: inv)
+
+        guard var mixed = groups.first(where: { $0.id == "com.gone.tool" }) else {
+            throw CheckFailure(message: "Expected merged mixed group com.gone.tool")
+        }
+        try runner.expectEqual(mixed.files.count, 2)
+        try runner.expectEqual(mixed.confidence, .high)
+        try runner.expect(mixed.hasSystemScopeFiles && mixed.hasUserScopeFiles)
+
+        let userFileBefore = mixed.files.first { !$0.isSystemScope }
+        let sysFileBefore = mixed.files.first { $0.isSystemScope }
+        try runner.expectEqual(userFileBefore?.isSelected, true)
+        try runner.expectEqual(sysFileBefore?.isSelected, false, "System-scope file must start unselected")
+
+        // 1. Clicking 'High Only' must NOT select the system-scope file
+        mixed.selectHighConfidenceOnly()
+        try runner.expectEqual(mixed.files.first { !$0.isSystemScope }?.isSelected, true)
+        try runner.expectEqual(mixed.files.first { $0.isSystemScope }?.isSelected, false, "High Only must never select /Library file")
+
+        // 2. Unchecking then re-checking the group checkbox must NOT select the system-scope file
+        mixed.applyGroupToggle(false)
+        try runner.expectEqual(mixed.isChecked, false)
+        try runner.expect(mixed.files.allSatisfy { !$0.isSelected })
+
+        mixed.applyGroupToggle(true)
+        try runner.expectEqual(mixed.isChecked, true)
+        try runner.expectEqual(mixed.files.first { !$0.isSystemScope }?.isSelected, true)
+        try runner.expectEqual(mixed.files.first { $0.isSystemScope }?.isSelected, false, "Group toggle ON must never auto-check /Library file")
+
+        // 3. System-only group toggle ON must also keep /Library files unchecked (requires per-file opt-in)
+        var sysOnly = LeftoverGroup(
+            id: "com.gone.sysonly",
+            groupName: "Sysonly",
+            suspectedBundleID: "com.gone.sysonly",
+            confidence: .medium,
+            files: [
+                ServiceFile(
+                    url: sysLib.appendingPathComponent("Caches/com.gone.sysonly"),
+                    category: .caches,
+                    isSelected: false,
+                    requiresAdmin: true,
+                    isSystemScope: true,
+                    confidence: .medium
+                ),
+            ],
+            isChecked: false
+        )
+        sysOnly.applyGroupToggle(true)
+        try runner.expectEqual(sysOnly.isChecked, false)
+        try runner.expectEqual(sysOnly.files.first?.isSelected, false)
+    }
+
+    runner.run("N2: stripUUIDSuffix handles exact 37-char separator+UUID strings without off-by-one") {
+        let exact37Underscore = "_269F5995-70FC-5B55-BCF5-D7E491D2E457"
+        let exact37Dash = "-269F5995-70FC-5B55-BCF5-D7E491D2E457"
+        let exact37Dot = ".269F5995-70FC-5B55-BCF5-D7E491D2E457"
+        try runner.expectEqual(exact37Underscore.count, 37)
+        try runner.expectEqual(InstalledAppInventory.stripUUIDSuffix(exact37Underscore), "")
+        try runner.expectEqual(InstalledAppInventory.stripUUIDSuffix(exact37Dash), "")
+        try runner.expectEqual(InstalledAppInventory.stripUUIDSuffix(exact37Dot), "")
+        try runner.expectEqual(InstalledAppInventory.stripUUIDSuffix("A" + exact37Underscore), "A")
+    }
 }

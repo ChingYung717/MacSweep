@@ -197,10 +197,18 @@ struct LeftoversView: View {
 
     private func leftoverGroupRow(_ group: LeftoverGroup) -> some View {
         let isSelected = selectedGroupIDBox.value == group.id
+        let isSystemOnly = !group.hasUserScopeFiles
         return HStack(spacing: 10) {
-            SweepCheckbox(isChecked: group.isChecked, isDisabled: false, palette: palette) {
+            SweepCheckbox(
+                isChecked: group.isChecked,
+                isDisabled: isSystemOnly && !group.isChecked,
+                palette: palette
+            ) {
                 state.toggleLeftoverGroupChecked(group.id)
             }
+            .help(isSystemOnly
+                  ? l10n.t("仅含 /Library 系统级文件，请点击分组后在右侧逐项手动勾选", "System-scope (/Library) items only — open this group to opt in per file")
+                  : "")
 
             ZStack {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -219,6 +227,15 @@ struct LeftoversView: View {
                         .lineLimit(1)
 
                     confidenceBadge(group.confidence)
+
+                    if group.hasSystemScopeFiles {
+                        Text(l10n.t("含系统级", "System"))
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(palette.warning)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(palette.warning.opacity(0.16)))
+                    }
                 }
 
                 Text(l10n.isChinese
@@ -284,6 +301,18 @@ struct LeftoversView: View {
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
+                    }
+
+                    if group.hasSystemScopeFiles {
+                        HStack(spacing: 6) {
+                            Image(systemName: "shield.lefthalf.filled")
+                                .foregroundStyle(palette.warning)
+                            Text(l10n.isChinese
+                                 ? "包含 \(group.systemScopeFileCount) 项 /Library 系统级文件，受安全策略保护不会随分组或「仅选高置信度」自动勾选；如需清理请在下方逐项手动勾选。"
+                                 : "Contains \(group.systemScopeFileCount) system-scope (/Library) item(s). They are never auto-checked by group or High Only selection; opt in per file below if needed.")
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(palette.secondaryText)
+                        }
                     }
 
                     if group.confidence == .medium {
