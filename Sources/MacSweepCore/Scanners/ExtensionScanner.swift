@@ -169,9 +169,10 @@ public struct ExtensionScanner: Sendable {
         computeSize: Bool = true
     ) -> [ExtensionItem] {
         let fm = FileManager.default
+        let resolvedUserData = userDataURL.resolvingSymlinksInPath().standardizedFileURL.path
         guard let children = try? fm.contentsOfDirectory(
             at: userDataURL,
-            includingPropertiesForKeys: [.isDirectoryKey],
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
             options: [.skipsHiddenFiles]
         ) else {
             return []
@@ -179,11 +180,15 @@ public struct ExtensionScanner: Sendable {
 
         var results: [ExtensionItem] = []
         for profileDir in children {
+            let profileVals = try? profileDir.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            guard profileVals?.isDirectory == true, profileVals?.isSymbolicLink != true else { continue }
+
             let extRoot = profileDir.appendingPathComponent("Extensions")
-            guard fm.fileExists(atPath: extRoot.path),
+            let extRootVals = try? extRoot.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            guard extRootVals?.isDirectory == true, extRootVals?.isSymbolicLink != true,
                   let extDirs = try? fm.contentsOfDirectory(
                     at: extRoot,
-                    includingPropertiesForKeys: [.isDirectoryKey],
+                    includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
                     options: [.skipsHiddenFiles]
                   ) else {
                 continue
@@ -191,6 +196,13 @@ public struct ExtensionScanner: Sendable {
 
             let profileName = profileDir.lastPathComponent
             for extDir in extDirs {
+                let extVals = try? extDir.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+                guard extVals?.isDirectory == true, extVals?.isSymbolicLink != true else { continue }
+                let resolvedExt = extDir.resolvingSymlinksInPath().standardizedFileURL.path
+                guard resolvedExt.hasPrefix(resolvedUserData + "/"),
+                      safetyGuard.validateForRemoval(extDir).isAllowed else {
+                    continue
+                }
                 let extID = extDir.lastPathComponent
                 if extID == "Temp" { continue }
                 guard let parsed = Self.parseChromiumExtensionDirectory(
@@ -283,7 +295,9 @@ public struct ExtensionScanner: Sendable {
                 candidates.append(contentsOf: ["zh_CN", "zh-CN", "zh"])
             }
         }
-        if let def = defaultLocale, !def.isEmpty {
+        if let def = defaultLocale,
+           !def.isEmpty,
+           def.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "_" || $0 == "-") }) {
             candidates.append(def)
         }
         candidates.append(contentsOf: ["en", "en_US", "en_GB"])
@@ -341,29 +355,38 @@ public struct ExtensionScanner: Sendable {
 
         var results: [ExtensionItem] = []
         for profile in profileDirs {
+            let profVals = try? profile.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            guard profVals?.isDirectory == true, profVals?.isSymbolicLink != true else { continue }
             let extJSON = profile.appendingPathComponent("extensions.json")
             guard let data = try? Data(contentsOf: extJSON) else { continue }
             results.append(contentsOf: Self.parseFirefoxExtensionsJSON(
                 data,
                 profileName: profile.lastPathComponent,
-                computeSize: computeSize
+                computeSize: computeSize,
+                profileDirectory: profile,
+                safetyGuard: safetyGuard
             ))
         }
         return results
     }
 
     /// Parses Mozilla `profiles.ini` sections (`[Profile*]`) into resolved profile directory URLs.
+    /// Relative profile paths (`IsRelative=1`) must stay contained within `firefoxBaseURL`.
     public static func parseFirefoxProfilesINI(_ content: String, firefoxBaseURL: URL) -> [URL] {
         var results: [URL] = []
         var inProfileSection = false
         var currentPath: String?
         var currentIsRelative = true
+        let basePath = firefoxBaseURL.standardizedFileURL.path
 
         func flushSection() {
-            guard inProfileSection, let path = currentPath, !path.isEmpty else { return }
+            guard inProfileSection, let path = currentPath, !path.isEmpty, !path.contains("\0") else { return }
             if currentIsRelative {
-                results.append(firefoxBaseURL.appendingPathComponent(path).standardizedFileURL)
+                let candidate = firefoxBaseURL.appendingPathComponent(path).standardizedFileURL
+                guard candidate.path.hasPrefix(basePath + "/") else { return }
+                results.append(candidate)
             } else {
+                guard path.hasPrefix("/") else { return }
                 results.append(URL(fileURLWithPath: path).standardizedFileURL)
             }
         }
@@ -395,7 +418,9 @@ public struct ExtensionScanner: Sendable {
     public static func parseFirefoxExtensionsJSON(
         _ data: Data,
         profileName: String,
-        computeSize: Bool = true
+        computeSize: Bool = true,
+        profileDirectory: URL? = nil,
+        safetyGuard: SafetyGuard = SafetyGuard()
     ) -> [ExtensionItem] {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let addons = root["addons"] as? [[String: Any]] else {
@@ -403,6 +428,8 @@ public struct ExtensionScanner: Sendable {
         }
 
         let fm = FileManager.default
+        let expectedExtensionsRaw = profileDirectory?.appendingPathComponent("extensions").standardizedFileURL.path
+        let expectedExtensionsResolved = profileDirectory?.appendingPathComponent("extensions").resolvingSymlinksInPath().standardizedFileURL.path
         var items: [ExtensionItem] = []
 
         for addon in addons {
@@ -413,11 +440,26 @@ public struct ExtensionScanner: Sendable {
 
             guard let id = addon["id"] as? String,
                   let pathStr = addon["path"] as? String,
-                  !pathStr.isEmpty else {
+                  !pathStr.isEmpty,
+                  !pathStr.contains("\0"),
+                  pathStr.hasPrefix("/") else {
                 continue
             }
 
-            let url = URL(fileURLWithPath: pathStr)
+            let url = URL(fileURLWithPath: pathStr).standardizedFileURL
+            if let expRaw = expectedExtensionsRaw, let expRes = expectedExtensionsResolved {
+                let rawPath = url.path
+                let resPath = url.resolvingSymlinksInPath().standardizedFileURL.path
+                let rawInside = rawPath.hasPrefix(expRaw + "/") || rawPath.hasPrefix(expRes + "/")
+                let resInside = resPath.hasPrefix(expRaw + "/") || resPath.hasPrefix(expRes + "/")
+                guard rawInside && resInside else {
+                    continue
+                }
+            }
+            guard safetyGuard.validateForRemoval(url).isAllowed else {
+                continue
+            }
+
             let defaultLocale = addon["defaultLocale"] as? [String: Any]
             let name = (defaultLocale?["name"] as? String) ?? id
             let version = (addon["version"] as? String) ?? ""

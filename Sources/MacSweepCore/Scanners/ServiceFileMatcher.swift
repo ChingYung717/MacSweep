@@ -113,6 +113,34 @@ public struct ServiceFileMatcher: Sendable {
         return false
     }
 
+    /// Returns `true` only for well-formed reverse-DNS bundle identifiers safe for prefix matching.
+    /// Rejects single-segment prefixes (`"com"`, `"org"`), bare `"com.apple"`, synthetic `"unknown.*"`,
+    /// empty segments, leading `"-"`, whitespace, and NUL bytes.
+    public static func isMatchableBundleID(_ bundleID: String) -> Bool {
+        let lower = bundleID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !lower.isEmpty,
+              !lower.contains("\0"),
+              !lower.hasPrefix("-"),
+              !lower.hasPrefix("unknown."),
+              !lower.contains(where: { $0.isWhitespace }),
+              lower != "com.apple" else {
+            return false
+        }
+        let rawParts = lower.split(separator: ".", omittingEmptySubsequences: false)
+        guard rawParts.count >= 2, rawParts.allSatisfy({ !$0.isEmpty }) else {
+            return false
+        }
+        // Reject overly broad 2-segment vendor-only prefixes like `com.google`, `com.microsoft`, `com.adobe`
+        // unless they are not generic shared vendors.
+        if rawParts.count == 2 {
+            let second = String(rawParts[1])
+            if second == "apple" || SafetyGuard.sharedVendorFolderNames.contains(second) {
+                return false
+            }
+        }
+        return true
+    }
+
     /// Fast in-memory match against `LibraryIndex` (no disk traversal, no per-entry safety I/O).
     public func matchInMemory(
         app: AppItem,
@@ -121,7 +149,7 @@ public struct ServiceFileMatcher: Sendable {
         allInstalledBundleIDs: Set<String> = []
     ) -> [ServiceFile] {
         let lowerBundleID = app.bundleID.lowercased()
-        let hasValidBundleID = !lowerBundleID.isEmpty && !lowerBundleID.hasPrefix("unknown.")
+        let hasValidBundleID = Self.isMatchableBundleID(lowerBundleID)
         let appBundlePath = app.url.standardizedFileURL.path
         let nameCandidates = Self.nameCandidates(for: app).filter { !ambiguousNames.contains($0) }
 
@@ -266,7 +294,7 @@ public struct ServiceFileMatcher: Sendable {
         allInstalledBundleIDs: Set<String> = []
     ) -> [String] {
         let lowerBundle = bundleID.lowercased()
-        guard !lowerBundle.isEmpty, !lowerBundle.hasPrefix("unknown.") else { return [] }
+        guard isMatchableBundleID(lowerBundle) else { return [] }
         if !allowApple && lowerBundle.hasPrefix("com.apple.") { return [] }
 
         return allPackageIDs.filter { pkg in

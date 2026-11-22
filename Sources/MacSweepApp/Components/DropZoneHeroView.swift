@@ -159,7 +159,7 @@ struct DropZoneHeroView: View {
             } else {
                 droppedURL = nil
             }
-            if let url = droppedURL, url.pathExtension.lowercased() == "app" {
+            if let url = droppedURL, url.isFileURL, url.pathExtension.lowercased() == "app" {
                 DispatchQueue.main.async {
                     onDropAppURL(url)
                 }

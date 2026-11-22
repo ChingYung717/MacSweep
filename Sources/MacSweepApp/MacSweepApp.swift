@@ -48,7 +48,7 @@ struct MacSweepApp: App {
                 .frame(minWidth: 1020, minHeight: 650)
                 .onAppear {
                     appDelegate.onOpenURLs = { [state] urls in
-                        if let appURL = urls.first(where: { $0.pathExtension.lowercased() == "app" }) {
+                        if let appURL = urls.first(where: { $0.isFileURL && $0.pathExtension.lowercased() == "app" }) {
                             Task { @MainActor in
                                 state.inspectDroppedApp(at: appURL)
                             }

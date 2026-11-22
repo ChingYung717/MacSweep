@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public struct InstalledAppInventory: Sendable {
@@ -35,7 +36,7 @@ public struct InstalledAppInventory: Sendable {
     }
 
     /// Strips a trailing `_<UUID>`, `-<UUID>`, or `.<UUID>` suffix
-    /// (e.g. `企业微信_269F5995-70FC-5B55-BCF5-D7E491D2E457`, ByHost `com.foo.bar.<UUID>`, or bare 37-char `_<UUID>`).
+    /// (e.g. `SampleApp_11111111-2222-3333-4444-555555555555`, ByHost `com.foo.bar.<UUID>`, or bare 37-char `_<UUID>`).
     public static func stripUUIDSuffix(_ name: String) -> String {
         guard name.count >= 37 else { return name }
         let suffix = String(name.suffix(36))
@@ -196,7 +197,7 @@ public struct InstalledAppInventory: Sendable {
             for entry in index.entries where entry.category == .launchAgents || entry.category == .launchDaemons {
                 guard let firstProg = entry.launchProgramPaths.first,
                       firstProg.hasPrefix("/"),
-                      fm.fileExists(atPath: firstProg) else {
+                      !StartupScanner.isExecutableDefinitelyMissing(atPath: firstProg) else {
                     continue
                 }
                 if let label = entry.launchLabel {
@@ -319,7 +320,6 @@ public struct LeftoverScanner: Sendable {
         index: LibraryIndex,
         inventory: InstalledAppInventory
     ) -> [LeftoverGroup] {
-        let fm = FileManager.default
         var groupedFiles: [String: (displayName: String, bundleID: String?, confidence: LeftoverConfidence, files: [ServiceFile])] = [:]
 
         for entry in index.entries {
@@ -348,12 +348,12 @@ public struct LeftoverScanner: Sendable {
                 }
             }
 
-            // LaunchAgents & LaunchDaemons: ONLY consider leftover if the target executable is missing on disk!
+            // LaunchAgents & LaunchDaemons: ONLY consider leftover if the target executable is confirmed missing!
             if entry.category == .launchAgents || entry.category == .launchDaemons {
                 guard let firstProg = entry.launchProgramPaths.first, firstProg.hasPrefix("/") else {
                     continue
                 }
-                if fm.fileExists(atPath: firstProg) {
+                if !StartupScanner.isExecutableDefinitelyMissing(atPath: firstProg) {
                     continue
                 }
             }

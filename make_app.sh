@@ -11,7 +11,7 @@ APP="$OUT/MacSweep.app"
 NAME="MacSweepApp"
 DISPLAY_NAME="MacSweep"
 BUNDLE_ID="local.macsweep"
-VERSION_BASE_COMMIT="2dfba249b6dca88ce6841e3bc80aab91410dd25a"
+VERSION_BASE_COMMIT="db3f7dcb717ffd52736914cd3e0ad89de91d506f"
 
 if [ -n "${MACSWEEP_VERSION:-}" ]; then
     VERSION="$MACSWEEP_VERSION"
@@ -48,9 +48,13 @@ fi
 
 echo "==> Building release binary ($NAME, v${VERSION} build ${BUILD_NUMBER})"
 cd "$HERE"
-swift build -c release --product "$NAME"
+build_args=(-c release)
+if [ -n "${MACSWEEP_SCRATCH_PATH:-}" ]; then
+    build_args+=(--scratch-path "$MACSWEEP_SCRATCH_PATH")
+fi
+swift build "${build_args[@]}" --product "$NAME"
 
-BIN="$(swift build -c release --show-bin-path)/$NAME"
+BIN="$(swift build "${build_args[@]}" --show-bin-path)/$NAME"
 if [ ! -f "$BIN" ]; then
     echo "Error: compiled binary not found at $BIN" >&2
     exit 1
@@ -142,9 +146,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 
 echo "==> Signing (${ARCH}, macOS ${MIN_MACOS}+) with identity: $SIGN_IDENTITY"
-sign_args=(--force --sign "$SIGN_IDENTITY")
-if [ -n "$NOTARY_PROFILE" ] || [[ "$SIGN_IDENTITY" == "Developer ID "* ]]; then
-    sign_args+=(--options runtime --timestamp)
+# Always enable Hardened Runtime (blocks DYLD_INSERT_LIBRARIES / debugger attach).
+# MacSweep has zero bundled third-party dylibs, so Library Validation works even with ad-hoc signing.
+sign_args=(--force --sign "$SIGN_IDENTITY" --options runtime)
+if [ "$SIGN_IDENTITY" != "-" ]; then
+    sign_args+=(--timestamp)
 fi
 codesign "${sign_args[@]}" "$APP"
 codesign --verify --deep --strict --verbose=1 "$APP"

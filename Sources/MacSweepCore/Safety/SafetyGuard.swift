@@ -20,6 +20,9 @@ public struct SafetyGuard: Sendable {
     public let protectedBundleIDs: Set<String>
     /// Precomputed once (avoid rebuilding on every `validateForRemoval` call).
     private let criticalExactPaths: Set<String>
+    private let criticalExactPathsLower: Set<String>
+    private let immutablePrefixesLower: [String]
+    private let protectedPathsLower: Set<String>
 
     public init(
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
@@ -47,9 +50,26 @@ public struct SafetyGuard: Sendable {
             self.selfResolvedBundlePath = nil
         }
         self.selfDataPaths = dataPaths
-        self.protectedPaths = Set(protectedPaths.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
+        let stdProtected = Set(protectedPaths.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
+        self.protectedPaths = stdProtected
+        self.protectedPathsLower = Set(stdProtected.map(Self.normalizedForCompare))
         self.protectedBundleIDs = Set(protectedBundleIDs.map { $0.lowercased() })
-        self.criticalExactPaths = Self.makeCriticalExactPaths(home: stdHome, selfDataPaths: dataPaths)
+        let exact = Self.makeCriticalExactPaths(home: stdHome, selfDataPaths: dataPaths)
+        self.criticalExactPaths = exact
+        self.criticalExactPathsLower = Set(exact.map(Self.normalizedForCompare))
+        let userPrefixes = [
+            "\(stdHome)/Library/Keychains/",
+            "\(stdHome)/Library/Safari/",
+            "\(stdHome)/Library/Mail/",
+            "\(stdHome)/Library/Messages/",
+            "\(stdHome)/.ssh/",
+            "\(stdHome)/.gnupg/",
+        ]
+        self.immutablePrefixesLower = (Self.immutableSystemPrefixes + userPrefixes).map(Self.normalizedForCompare)
+    }
+
+    private static func normalizedForCompare(_ path: String) -> String {
+        path.precomposedStringWithCanonicalMapping.lowercased()
     }
 
     // Directories that must NEVER be deleted themselves (neither directly nor via pkgutil/leftovers).
@@ -101,6 +121,11 @@ public struct SafetyGuard: Sendable {
             "/Library/Logs/DiagnosticReports",
             "/Library/Java",
             "/Library/Java/JavaVirtualMachines",
+            "/Library/Keychains",
+            "/Library/Application Support/com.apple.TCC",
+            "/Library/Preferences/SystemConfiguration",
+            "/var/db/dslocal",
+            "/private/var/db/dslocal",
             "/Library/Security",
             "/Library/QuickLook",
             "/Library/Screen Savers",
@@ -153,6 +178,8 @@ public struct SafetyGuard: Sendable {
             "\(h)/Library/Mail",
             "\(h)/Library/Messages",
             "\(h)/Library/Keychains",
+            "\(h)/.ssh",
+            "\(h)/.gnupg",
             "\(h)/.Trash",
         ]
         for p in selfDataPaths {
@@ -165,6 +192,13 @@ public struct SafetyGuard: Sendable {
         "/System/",
         "/Library/Apple/",
         "/Library/Application Support/Apple/",
+        "/Library/Application Support/com.apple.TCC/",
+        "/Library/Preferences/SystemConfiguration/",
+        "/Library/Keychains/",
+        "/etc/",
+        "/private/etc/",
+        "/var/db/",
+        "/private/var/db/",
         "/usr/bin/",
         "/usr/sbin/",
         "/usr/lib/",
@@ -172,7 +206,6 @@ public struct SafetyGuard: Sendable {
         "/usr/share/",
         "/bin/",
         "/sbin/",
-        "/private/var/db/receipts/",
     ]
 
     /// Lowercased directory/file names never flagged as leftovers or blindly removed.
@@ -286,9 +319,12 @@ public struct SafetyGuard: Sendable {
     }
 
     /// True if the bundle ID belongs to an Apple app (e.g. `com.apple.iWork.Pages`).
+    /// Rejects bare `"com.apple"` without a product segment.
     public func isAppleBundleID(_ bundleID: String) -> Bool {
         let lower = bundleID.lowercased()
-        return lower.hasPrefix("com.apple.") || lower == "com.apple"
+        guard lower.hasPrefix("com.apple.") else { return false }
+        let suffix = lower.dropFirst("com.apple.".count)
+        return !suffix.isEmpty && !suffix.hasPrefix(".")
     }
 
     /// True if `bundleID` matches any user-protected bundle ID (exact or boundary sub-identifier).
@@ -345,14 +381,16 @@ public struct SafetyGuard: Sendable {
         return false
     }
 
-    /// True if a path is a critical exact system/user root directory (used for filtering pkgutil & leftovers).
+    /// True if a path is a critical exact system/user root directory or shared vendor folder
+    /// (used for filtering pkgutil, leftovers, and final removal validation).
     public func isCriticalSharedDirectory(_ path: String) -> Bool {
         let std = URL(fileURLWithPath: path).standardizedFileURL.path
-        if criticalExactPaths.contains(std) {
+        if criticalExactPathsLower.contains(Self.normalizedForCompare(std)) {
             return true
         }
-        let last = URL(fileURLWithPath: std).lastPathComponent.lowercased()
-        let parent = URL(fileURLWithPath: std).deletingLastPathComponent().lastPathComponent.lowercased()
+        let url = URL(fileURLWithPath: std)
+        let last = url.lastPathComponent.precomposedStringWithCanonicalMapping.lowercased()
+        let parent = url.deletingLastPathComponent().lastPathComponent.precomposedStringWithCanonicalMapping.lowercased()
         if ["application support", "caches", "preferences", "logs"].contains(parent),
            (Self.sharedVendorFolderNames.contains(last) || last == "apple") {
             return true
@@ -366,20 +404,29 @@ public struct SafetyGuard: Sendable {
         let rawPath = url.standardizedFileURL.path
         let resolvedPath = url.resolvingSymlinksInPath().standardizedFileURL.path
 
-        if rawPath.isEmpty || rawPath == "/" {
-            return .blocked(reason: "Cannot remove root filesystem")
+        if !url.isFileURL || rawPath.isEmpty || rawPath == "/"
+            || rawPath.contains("\0") || resolvedPath.contains("\0")
+            || url.absoluteString.lowercased().contains("%00") {
+            return .blocked(reason: "Cannot remove root or invalid filesystem path")
         }
 
-        for selfPath in [selfBundlePath, selfResolvedBundlePath].compactMap({ $0 }) where selfPath.hasSuffix(".app") {
-            if rawPath == selfPath || rawPath.hasPrefix(selfPath + "/")
-                || resolvedPath == selfPath || resolvedPath.hasPrefix(selfPath + "/") {
+        let normRaw = Self.normalizedForCompare(rawPath)
+        let normResolved = Self.normalizedForCompare(resolvedPath)
+
+        func overlaps(_ candidate: String, with target: String) -> Bool {
+            candidate == target || candidate.hasPrefix(target + "/") || target.hasPrefix(candidate + "/")
+        }
+
+        for selfPath in [selfBundlePath, selfResolvedBundlePath].compactMap({ $0 }) where selfPath.lowercased().hasSuffix(".app") {
+            let normSelf = Self.normalizedForCompare(selfPath)
+            if overlaps(normRaw, with: normSelf) || overlaps(normResolved, with: normSelf) {
                 return .blocked(reason: "Cannot remove MacSweep itself")
             }
         }
 
         for selfData in selfDataPaths {
-            if rawPath == selfData || rawPath.hasPrefix(selfData + "/")
-                || resolvedPath == selfData || resolvedPath.hasPrefix(selfData + "/") {
+            let normData = Self.normalizedForCompare(selfData)
+            if overlaps(normRaw, with: normData) || overlaps(normResolved, with: normData) {
                 return .blocked(reason: "Cannot remove MacSweep application data")
             }
         }
@@ -392,17 +439,22 @@ public struct SafetyGuard: Sendable {
             return .blocked(reason: "Symbolic link points to protected macOS system volume")
         }
 
-        for candidate in [rawPath, resolvedPath] {
-            if criticalExactPaths.contains(candidate) {
+        for (candidate, normCandidate) in [(rawPath, normRaw), (resolvedPath, normResolved)] {
+            if criticalExactPathsLower.contains(normCandidate) {
                 return .blocked(reason: "Critical system or user directory: \(candidate)")
             }
-            for prefix in Self.immutableSystemPrefixes {
-                if candidate.hasPrefix(prefix) {
-                    return .blocked(reason: "Protected macOS system path: \(candidate)")
+            if isCriticalSharedDirectory(candidate) {
+                return .blocked(reason: "Critical shared vendor directory: \(candidate)")
+            }
+            for prefix in immutablePrefixesLower {
+                if normCandidate.hasPrefix(prefix) {
+                    return .blocked(reason: "Protected macOS system or credential path: \(candidate)")
                 }
             }
-            if protectedPaths.contains(candidate) {
-                return .blocked(reason: "Protected by user skip list")
+            for protected in protectedPathsLower {
+                if overlaps(normCandidate, with: protected) {
+                    return .blocked(reason: "Protected by user skip list")
+                }
             }
         }
 

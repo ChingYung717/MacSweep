@@ -18,11 +18,20 @@ public struct ProcessResult: Sendable, Equatable {
 
 public enum ProcessRunner {
     /// Runs an executable synchronously and captures stdout/stderr without deadlocking pipes.
+    /// Rejects any NUL byte (`\0`) in executable, arguments, or environment to prevent uncatchable
+    /// Objective-C `NSInvalidArgumentException` (`SIGABRT`) inside Foundation's `Process`.
     public static func run(
         executable: String,
         arguments: [String],
-        environment: [String: String]? = nil
+        environment: [String: String]? = nil,
+        stdinData: Data? = nil
     ) -> ProcessResult {
+        if executable.isEmpty || executable.contains("\0")
+            || arguments.contains(where: { $0.contains("\0") })
+            || (environment?.contains(where: { $0.key.contains("\0") || $0.value.contains("\0") }) ?? false) {
+            return ProcessResult(exitCode: -1, stdout: "", stderr: "Invalid NUL byte in process invocation")
+        }
+
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -36,10 +45,25 @@ public enum ProcessRunner {
         process.standardOutput = outPipe
         process.standardError = errPipe
 
+        let inPipe: Pipe? = stdinData != nil ? Pipe() : nil
+        if let inPipe {
+            process.standardInput = inPipe
+        }
+
         do {
             try process.run()
         } catch {
             return ProcessResult(exitCode: -1, stdout: "", stderr: error.localizedDescription)
+        }
+
+        if let inPipe, let stdinData {
+            DispatchQueue.global(qos: .userInitiated).async {
+                let fh = inPipe.fileHandleForWriting
+                if !stdinData.isEmpty {
+                    try? fh.write(contentsOf: stdinData)
+                }
+                try? fh.close()
+            }
         }
 
         let outGroup = DispatchGroup()

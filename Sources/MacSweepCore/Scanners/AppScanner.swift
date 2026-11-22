@@ -167,7 +167,9 @@ public struct AppScanner: Sendable {
         runningBundlePaths: [String]? = nil
     ) -> AppItem? {
         let fm = FileManager.default
-        guard appURL.pathExtension.lowercased() == "app",
+        guard appURL.isFileURL,
+              !appURL.path.contains("\0"),
+              appURL.pathExtension.lowercased() == "app",
               fm.fileExists(atPath: appURL.path) else {
             return nil
         }
@@ -208,7 +210,9 @@ public struct AppScanner: Sendable {
         let modified = resVals?.contentModificationDate
 
         let isSystemProtected = safetyGuard.isSystemProtectedApp(at: appURL)
-        let isAppleAppStoreApp = !isSystemProtected && safetyGuard.isAppleBundleID(bundleID)
+        let isAppleAppStoreApp = !isSystemProtected
+            && safetyGuard.isAppleBundleID(bundleID)
+            && Self.hasValidAppleSignature(at: appURL, expectedBundleID: bundleID)
         let isUserProtected = safetyGuard.isUserProtected(bundleID: bundleID, url: appURL)
         let requiresAdmin = safetyGuard.requiresAdmin(for: appURL)
         let stdAppPath = appURL.standardizedFileURL.path
@@ -252,11 +256,53 @@ public struct AppScanner: Sendable {
         return value as? Date
     }
 
-    /// Reads the real code-signing Team Identifier via Security framework (no subprocess overhead).
-    private static func extractTeamIdentifier(at appURL: URL) -> String? {
+    /// Verifies that an `.app` bundle carries a valid Apple OS or Mac App Store code signature
+    /// whose cryptographically sealed `kSecCodeInfoIdentifier` matches `expectedBundleID`.
+    /// Prevents unsigned/spoofed `.app` bundles from bypassing `com.apple.` filtering via `Info.plist`.
+    public static func hasValidAppleSignature(at appURL: URL, expectedBundleID: String) -> Bool {
+        let lowerExpected = expectedBundleID.lowercased()
+        guard lowerExpected.hasPrefix("com.apple.") else { return false }
+
         var staticCode: SecStaticCode?
         guard SecStaticCodeCreateWithPath(appURL as CFURL, SecCSFlags(), &staticCode) == errSecSuccess,
               let code = staticCode else {
+            return false
+        }
+
+        // Matches Apple OS-signed apps (`anchor apple`) AND Apple Mac App Store apps
+        // (Mac App Store signing cert OID 1.2.840.113635.100.6.1.9).
+        let reqString = "anchor apple or (anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.9])" as CFString
+        var requirement: SecRequirement?
+        guard SecRequirementCreateWithString(reqString, SecCSFlags(), &requirement) == errSecSuccess,
+              let req = requirement else {
+            return false
+        }
+
+        let checkFlags = SecCSFlags(rawValue: kSecCSDoNotValidateResources)
+        guard SecStaticCodeCheckValidity(code, checkFlags, req) == errSecSuccess else {
+            return false
+        }
+
+        var infoRef: CFDictionary?
+        let infoFlags = SecCSFlags(rawValue: kSecCSSigningInformation)
+        guard SecCodeCopySigningInformation(code, infoFlags, &infoRef) == errSecSuccess,
+              let dict = infoRef as? [String: Any],
+              let signedID = dict[kSecCodeInfoIdentifier as String] as? String else {
+            return false
+        }
+        return signedID.lowercased() == lowerExpected
+    }
+
+    /// Reads the verified code-signing Team Identifier via Security framework (no subprocess overhead).
+    /// Requires a cryptographically valid code signature before trusting TeamIdentifier.
+    public static func extractTeamIdentifier(at appURL: URL) -> String? {
+        var staticCode: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(appURL as CFURL, SecCSFlags(), &staticCode) == errSecSuccess,
+              let code = staticCode else {
+            return nil
+        }
+        let checkFlags = SecCSFlags(rawValue: kSecCSDoNotValidateResources)
+        guard SecStaticCodeCheckValidity(code, checkFlags, nil) == errSecSuccess else {
             return nil
         }
         var infoRef: CFDictionary?
@@ -268,5 +314,52 @@ public struct AppScanner: Sendable {
             return nil
         }
         return team
+    }
+
+    /// Collects bundle IDs and bundle paths of all apps across standard roots INCLUDING
+    /// `/System/Applications`, `/System/Applications/Utilities`, `/Applications/Utilities`, and
+    /// `/System/Library/CoreServices`, so dropped/spoofed `.app` bundles cannot claim system app data.
+    public static func allInstalledBundleIdentities(
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> (bundleIDs: Set<String>, bundlePathsByID: [String: Set<String>]) {
+        let roots = [
+            URL(fileURLWithPath: "/Applications"),
+            URL(fileURLWithPath: "/Applications/Utilities"),
+            homeDirectory.appendingPathComponent("Applications"),
+            URL(fileURLWithPath: "/System/Applications"),
+            URL(fileURLWithPath: "/System/Applications/Utilities"),
+            URL(fileURLWithPath: "/System/Library/CoreServices"),
+        ]
+        let fm = FileManager.default
+        var ids = Set<String>()
+        var pathsByID: [String: Set<String>] = [:]
+
+        func scan(_ dir: URL, depth: Int) {
+            guard let items = try? fm.contentsOfDirectory(
+                at: dir,
+                includingPropertiesForKeys: [.isDirectoryKey, .isPackageKey, .isSymbolicLinkKey],
+                options: [.skipsHiddenFiles]
+            ) else { return }
+            for item in items {
+                if item.pathExtension.lowercased() == "app" {
+                    let stdPath = item.standardizedFileURL.path
+                    if let bid = (Bundle(url: item)?.infoDictionary?["CFBundleIdentifier"] as? String)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                       !bid.isEmpty, !bid.hasPrefix("unknown.") {
+                        ids.insert(bid)
+                        pathsByID[bid, default: []].insert(stdPath)
+                    }
+                    continue
+                }
+                if depth == 0 {
+                    let vals = try? item.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey, .isSymbolicLinkKey])
+                    if vals?.isDirectory == true, vals?.isPackage != true, vals?.isSymbolicLink != true {
+                        scan(item, depth: 1)
+                    }
+                }
+            }
+        }
+        for root in roots { scan(root, depth: 0) }
+        return (ids, pathsByID)
     }
 }

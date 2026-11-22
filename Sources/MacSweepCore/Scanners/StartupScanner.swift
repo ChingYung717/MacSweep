@@ -110,7 +110,7 @@ public struct StartupScanner: Sendable {
         let fm = FileManager.default
         var isOrphaned = false
         if let exe = primaryExecutable, exe.hasPrefix("/") {
-            isOrphaned = !fm.fileExists(atPath: exe)
+            isOrphaned = Self.isExecutableDefinitelyMissing(atPath: exe)
         }
 
         let allCandidates = ([program].compactMap { $0 }) + programArgs
@@ -301,5 +301,18 @@ public struct StartupScanner: Sendable {
         case .systemDaemon: return 2
         case .appLoginItem: return 3
         }
+    }
+
+    /// Returns `true` ONLY when `stat(2)` confirms the path does not exist (`ENOENT` / `ENOTDIR`).
+    /// Permission errors (`EACCES` / `EPERM` on `0700 root:wheel` directories) conservatively return `false`
+    /// so active root-owned daemons are never falsely flagged as orphaned.
+    public static func isExecutableDefinitelyMissing(atPath path: String) -> Bool {
+        guard !path.isEmpty, !path.contains("\0") else { return true }
+        var st = stat()
+        if stat(path, &st) == 0 {
+            return false
+        }
+        let err = errno
+        return err == ENOENT || err == ENOTDIR
     }
 }

@@ -351,7 +351,7 @@ func runAuditFixChecks(_ runner: CheckRunner) {
                           "StartupScanner must find Contents/Library/LaunchAgents in 1-level subfolder apps")
 
         // ByHost dot-separated UUID stripping
-        let byHostStem = "com.acme.Tool.269F5995-70FC-5B55-BCF5-D7E491D2E457"
+        let byHostStem = "com.acme.Tool.11111111-2222-3333-4444-555555555555"
         try runner.expectEqual(InstalledAppInventory.stripUUIDSuffix(byHostStem), "com.acme.Tool")
 
         // Firefox profiles.ini parsing (relative & absolute)
@@ -445,13 +445,227 @@ func runAuditFixChecks(_ runner: CheckRunner) {
     }
 
     runner.run("N2: stripUUIDSuffix handles exact 37-char separator+UUID strings without off-by-one") {
-        let exact37Underscore = "_269F5995-70FC-5B55-BCF5-D7E491D2E457"
-        let exact37Dash = "-269F5995-70FC-5B55-BCF5-D7E491D2E457"
-        let exact37Dot = ".269F5995-70FC-5B55-BCF5-D7E491D2E457"
+        let exact37Underscore = "_11111111-2222-3333-4444-555555555555"
+        let exact37Dash = "-11111111-2222-3333-4444-555555555555"
+        let exact37Dot = ".11111111-2222-3333-4444-555555555555"
         try runner.expectEqual(exact37Underscore.count, 37)
         try runner.expectEqual(InstalledAppInventory.stripUUIDSuffix(exact37Underscore), "")
         try runner.expectEqual(InstalledAppInventory.stripUUIDSuffix(exact37Dash), "")
         try runner.expectEqual(InstalledAppInventory.stripUUIDSuffix(exact37Dot), "")
         try runner.expectEqual(InstalledAppInventory.stripUUIDSuffix("A" + exact37Underscore), "A")
+    }
+
+    // MARK: Security Audit Round 2 — M-01 through M-06 regressions
+
+    runner.run("M-01: privileged trash refuses hardlink chown, symlink trash, and parent-symlink TOCTOU") {
+        let sandbox = try runner.makeTempSandbox(prefix: "m01-lpe")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let fm = FileManager.default
+        let sg = SafetyGuard(homeDirectory: sandbox)
+        let exec = PrivilegedExecutor(safetyGuard: sg)
+
+        // 1. Hardlink inside directory must trigger chown-failed:(hardlink) and non-zero exit
+        let trash = sandbox.appendingPathComponent("Trash")
+        let victimDir = sandbox.appendingPathComponent("HardlinkApp.app")
+        try fm.createDirectory(at: victimDir, withIntermediateDirectories: true)
+        let outsideFile = sandbox.appendingPathComponent("outside-root-like.dat")
+        try Data("secret".utf8).write(to: outsideFile)
+        let plantedHardlink = victimDir.appendingPathComponent("link.dat")
+        try fm.linkItem(at: outsideFile, to: plantedHardlink)
+
+        let hardlinkScript = try exec.buildPrivilegedTrashShellCommand(
+            urls: [victimDir],
+            trashDirectory: trash,
+            timestamp: "hl"
+        )
+        let hlRes = ProcessRunner.run(executable: "/bin/sh", arguments: ["-c", hardlinkScript])
+        try runner.expect(hlRes.exitCode != 0, "Hardlink entry must fail chown guard")
+        try runner.expect(hlRes.stderr.contains("chown-failed:") && hlRes.stderr.contains("hardlink"),
+                          "Hardlink refusal must emit chown-failed hardlink marker; stderr=\(hlRes.stderr)")
+
+        // 2. Symlink Trash directory must fail immediately
+        let realDir = sandbox.appendingPathComponent("RealDir")
+        try fm.createDirectory(at: realDir, withIntermediateDirectories: true)
+        let symlinkTrash = sandbox.appendingPathComponent("SymTrash")
+        try fm.createSymbolicLink(at: symlinkTrash, withDestinationURL: realDir)
+        let victim2 = sandbox.appendingPathComponent("victim2.txt")
+        try Data("x".utf8).write(to: victim2)
+        let symTrashScript = try exec.buildPrivilegedTrashShellCommand(urls: [victim2], trashDirectory: symlinkTrash)
+        let symTrashRes = ProcessRunner.run(executable: "/bin/sh", arguments: ["-c", symTrashScript])
+        try runner.expect(symTrashRes.exitCode != 0, "Symlink Trash dir must be rejected")
+        try runner.expect(fm.fileExists(atPath: victim2.path), "Victim must not move into symlinked Trash")
+
+        // 3. Parent-symlink TOCTOU swap between command build and execution must block rm -rf
+        let swapParent = sandbox.appendingPathComponent("swap-parent")
+        let protectedSibling = sandbox.appendingPathComponent("decoy-target")
+        try fm.createDirectory(at: swapParent, withIntermediateDirectories: true)
+        try fm.createDirectory(at: protectedSibling, withIntermediateDirectories: true)
+        let targetInParent = swapParent.appendingPathComponent("item.txt")
+        let targetInDecoy = protectedSibling.appendingPathComponent("item.txt")
+        try Data("orig".utf8).write(to: targetInParent)
+        try Data("precious".utf8).write(to: targetInDecoy)
+
+        let rmScript = try exec.buildPermanentDeleteShellCommand(urls: [targetInParent])
+        // Simulate attacker replacing swapParent with symlink to protectedSibling during auth window
+        try fm.removeItem(at: swapParent)
+        try fm.createSymbolicLink(at: swapParent, withDestinationURL: protectedSibling)
+        let rmRes = ProcessRunner.run(executable: "/bin/sh", arguments: ["-c", rmScript])
+        try runner.expect(rmRes.exitCode != 0, "Parent-symlink swap must abort rm -rf")
+        try runner.expect(fm.fileExists(atPath: targetInDecoy.path), "Decoy file behind swapped parent symlink must stay intact")
+    }
+
+    runner.run("M-02: unsigned .app cannot spoof isAppleAppStoreApp or broad bundle prefixes like 'com' / 'com.apple'") {
+        let sandbox = try runner.makeTempSandbox(prefix: "m02-spoof")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let fm = FileManager.default
+        let sg = SafetyGuard(homeDirectory: sandbox)
+
+        // Unsigned fake app claiming CFBundleIdentifier = "com.apple.Safari"
+        let fakeApple = sandbox.appendingPathComponent("FakeSafari.app")
+        try fm.createDirectory(at: fakeApple.appendingPathComponent("Contents"), withIntermediateDirectories: true)
+        let fakePlist: [String: Any] = ["CFBundleIdentifier": "com.apple.Safari", "CFBundleName": "FakeSafari"]
+        try PropertyListSerialization.data(fromPropertyList: fakePlist, format: .xml, options: 0)
+            .write(to: fakeApple.appendingPathComponent("Contents/Info.plist"))
+
+        let scanner = AppScanner(safetyGuard: sg)
+        let inspected = scanner.inspectApp(at: fakeApple)
+        try runner.expect(inspected != nil)
+        try runner.expectEqual(inspected?.isAppleAppStoreApp, false, "Unsigned .app must NEVER be marked isAppleAppStoreApp")
+        try runner.expect(!sg.isAppleBundleID("com.apple"), "Bare 'com.apple' must not be treated as Apple bundle ID")
+
+        // ServiceFileMatcher must reject overly broad prefixes ("com", "org", "com.apple", "com.google")
+        try runner.expect(!ServiceFileMatcher.isMatchableBundleID("com"))
+        try runner.expect(!ServiceFileMatcher.isMatchableBundleID("org"))
+        try runner.expect(!ServiceFileMatcher.isMatchableBundleID("com.apple"))
+        try runner.expect(!ServiceFileMatcher.isMatchableBundleID("com.google"))
+        try runner.expect(!ServiceFileMatcher.isMatchableBundleID("-evil.app"))
+        try runner.expect(ServiceFileMatcher.isMatchableBundleID("com.acme.tool"))
+        try runner.expect(ServiceFileMatcher.isMatchableBundleID("local.myapp"))
+
+        let userLib = sandbox.appendingPathComponent("UserLib")
+        try fm.createDirectory(at: userLib.appendingPathComponent("Caches/com.apple.Notes"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: userLib.appendingPathComponent("Caches/com.thirdparty.Widget"), withIntermediateDirectories: true)
+        let idx = LibraryIndex.build(userLibraryURL: userLib, systemLibraryURL: sandbox.appendingPathComponent("SysLib"), safetyGuard: sg)
+        let matcher = ServiceFileMatcher(safetyGuard: sg)
+
+        let broadApp = AppItem(url: fakeApple, name: "Fake", localizedName: "Fake", bundleID: "com", version: "1.0")
+        try runner.expect(matcher.matchInMemory(app: broadApp, index: idx).isEmpty, "Broad 'com' bundleID must match nothing")
+        try runner.expect(ServiceFileMatcher.findMatchingPackageIDs(bundleID: "com", allPackageIDs: ["com.thirdparty.pkg"]).isEmpty)
+        try runner.expect(matcher.matchInMemory(app: inspected!, index: idx).isEmpty, "Unsigned spoofed com.apple.Safari must not match com.apple.*")
+    }
+
+    runner.run("M-03: SafetyGuard blocks shared vendor dirs, keychains/ssh/etc/TCC, self ancestors, case variants, and NUL") {
+        let sandbox = try runner.makeTempSandbox(prefix: "m03-sg")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let appParent = sandbox.appendingPathComponent("MyApps")
+        let selfApp = appParent.appendingPathComponent("MacSweep.app")
+        let protectedSub = sandbox.appendingPathComponent("KeepRoot/Sub")
+        let sg = SafetyGuard(
+            homeDirectory: sandbox,
+            selfBundlePath: selfApp.path,
+            protectedPaths: [protectedSub.path]
+        )
+
+        let mustBlock = [
+            sandbox.appendingPathComponent("Library/Application Support/Google").path,
+            sandbox.appendingPathComponent("Library/Application Support/Microsoft").path,
+            "/Library/Keychains",
+            "/Library/Keychains/System.keychain",
+            sandbox.appendingPathComponent("Library/Keychains/login.keychain-db").path,
+            sandbox.appendingPathComponent(".ssh/id_ed25519").path,
+            sandbox.appendingPathComponent(".gnupg/secring.gpg").path,
+            "/etc/hosts",
+            "/private/etc/sudoers",
+            "/private/var/db/dslocal/nodes/Default",
+            "/Library/Application Support/com.apple.TCC/TCC.db",
+            "/Library/Preferences/SystemConfiguration/preferences.plist",
+            "/LIBRARY/APPLE/SomeNonexistentFile",
+            appParent.path, // ancestor of selfBundlePath
+            sandbox.appendingPathComponent("KeepRoot").path, // ancestor of protectedPaths
+            protectedSub.appendingPathComponent("child.dat").path, // descendant of protectedPaths
+        ]
+        for p in mustBlock {
+            try runner.expect(!sg.validateForRemoval(URL(fileURLWithPath: p)).isAllowed, "Must block: \(p)")
+        }
+        try runner.expect(!sg.validateForRemoval(URL(fileURLWithPath: sandbox.path + "/bad\u{0000}name")).isAllowed,
+                          "Must block NUL byte in path")
+        try runner.expect(sg.validateForRemoval(sandbox.appendingPathComponent("literal%00ok.txt")).isAllowed,
+                          "Literal '%00' characters in filename should still be allowed")
+    }
+
+    runner.run("M-04 & M-05: Firefox path confinement, Chromium locale validation, ProcessRunner NUL safety, StartupController & pkgutil guards") {
+        let sandbox = try runner.makeTempSandbox(prefix: "m04-ext")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+        let fm = FileManager.default
+        let sg = SafetyGuard(homeDirectory: sandbox)
+
+        // Firefox profiles.ini rejects relative '..' escape
+        let evilIni = """
+        [Profile0]
+        Name=escape
+        IsRelative=1
+        Path=../../outside
+        """
+        let ffBase = sandbox.appendingPathComponent("Firefox")
+        try runner.expect(ExtensionScanner.parseFirefoxProfilesINI(evilIni, firefoxBaseURL: ffBase).isEmpty,
+                          "IsRelative=1 '..' traversal must be dropped")
+
+        // Firefox extensions.json rejects path outside <profile>/extensions/
+        let profileDir = ffBase.appendingPathComponent("Profiles/abc.default")
+        let extDir = profileDir.appendingPathComponent("extensions")
+        try fm.createDirectory(at: extDir, withIntermediateDirectories: true)
+        let validXpi = extDir.appendingPathComponent("good@example.org.xpi")
+        let outsideFile = sandbox.appendingPathComponent("secret.txt")
+        try Data("ok".utf8).write(to: validXpi)
+        try Data("secret".utf8).write(to: outsideFile)
+        let ffJSON = """
+        {
+          "addons": [
+            {"id":"good@example.org","location":"app-profile","type":"extension","path":"\(validXpi.path)"},
+            {"id":"evil@example.org","location":"app-profile","type":"extension","path":"\(outsideFile.path)"}
+          ]
+        }
+        """
+        let ffItems = ExtensionScanner.parseFirefoxExtensionsJSON(
+            Data(ffJSON.utf8),
+            profileName: "abc.default",
+            computeSize: false,
+            profileDirectory: profileDir,
+            safetyGuard: sg
+        )
+        try runner.expectEqual(ffItems.count, 1)
+        try runner.expectEqual(ffItems.first?.identifier, "good@example.org")
+
+        // ProcessRunner rejects NUL byte cleanly without crashing via ObjC exception
+        let nulRes = ProcessRunner.run(executable: "/bin/echo", arguments: ["hello\0world"])
+        try runner.expectEqual(nulRes.exitCode, -1, "NUL arg must return exitCode -1 without SIGABRT")
+
+        // sanitizedPackageIDs rejects leading '-' and bare 'com.apple'
+        let pkgs = PrivilegedExecutor.sanitizedPackageIDs(["--volume", "-v", "com.apple", "com.apple.pkg.X", "com.acme.ok"])
+        try runner.expectEqual(pkgs, ["com.acme.ok"])
+
+        // StartupController root PlistBuddy branch rejects com.apple.* labels dynamically
+        let unloadCmd = StartupController.buildUnloadShellCommand(targets: [
+            LaunchServiceTarget(
+                label: "com.acme.fallback",
+                domain: "system",
+                plistURL: URL(fileURLWithPath: "/Library/LaunchDaemons/com.acme.fallback.plist"),
+                labelFromPlist: nil
+            )
+        ])
+        try runner.expect(unloadCmd.contains("'com.apple.'*"), "Root PlistBuddy label script must guard against com.apple.*")
+
+        // CleanupHistoryStore & PreferencesStore enforce 0700 / 0600 permissions
+        let storeDir = sandbox.appendingPathComponent("StorePerms")
+        let histFile = storeDir.appendingPathComponent("history.json")
+        let prefFile = storeDir.appendingPathComponent("preferences.json")
+        CleanupHistoryStore(fileURL: histFile).clear()
+        PreferencesStore(fileURL: prefFile).save(SweepPreferences())
+        let dirPerm = (try fm.attributesOfItem(atPath: storeDir.path)[.posixPermissions] as? NSNumber)?.intValue
+        let histPerm = (try fm.attributesOfItem(atPath: histFile.path)[.posixPermissions] as? NSNumber)?.intValue
+        let prefPerm = (try fm.attributesOfItem(atPath: prefFile.path)[.posixPermissions] as? NSNumber)?.intValue
+        try runner.expectEqual(dirPerm, 0o700)
+        try runner.expectEqual(histPerm, 0o600)
+        try runner.expectEqual(prefPerm, 0o600)
     }
 }

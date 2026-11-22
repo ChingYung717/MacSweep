@@ -1,3 +1,4 @@
+import Darwin
 import MacSweepCore
 import SwiftUI
 
@@ -518,7 +519,27 @@ struct StartupProgramsView: View {
     }
 
     nonisolated private static func loadPlistTextOffMain(_ url: URL) -> String? {
-        guard let data = try? Data(contentsOf: url) else { return nil }
+        let maxBytes = 1_048_576
+        guard url.isFileURL, !url.path.contains("\0") else { return nil }
+        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+
+        var st = stat()
+        guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else { return nil }
+        var data = Data()
+        data.reserveCapacity(min(Int(st.st_size), maxBytes))
+        var buffer = [UInt8](repeating: 0, count: 16_384)
+        while data.count < maxBytes {
+            let remaining = maxBytes - data.count
+            let n = read(fd, &buffer, min(buffer.count, remaining))
+            if n > 0 {
+                data.append(contentsOf: buffer[..<n])
+            } else {
+                break
+            }
+        }
+        guard !data.isEmpty else { return nil }
         if let str = String(data: data, encoding: .utf8), str.contains("<?xml") {
             return String(str.prefix(6000))
         }

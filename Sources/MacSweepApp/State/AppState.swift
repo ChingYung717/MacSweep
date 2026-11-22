@@ -209,20 +209,26 @@ final class AppState: ObservableObject {
             )
             let matcher = ServiceFileMatcher(safetyGuard: guardCopy)
             var found = scanner.scanApplications()
+            let fullInventory = AppScanner.allInstalledBundleIdentities()
             let ambiguous = ServiceFileMatcher.ambiguousNameCandidates(across: found)
-            let installedIDs = Set(found.map { $0.bundleID.lowercased() }.filter { !$0.hasPrefix("unknown.") })
+            let scannedIDs = Set(found.map { $0.bundleID.lowercased() }.filter { !$0.hasPrefix("unknown.") })
+            let installedIDs = scannedIDs.union(fullInventory.bundleIDs)
             let installedPaths = Set(found.map { $0.url.standardizedFileURL.path })
+                .union(fullInventory.bundlePathsByID.values.flatMap { $0 })
 
             var bundleIDCounts: [String: Int] = [:]
             for app in found { bundleIDCounts[app.bundleID.lowercased(), default: 0] += 1 }
             for i in found.indices {
+                let lowerID = found[i].bundleID.lowercased()
+                let appPath = found[i].url.standardizedFileURL.path
+                let hasOtherSystemCopy = (fullInventory.bundlePathsByID[lowerID] ?? []).contains { $0 != appPath }
                 var matched = matcher.matchInMemory(
                     app: found[i],
                     index: index,
                     ambiguousNames: ambiguous,
                     allInstalledBundleIDs: installedIDs
                 )
-                if (bundleIDCounts[found[i].bundleID.lowercased()] ?? 0) > 1 {
+                if (bundleIDCounts[lowerID] ?? 0) > 1 || hasOtherSystemCopy {
                     found[i].sharesBundleIDWithOtherApp = true
                     for j in matched.indices { matched[j].isSelected = false }
                 }
@@ -373,7 +379,9 @@ final class AppState: ObservableObject {
 
     /// Handles Drag & Drop of any `.app` bundle (even outside `/Applications`) or Dock drop.
     func inspectDroppedApp(at url: URL) {
-        guard url.pathExtension.lowercased() == "app" else { return }
+        guard url.isFileURL,
+              !url.path.contains("\0"),
+              url.pathExtension.lowercased() == "app" else { return }
         if safetyGuard.isSelfApp(bundleID: nil, url: url) {
             banner = OperationBanner(
                 isError: true,
@@ -407,16 +415,25 @@ final class AppState: ObservableObject {
             )
             guard var inspected = scanner.inspectApp(at: url) else { return }
             let installedApps = knownApps.isEmpty ? scanner.scanApplications() : knownApps
+            let fullInventory = AppScanner.allInstalledBundleIdentities()
             let index = existingIndex ?? LibraryIndex.build(safetyGuard: guardCopy)
             let pkgs = existingPkgs ?? ServiceFileMatcher.listThirdPartyPackages()
             let allApps = installedApps + [inspected]
             let ambiguous = ServiceFileMatcher.ambiguousNameCandidates(across: allApps)
             let installedIDs = Set(allApps.map { $0.bundleID.lowercased() }.filter { !$0.hasPrefix("unknown.") })
-            let otherPaths = Set(installedApps.map { $0.url.standardizedFileURL.path }).subtracting([stdPath])
-            let shared = installedApps.contains {
-                $0.bundleID.lowercased() == inspected.bundleID.lowercased()
+                .union(fullInventory.bundleIDs)
+            let otherPaths = Set(installedApps.map { $0.url.standardizedFileURL.path })
+                .union(fullInventory.bundlePathsByID.values.flatMap { $0 })
+                .subtracting([stdPath])
+            let lowerInspectedID = inspected.bundleID.lowercased()
+            let sharedWithScanned = installedApps.contains {
+                $0.bundleID.lowercased() == lowerInspectedID
                     && $0.url.standardizedFileURL.path != stdPath
             }
+            let sharedWithSystemOrUtilities = (fullInventory.bundlePathsByID[lowerInspectedID] ?? []).contains {
+                $0 != stdPath
+            }
+            let shared = sharedWithScanned || sharedWithSystemOrUtilities
             let matcher = ServiceFileMatcher(safetyGuard: guardCopy)
             let matched = matcher.matchWithPackages(
                 app: inspected,
@@ -878,9 +895,15 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// Returns only candidate bundle IDs (excluding synthetic `unknown.*`) that had a matching
-    /// preference `.plist` actually removed under a `/Preferences/` directory.
+    /// Returns only candidate bundle IDs (excluding synthetic `unknown.*`, leading `-`, and global domains)
+    /// that had a matching preference `.plist` actually removed under a `/Preferences/` directory.
     static func preferenceDomainsRemoved(in removedURLs: [URL], candidateDomains: [String]) -> [String] {
+        let forbiddenGlobalDomains: Set<String> = [
+            "nsglobaldomain",
+            "apple global domain",
+            ".globalpreferences",
+            "com.apple",
+        ]
         let removedPrefFilenames = removedURLs.compactMap { url -> String? in
             let p = url.standardizedFileURL.path
             guard p.contains("/Preferences/"), url.pathExtension.lowercased() == "plist" else { return nil }
@@ -889,8 +912,15 @@ final class AppState: ObservableObject {
         guard !removedPrefFilenames.isEmpty else { return [] }
 
         return candidateDomains.filter { domain in
-            let lower = domain.lowercased()
-            guard !lower.isEmpty, !lower.hasPrefix("unknown.") else { return false }
+            let trimmed = domain.trimmingCharacters(in: .whitespacesAndNewlines)
+            let lower = trimmed.lowercased()
+            guard !lower.isEmpty,
+                  !lower.hasPrefix("-"),
+                  !lower.contains("\0"),
+                  !lower.contains(where: { $0.isWhitespace }),
+                  !lower.hasPrefix("unknown."),
+                  !forbiddenGlobalDomains.contains(lower),
+                  ServiceFileMatcher.isMatchableBundleID(lower) else { return false }
             return removedPrefFilenames.contains { file in
                 file == "\(lower).plist" || file.hasPrefix("\(lower).")
             }

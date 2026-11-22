@@ -247,7 +247,7 @@ func runReviewRegressionChecks(_ runner: CheckRunner) {
         try makeApp("WorkBuddy", bundleID: "com.tencent.workbuddy.mac", exec: "Electron")
         try makeApp("WeWork", bundleID: "com.tencent.WeWorkMac", exec: "WeWork", zhName: "企业微信")
 
-        let uuid = "269F5995-70FC-5B55-BCF5-D7E491D2E457"
+        let uuid = "11111111-2222-3333-4444-555555555555"
         for rel in [
             "Application Support/com.baidu.BaiduNetdisk-mac",   // renamed bundle id of installed app -> NOT leftover
             "Application Support/阿里云盘",                        // localized name of installed app -> NOT leftover
@@ -294,7 +294,7 @@ func runReviewRegressionChecks(_ runner: CheckRunner) {
         let fm = FileManager.default
         for rel in [
             "Application Support/Electron",
-            "Application Support/CrashReporter/Electron_269F5995-70FC-5B55-BCF5-D7E491D2E457.plist",
+            "Application Support/CrashReporter/Electron_11111111-2222-3333-4444-555555555555.plist",
             "Application Support/SharedEngine",
             "Application Support/WorkThing",
         ] {
