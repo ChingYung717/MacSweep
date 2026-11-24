@@ -142,6 +142,7 @@ struct L10n {
     var runningAppsWarning: String { t("以下应用正在运行，操作前将先自动退出：", "The following apps are running and will be quit first:") }
     var resetForceQuitNote: String { t("重置前必须退出应用，以防系统偏好缓存（cfprefsd）回写旧配置。", "Apps must quit before resetting so macOS preference cache (cfprefsd) does not write stale data back.") }
     var adminAuthNote: String { t("包含系统/受限目录项，确认后将弹出系统授权（优先委托 Finder 保留「放回原处」）。", "Includes root/protected paths. System authorization will be requested (delegating to Finder first to preserve Put Back).") }
+    var userLockedItemsNote: String { t("部分所选项目已被用户锁定（uchg），确认后将自动解锁并移除。", "Some selected items are locked by the user (uchg) and will be unlocked before removal.") }
     var chromiumSyncNote: String { t("提示：若浏览器开启了账号云同步，移除的扩展可能会在下次同步时自动恢复。", "Note: If browser account sync is enabled, removed extensions may be restored automatically on next sync.") }
 
     @MainActor

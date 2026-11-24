@@ -843,7 +843,7 @@ struct ApplicationsView: View {
             } else {
                 droppedURL = nil
             }
-            if let url = droppedURL, url.pathExtension.lowercased() == "app" {
+            if let url = droppedURL, url.isFileURL, url.pathExtension.lowercased() == "app" {
                 DispatchQueue.main.async {
                     state.inspectDroppedApp(at: url)
                 }

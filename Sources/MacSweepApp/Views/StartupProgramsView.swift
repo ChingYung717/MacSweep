@@ -1,4 +1,3 @@
-import Darwin
 import MacSweepCore
 import SwiftUI
 
@@ -442,10 +441,11 @@ struct StartupProgramsView: View {
 
                         Spacer()
 
+                        let isRemoveDisabled = isBusy || !item.canRemove
                         Button {
                             state.prepareRemovalForStartupItem(item)
                         } label: {
-                            Text(l10n.t("移除配置文件", "Remove Plist"))
+                            Text(item.canRemove ? l10n.t("移除配置文件", "Remove Plist") : l10n.t("受保护项", "Protected"))
                                 .font(.system(size: 13.5, weight: .semibold))
                                 .foregroundStyle(.white)
                                 .padding(.horizontal, 18)
@@ -456,8 +456,8 @@ struct StartupProgramsView: View {
                                 )
                         }
                         .buttonStyle(.plain)
-                        .disabled(isBusy)
-                        .opacity(isBusy ? 0.55 : 1)
+                        .disabled(isRemoveDisabled)
+                        .opacity(isRemoveDisabled ? 0.55 : 1)
                     }
                 }
                 .padding(.horizontal, 18)
@@ -519,35 +519,6 @@ struct StartupProgramsView: View {
     }
 
     nonisolated private static func loadPlistTextOffMain(_ url: URL) -> String? {
-        let maxBytes = 1_048_576
-        guard url.isFileURL, !url.path.contains("\0") else { return nil }
-        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
-        guard fd >= 0 else { return nil }
-        defer { close(fd) }
-
-        var st = stat()
-        guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else { return nil }
-        var data = Data()
-        data.reserveCapacity(min(Int(st.st_size), maxBytes))
-        var buffer = [UInt8](repeating: 0, count: 16_384)
-        while data.count < maxBytes {
-            let remaining = maxBytes - data.count
-            let n = read(fd, &buffer, min(buffer.count, remaining))
-            if n > 0 {
-                data.append(contentsOf: buffer[..<n])
-            } else {
-                break
-            }
-        }
-        guard !data.isEmpty else { return nil }
-        if let str = String(data: data, encoding: .utf8), str.contains("<?xml") {
-            return String(str.prefix(6000))
-        }
-        if let obj = try? PropertyListSerialization.propertyList(from: data, format: nil),
-           let xml = try? PropertyListSerialization.data(fromPropertyList: obj, format: .xml, options: 0),
-           let str = String(data: xml, encoding: .utf8) {
-            return String(str.prefix(6000))
-        }
-        return nil
+        StartupScanner.loadPlistPreview(at: url)
     }
 }

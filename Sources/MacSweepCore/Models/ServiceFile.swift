@@ -47,6 +47,8 @@ public struct ServiceFile: Identifiable, Hashable, Sendable {
     public let isSystemScope: Bool
     public let confidence: LeftoverConfidence?
     public let matchReason: String
+    /// Canonical POSIX parent directory captured at scan / discovery time for TOCTOU verification.
+    public let expectedCanonicalParent: String
 
     public init(
         url: URL,
@@ -57,7 +59,8 @@ public struct ServiceFile: Identifiable, Hashable, Sendable {
         requiresReboot: Bool = false,
         isSystemScope: Bool = false,
         confidence: LeftoverConfidence? = nil,
-        matchReason: String = ""
+        matchReason: String = "",
+        expectedCanonicalParent: String? = nil
     ) {
         self.id = url.path
         self.url = url
@@ -69,6 +72,8 @@ public struct ServiceFile: Identifiable, Hashable, Sendable {
         self.isSystemScope = isSystemScope
         self.confidence = confidence
         self.matchReason = matchReason
+        self.expectedCanonicalParent = expectedCanonicalParent
+            ?? PrivilegedExecutor.canonicalParentPath(forTargetURL: url)
     }
 
     public var displayName: String {

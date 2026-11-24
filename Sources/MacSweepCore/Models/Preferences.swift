@@ -47,8 +47,12 @@ public struct SweepPreferences: Codable, Sendable, Equatable {
     }
 }
 
-public final class PreferencesStore: Sendable {
+public final class PreferencesStore: @unchecked Sendable {
+    public static let maxBytes: Int = 1 * 1024 * 1024
+
     private let fileURL: URL
+    private let lock = NSLock()
+    private var hasWriteBlock: Bool = false
 
     public init(fileURL: URL? = nil) {
         if let fileURL {
@@ -60,24 +64,47 @@ public final class PreferencesStore: Sendable {
         }
     }
 
-    public func load() -> SweepPreferences {
-        guard let data = try? Data(contentsOf: fileURL),
-              let prefs = try? JSONDecoder().decode(SweepPreferences.self, from: data) else {
-            return SweepPreferences()
-        }
-        return prefs
+    public var isWriteBlockedDueToLoadError: Bool {
+        lock.withLock { hasWriteBlock }
     }
 
-    public func save(_ prefs: SweepPreferences) {
-        let fm = FileManager.default
-        let dir = fileURL.deletingLastPathComponent()
-        try? fm.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? encoder.encode(prefs) {
-            try? data.write(to: fileURL, options: .atomic)
-            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+    public func load() -> SweepPreferences {
+        lock.withLock {
+            let (prefs, canOverwrite) = loadDetailedUnlocked()
+            if !canOverwrite {
+                hasWriteBlock = true
+            }
+            return prefs
+        }
+    }
+
+    @discardableResult
+    public func save(_ prefs: SweepPreferences) -> Bool {
+        lock.withLock {
+            guard !hasWriteBlock else { return false }
+            let (_, canOverwrite) = loadDetailedUnlocked()
+            guard canOverwrite else {
+                hasWriteBlock = true
+                return false
+            }
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            guard let data = try? encoder.encode(prefs) else { return false }
+            return SafeFileReader.writePrivateAtomically(data, to: fileURL)
+        }
+    }
+
+    private func loadDetailedUnlocked() -> (prefs: SweepPreferences, canOverwrite: Bool) {
+        switch SafeFileReader.readBoundedRegularFileDetailed(at: fileURL, maxBytes: Self.maxBytes) {
+        case .notFound:
+            return (SweepPreferences(), true)
+        case let .success(data):
+            if let prefs = try? JSONDecoder().decode(SweepPreferences.self, from: data) {
+                return (prefs, true)
+            }
+            return (SweepPreferences(), false)
+        case .oversized, .notRegularFile, .readError:
+            return (SweepPreferences(), false)
         }
     }
 }

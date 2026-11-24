@@ -1,8 +1,19 @@
 import Darwin
 import Foundation
 
+public struct DirectorySizeMeasurement: Sendable, Equatable {
+    public let bytes: Int64
+    public let isTruncated: Bool
+
+    public init(bytes: Int64, isTruncated: Bool) {
+        self.bytes = bytes
+        self.isTruncated = isTruncated
+    }
+}
+
 /// Concurrent, bounded, cached disk-size calculator that skips symbolic links to avoid loops.
 public actor DirectorySizer {
+    public static let defaultMaxEntriesPerDirectory: Int = 250_000
     private var cache: [String: Int64] = [:]
 
     public init() {}
@@ -15,23 +26,34 @@ public actor DirectorySizer {
         cache.removeAll()
     }
 
-    public func size(of url: URL, useCache: Bool = true) -> Int64 {
+    public func isCached(path: String) -> Bool {
+        cache[URL(fileURLWithPath: path).standardizedFileURL.path] != nil
+    }
+
+    public func size(
+        of url: URL,
+        useCache: Bool = true,
+        maxEntries: Int = defaultMaxEntriesPerDirectory
+    ) -> Int64 {
         let key = url.standardizedFileURL.path
         if useCache, let cached = cache[key] {
             return cached
         }
-        let computed = Self.computeSizeSync(of: url)
-        if useCache {
-            cache[key] = computed
+        let measurement = Self.measureSizeSync(of: url, maxEntries: maxEntries)
+        if useCache && !measurement.isTruncated {
+            cache[key] = measurement.bytes
         }
-        return computed
+        return measurement.bytes
     }
 
     /// Computes sizes for multiple URLs concurrently with a fixed concurrency bound.
+    /// Truncated measurements (hitting `maxEntries` or cancellation) are returned for display
+    /// without being permanently cached as authoritative sizes.
     public func sizes(
         of urls: [URL],
         maxConcurrency: Int = 6,
-        useCache: Bool = true
+        useCache: Bool = true,
+        maxEntries: Int = defaultMaxEntriesPerDirectory
     ) async -> [String: Int64] {
         var results: [String: Int64] = [:]
         var toCompute: [URL] = []
@@ -50,26 +72,30 @@ public actor DirectorySizer {
         }
 
         let limit = max(1, maxConcurrency)
-        await withTaskGroup(of: (String, Int64).self) { group in
+        await withTaskGroup(of: (String, DirectorySizeMeasurement).self) { group in
             var index = 0
             for _ in 0..<min(limit, toCompute.count) {
                 let target = toCompute[index]
                 index += 1
                 group.addTask {
-                    (target.standardizedFileURL.path, Self.computeSizeSync(of: target))
+                    (target.standardizedFileURL.path, Self.measureSizeSync(of: target, maxEntries: maxEntries))
                 }
             }
 
-            while let (key, bytes) = await group.next() {
-                results[key] = bytes
-                if useCache {
-                    cache[key] = bytes
+            while let (key, measurement) = await group.next() {
+                if Task.isCancelled {
+                    group.cancelAll()
+                    break
+                }
+                results[key] = measurement.bytes
+                if useCache && !measurement.isTruncated {
+                    cache[key] = measurement.bytes
                 }
                 if index < toCompute.count {
                     let target = toCompute[index]
                     index += 1
                     group.addTask {
-                        (target.standardizedFileURL.path, Self.computeSizeSync(of: target))
+                        (target.standardizedFileURL.path, Self.measureSizeSync(of: target, maxEntries: maxEntries))
                     }
                 }
             }
@@ -78,21 +104,31 @@ public actor DirectorySizer {
         return results
     }
 
-    public nonisolated static func computeSizeSync(of url: URL) -> Int64 {
+    public nonisolated static func computeSizeSync(
+        of url: URL,
+        maxEntries: Int = defaultMaxEntriesPerDirectory
+    ) -> Int64 {
+        measureSizeSync(of: url, maxEntries: maxEntries).bytes
+    }
+
+    public nonisolated static func measureSizeSync(
+        of url: URL,
+        maxEntries: Int = defaultMaxEntriesPerDirectory
+    ) -> DirectorySizeMeasurement {
         let path = url.path
         var st = stat()
-        guard lstat(path, &st) == 0 else { return 0 }
+        guard lstat(path, &st) == 0 else {
+            return DirectorySizeMeasurement(bytes: 0, isTruncated: false)
+        }
 
         let fileType = st.st_mode & S_IFMT
         if fileType == S_IFLNK {
             // Symbolic link itself occupies negligible metadata blocks; never follow target.
-            return Int64(st.st_size)
+            return DirectorySizeMeasurement(bytes: Int64(st.st_size), isTruncated: false)
         }
         if fileType != S_IFDIR {
-            if st.st_blocks > 0 {
-                return Int64(st.st_blocks) * 512
-            }
-            return Int64(st.st_size)
+            let bytes = st.st_blocks > 0 ? Int64(st.st_blocks) * 512 : Int64(st.st_size)
+            return DirectorySizeMeasurement(bytes: bytes, isTruncated: false)
         }
 
         let keys: Set<URLResourceKey> = [
@@ -108,11 +144,23 @@ public actor DirectorySizer {
             options: [],
             errorHandler: { _, _ in true }
         ) else {
-            return 0
+            return DirectorySizeMeasurement(bytes: 0, isTruncated: false)
         }
 
+        let cap = max(0, maxEntries)
         var total: Int64 = 0
+        var visited = 0
+        var isTruncated = false
         for case let itemURL as URL in enumerator {
+            visited += 1
+            if visited > cap {
+                isTruncated = true
+                break
+            }
+            if (visited & 0xFF) == 0 && Task.isCancelled {
+                isTruncated = true
+                break
+            }
             guard let values = try? itemURL.resourceValues(forKeys: keys) else { continue }
             if values.isSymbolicLink == true {
                 continue
@@ -125,6 +173,6 @@ public actor DirectorySizer {
                 }
             }
         }
-        return total
+        return DirectorySizeMeasurement(bytes: total, isTruncated: isTruncated)
     }
 }

@@ -19,17 +19,31 @@ if CommandLine.arguments.contains("--live-audit") {
     let allPkgs = ServiceFileMatcher.listThirdPartyPackages()
     let allIDs = Set(apps.map { $0.bundleID.lowercased() }.filter { !$0.hasPrefix("unknown.") })
     let allPaths = Set(apps.map { $0.url.standardizedFileURL.path })
-    for probeName in ["AweSun", "Google Drive", "印象笔记", "aDrive"] {
+    let groupOwners = ServiceFileMatcher.applicationGroupOwners(across: apps)
+    for probeName in ["AweSun", "Google Drive", "印象笔记", "aDrive", "Microsoft Word"] {
         if let app = apps.first(where: { $0.name == probeName || $0.localizedName == probeName }) {
+            let otherGroups = ServiceFileMatcher.otherInstalledApplicationGroups(for: app, groupOwners: groupOwners)
             let res = matcher.matchWithPackages(
                 app: app,
                 index: index,
                 allPackageIDs: allPkgs,
                 allInstalledBundleIDs: allIDs,
-                otherInstalledAppPaths: allPaths.subtracting([app.url.standardizedFileURL.path])
+                otherInstalledAppPaths: allPaths.subtracting([app.url.standardizedFileURL.path]),
+                otherInstalledAppGroups: otherGroups
             )
+            let sharedOfficeSuffixes: Set<String> = [
+                "UBF8T346G9.Office",
+                "UBF8T346G9.ms",
+                "UBF8T346G9.com.microsoft.entrabroker",
+                "UBF8T346G9.com.microsoft.oneauth",
+                "UBF8T346G9.group.com.microsoft.shared",
+                "UBF8T346G9.OfficeOsfWebHost",
+                "UBF8T346G9.OfficeOneDriveSyncIntegration",
+            ]
             let badPaths = res.files.map(\.url.path).filter {
-                $0 == "/Library/StartupItems" || $0 == "/Library/Printers" || $0 == "/etc/paths.d" || $0.hasPrefix("/Applications/Google Docs")
+                $0 == "/Library/StartupItems" || $0 == "/Library/Printers" || $0 == "/etc/paths.d"
+                    || $0.hasPrefix("/Applications/Google Docs")
+                    || (probeName == "Microsoft Word" && sharedOfficeSuffixes.contains(URL(fileURLWithPath: $0).lastPathComponent))
             }
             print("  - \(app.localizedName) [\(app.bundleID)]: \(res.files.count) files, pkgs=\(res.matchedPackageIDs.count), badSharedHits=\(badPaths)")
         }

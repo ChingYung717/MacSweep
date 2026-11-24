@@ -67,7 +67,8 @@ public struct StartupScanner: Sendable {
             guard let item = parseLaunchPlist(at: url, scope: scope, disabledOverrides: disabledOverrides) else {
                 continue
             }
-            if item.label.lowercased().hasPrefix("com.apple.") {
+            let lowerLabel = item.label.lowercased()
+            if lowerLabel == "com.apple" || lowerLabel.hasPrefix("com.apple.") {
                 continue
             }
             items.append(item)
@@ -80,7 +81,7 @@ public struct StartupScanner: Sendable {
         scope: StartupScope,
         disabledOverrides: [String: Bool]
     ) -> StartupItem? {
-        guard let data = try? Data(contentsOf: url),
+        guard let data = SafeFileReader.readBoundedRegularFile(at: url),
               let raw = try? PropertyListSerialization.propertyList(from: data, format: nil),
               let dict = raw as? [String: Any] else {
             return nil
@@ -118,7 +119,11 @@ public struct StartupScanner: Sendable {
         let associatedExists = associated.map { fm.fileExists(atPath: $0.path) } ?? false
         let fileSize = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? Int64(data.count)
         let requiresAdmin = (scope != .userAgent) || safetyGuard.requiresAdmin(for: url)
+        let isProtected = safetyGuard.matchesProtectedBundleID(finalLabel)
+            || !safetyGuard.validateForRemoval(url).isAllowed
+            || (associated.map { safetyGuard.isUserProtected(bundleID: nil, url: URL(fileURLWithPath: $0.path)) } ?? false)
 
+        let expectedCanonicalParent = PrivilegedExecutor.canonicalParentPath(forTargetURL: url)
         return StartupItem(
             label: finalLabel,
             plistURL: url,
@@ -135,8 +140,9 @@ public struct StartupScanner: Sendable {
             labelFromPlist: resolvedPlistLabel,
             requiresAdmin: requiresAdmin,
             canToggle: true,
-            canRemove: true,
-            fileSize: fileSize
+            canRemove: !isProtected,
+            fileSize: fileSize,
+            expectedCanonicalParent: expectedCanonicalParent
         )
     }
 
@@ -188,7 +194,8 @@ public struct StartupScanner: Sendable {
                 for plistURL in plists where plistURL.pathExtension.lowercased() == "plist" {
                     let meta = LibraryIndex.parseLaunchPlistMetadata(at: plistURL)
                     let label = meta.label ?? plistURL.deletingPathExtension().lastPathComponent
-                    if label.lowercased().hasPrefix("com.apple.") { continue }
+                    let lowerEmbedded = label.lowercased()
+                    if lowerEmbedded == "com.apple" || lowerEmbedded.hasPrefix("com.apple.") { continue }
                     let item = StartupItem(
                         label: label,
                         plistURL: plistURL,
@@ -300,6 +307,55 @@ public struct StartupScanner: Sendable {
         case .systemAgent: return 1
         case .systemDaemon: return 2
         case .appLoginItem: return 3
+        }
+    }
+
+    /// Loads a bounded preview of a launchd plist without blocking on FIFOs or exhausting memory.
+    /// For files exceeding `maxFullBytes` (default 1 MB), reads a bounded prefix and appends a
+    /// clear truncation notice instead of returning a blank preview.
+    public static func loadPlistPreview(
+        at url: URL,
+        maxFullBytes: Int = 1_048_576,
+        prefixBytes: Int = 16_384,
+        maxChars: Int = 6000
+    ) -> String? {
+        switch SafeFileReader.readBoundedRegularFileDetailed(at: url, maxBytes: maxFullBytes) {
+        case let .success(data):
+            guard !data.isEmpty else { return nil }
+            let xmlText: String?
+            if let str = String(data: data, encoding: .utf8), str.contains("<?xml") {
+                xmlText = str
+            } else if let obj = try? PropertyListSerialization.propertyList(from: data, format: nil),
+                      let xml = try? PropertyListSerialization.data(fromPropertyList: obj, format: .xml, options: 0) {
+                xmlText = String(data: xml, encoding: .utf8)
+            } else {
+                xmlText = nil
+            }
+            guard let fullText = xmlText else { return nil }
+            if fullText.count > maxChars {
+                return String(fullText.prefix(maxChars)) + "\n\n... [Preview truncated]"
+            }
+            return fullText
+        case let .oversized(actualSize, _):
+            guard let prefix = SafeFileReader.readBoundedPrefix(at: url, maxBytes: prefixBytes),
+                  !prefix.data.isEmpty else {
+                return nil
+            }
+            let sizeDesc: String
+            if let actualSize = actualSize ?? prefix.totalSize {
+                sizeDesc = ByteCountFormatter.string(fromByteCount: actualSize, countStyle: .file)
+            } else {
+                sizeDesc = "> 1 MB"
+            }
+            let bplistMagic = Data("bplist".utf8)
+            if prefix.data.starts(with: bplistMagic) {
+                return "[Preview truncated: binary plist exceeds 1 MB (\(sizeDesc)). Reveal in Finder to inspect the full file.]"
+            }
+            let decoded = String(decoding: prefix.data, as: UTF8.self)
+            let clipped = String(decoded.prefix(maxChars))
+            return clipped + "\n\n... [Preview truncated: file exceeds 1 MB (\(sizeDesc))]"
+        case .notFound, .notRegularFile, .readError:
+            return nil
         }
     }
 

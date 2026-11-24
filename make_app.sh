@@ -26,6 +26,15 @@ else
     BUILD_NUMBER="1"
 fi
 
+if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+(\.[0-9]+){0,3}(-[A-Za-z0-9.-]+)?$'; then
+    echo "Error: Invalid VERSION format: $VERSION" >&2
+    exit 1
+fi
+if ! printf '%s' "$BUILD_NUMBER" | grep -Eq '^[0-9]+(\.[0-9]+)*$'; then
+    echo "Error: Invalid BUILD_NUMBER format: $BUILD_NUMBER" >&2
+    exit 1
+fi
+
 NOTARY_PROFILE="${MACSWEEP_NOTARY_PROFILE:-}"
 
 # Resolve signing identity: explicit env -> first Apple Development identity -> ad-hoc fallback
@@ -156,13 +165,15 @@ codesign "${sign_args[@]}" "$APP"
 codesign --verify --deep --strict --verbose=1 "$APP"
 
 ZIP_OUT="$OUT/${DISPLAY_NAME}-${ARCH}.zip"
-ZIP_TMP="$OUT/.${DISPLAY_NAME}-${ARCH}-$$.zip"
-trap 'rm -f "$ZIP_TMP"' EXIT
+ZIP_TMP_DIR="$(mktemp -d "$OUT/.${DISPLAY_NAME}-zip.XXXXXXXXXX")"
+ZIP_TMP="$ZIP_TMP_DIR/${DISPLAY_NAME}-${ARCH}.zip"
+trap 'rm -rf "$ZIP_TMP_DIR"' EXIT
 ditto -c -k --norsrc --keepParent "$APP" "$ZIP_TMP"
 if [ -n "$NOTARY_PROFILE" ]; then
     xcrun notarytool submit "$ZIP_TMP" --keychain-profile "$NOTARY_PROFILE" --wait
     xcrun stapler staple "$APP"
     xcrun stapler validate "$APP"
+    rm -f "$ZIP_TMP"
     ditto -c -k --norsrc --keepParent "$APP" "$ZIP_TMP"
 fi
 mv -f "$ZIP_TMP" "$ZIP_OUT"

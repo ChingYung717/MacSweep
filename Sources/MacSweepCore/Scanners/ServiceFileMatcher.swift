@@ -83,7 +83,17 @@ public struct ServiceFileMatcher: Sendable {
     public static func ambiguousNameCandidates(across apps: [AppItem]) -> Set<String> {
         var counts: [String: Int] = [:]
         for app in apps {
-            for name in Set(nameCandidates(for: app)) {
+            var names = Set(nameCandidates(for: app))
+            if let exec = app.executableName {
+                let trimmed = exec.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if trimmed.count >= 4,
+                   !genericExecutableNames.contains(trimmed),
+                   !genericStopWords.contains(trimmed),
+                   !SafetyGuard.sharedVendorFolderNames.contains(trimmed) {
+                    names.insert(trimmed)
+                }
+            }
+            for name in names {
                 counts[name, default: 0] += 1
             }
         }
@@ -113,25 +123,39 @@ public struct ServiceFileMatcher: Sendable {
         return false
     }
 
-    /// Returns `true` only for well-formed reverse-DNS bundle identifiers safe for prefix matching.
-    /// Rejects single-segment prefixes (`"com"`, `"org"`), bare `"com.apple"`, synthetic `"unknown.*"`,
-    /// empty segments, leading `"-"`, whitespace, and NUL bytes.
-    public static func isMatchableBundleID(_ bundleID: String) -> Bool {
+    /// Returns `true` only for well-formed reverse-DNS bundle identifiers safe for matching.
+    /// Strips `group.` / `groups.` / `<10-char TeamID>.` prefixes before checking `com.apple`/`com.apple.*`,
+    /// rejects `group.*` / `groups.*` as an app bundle ID, non-`com.apple` Apple group namespaces
+    /// (`is.workflow.*`, `tvappservices.*`), single-segment IDs, bare `"com.apple"`, synthetic `"unknown.*"`,
+    /// 2-segment shared-vendor prefixes, empty segments, leading `"-"`, whitespace, control chars, and NUL bytes.
+    public static func isMatchableBundleID(_ bundleID: String, allowApple: Bool = false) -> Bool {
         let lower = bundleID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !lower.isEmpty,
               !lower.contains("\0"),
               !lower.hasPrefix("-"),
               !lower.hasPrefix("unknown."),
-              !lower.contains(where: { $0.isWhitespace }),
+              !lower.hasPrefix("group."),
+              !lower.hasPrefix("groups."),
+              !lower.contains(where: { $0.isWhitespace || ($0.isASCII && ($0.asciiValue ?? 32) < 32) }),
               lower != "com.apple" else {
             return false
+        }
+        let stripped = InstalledAppInventory.stripContainerPrefixes(lower)
+        if stripped.isEmpty || stripped == "com.apple" {
+            return false
+        }
+        if !allowApple {
+            if stripped.hasPrefix("com.apple.")
+                || SafetyGuard.isAppleGroupContainerName(lower)
+                || SafetyGuard.isAppleGroupContainerName("group." + lower) {
+                return false
+            }
         }
         let rawParts = lower.split(separator: ".", omittingEmptySubsequences: false)
         guard rawParts.count >= 2, rawParts.allSatisfy({ !$0.isEmpty }) else {
             return false
         }
-        // Reject overly broad 2-segment vendor-only prefixes like `com.google`, `com.microsoft`, `com.adobe`
-        // unless they are not generic shared vendors.
+        // Reject overly broad 2-segment vendor-only prefixes like `com.google`, `com.microsoft`, `com.adobe`.
         if rawParts.count == 2 {
             let second = String(rawParts[1])
             if second == "apple" || SafetyGuard.sharedVendorFolderNames.contains(second) {
@@ -141,17 +165,71 @@ public struct ServiceFileMatcher: Sendable {
         return true
     }
 
+    /// Only >= 3-segment reverse-DNS identifiers are allowed to boundary-prefix match sub-identifiers,
+    /// LaunchDaemons, or pkgutil receipts. 2-segment IDs (e.g. `local.myapp`, `com.docker`, `com.1password`,
+    /// `org.python`, `us.zoom`) are restricted to exact matches (plus ByHost `.<UUID>` preferences).
+    public static func allowsPrefixMatching(forBundleID bundleID: String) -> Bool {
+        let lower = bundleID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let parts = lower.split(separator: ".", omittingEmptySubsequences: false)
+        return parts.count >= 3 && parts.allSatisfy { !$0.isEmpty }
+    }
+
+    private static func matchesBundleIdentifier(candidate: String, bundleID: String, allowPrefix: Bool) -> Bool {
+        allowPrefix ? isBoundaryPrefixMatch(candidate: candidate, prefix: bundleID) : (candidate == bundleID)
+    }
+
+    private static func normalizedPathKey(_ path: String) -> String {
+        URL(fileURLWithPath: path).standardizedFileURL.path.precomposedStringWithCanonicalMapping.lowercased()
+    }
+
+    /// Maps each lowercased `application-groups` entitlement ID to the set of normalized `.app` paths declaring it.
+    public static func applicationGroupOwners(across apps: [AppItem]) -> [String: Set<String>] {
+        var owners: [String: Set<String>] = [:]
+        for app in apps where !app.applicationGroups.isEmpty {
+            let pathKey = normalizedPathKey(app.url.path)
+            for group in app.applicationGroups {
+                let lower = group.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if !lower.isEmpty {
+                    owners[lower, default: []].insert(pathKey)
+                }
+            }
+        }
+        return owners
+    }
+
+    /// Returns all lowercased Group Container IDs declared by any OTHER installed `.app`
+    /// (different normalized bundle path from `app.url`), preventing shared-suite containers
+    /// (e.g. Microsoft Office) and installed third-party `group.*` containers from being claimed.
+    public static func otherInstalledApplicationGroups(
+        for app: AppItem,
+        groupOwners: [String: Set<String>]
+    ) -> Set<String> {
+        guard !groupOwners.isEmpty else { return [] }
+        let selfPathKey = normalizedPathKey(app.url.path)
+        var others = Set<String>()
+        for (groupID, paths) in groupOwners {
+            if paths.contains(where: { $0 != selfPathKey }) {
+                others.insert(groupID)
+            }
+        }
+        return others
+    }
+
     /// Fast in-memory match against `LibraryIndex` (no disk traversal, no per-entry safety I/O).
     public func matchInMemory(
         app: AppItem,
         index: LibraryIndex,
         ambiguousNames: Set<String> = [],
-        allInstalledBundleIDs: Set<String> = []
+        allInstalledBundleIDs: Set<String> = [],
+        otherInstalledAppGroups: Set<String> = []
     ) -> [ServiceFile] {
         let lowerBundleID = app.bundleID.lowercased()
-        let hasValidBundleID = Self.isMatchableBundleID(lowerBundleID)
+        let hasValidBundleID = Self.isMatchableBundleID(lowerBundleID, allowApple: app.isAppleAppStoreApp)
         let appBundlePath = app.url.standardizedFileURL.path
         let nameCandidates = Self.nameCandidates(for: app).filter { !ambiguousNames.contains($0) }
+        let lowerOtherGroups = Set(otherInstalledAppGroups.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        })
 
         var matched: [ServiceFile] = []
         var seenPaths = Set<String>()
@@ -159,32 +237,58 @@ public struct ServiceFileMatcher: Sendable {
         for entry in index.entries {
             guard entry.isRemovable else { continue }
             let entryPath = entry.url.standardizedFileURL.path
-            guard !seenPaths.contains(entryPath) else { continue }
+            let entryKey = Self.normalizedPathKey(entryPath)
+            guard !seenPaths.contains(entryKey) else { continue }
 
-            // Avoid matching Apple system files for non-Apple apps.
-            if !app.isAppleAppStoreApp && entry.normalizedName.hasPrefix("com.apple.") {
+            let lowerStem = entry.stem.lowercased()
+            let strippedName = InstalledAppInventory.stripContainerPrefixes(entry.normalizedName)
+            let strippedStem = InstalledAppInventory.stripContainerPrefixes(lowerStem)
+            let lowerLaunchLabel = entry.launchLabel?.lowercased()
+
+            // Avoid matching Apple system, Group Container, or launchd files for non-Apple apps.
+            if !app.isAppleAppStoreApp {
+                if strippedName == "com.apple" || strippedName.hasPrefix("com.apple.")
+                    || strippedStem == "com.apple" || strippedStem.hasPrefix("com.apple.")
+                    || lowerLaunchLabel == "com.apple" || (lowerLaunchLabel?.hasPrefix("com.apple.") ?? false) {
+                    continue
+                }
+                if entry.category == .groupContainers && SafetyGuard.isAppleGroupContainerName(entry.normalizedName) {
+                    continue
+                }
+            }
+
+            // Never claim entries belonging to a user-protected bundle ID.
+            let noUUIDStem = InstalledAppInventory.stripUUIDSuffix(lowerStem)
+            if safetyGuard.matchesProtectedBundleID(entry.normalizedName)
+                || safetyGuard.matchesProtectedBundleID(lowerStem)
+                || safetyGuard.matchesProtectedBundleID(noUUIDStem)
+                || (lowerLaunchLabel.map { safetyGuard.matchesProtectedBundleID($0) } ?? false) {
                 continue
             }
 
-            if let reason = matchReason(
+            if let match = matchReason(
                 entry: entry,
                 bundleID: hasValidBundleID ? lowerBundleID : nil,
+                allowApple: app.isAppleAppStoreApp,
                 appBundlePath: appBundlePath,
                 teamID: app.teamIdentifier?.lowercased(),
+                applicationGroups: app.applicationGroups,
                 nameCandidates: nameCandidates,
-                allInstalledBundleIDs: allInstalledBundleIDs
+                allInstalledBundleIDs: allInstalledBundleIDs,
+                otherInstalledAppGroups: lowerOtherGroups
             ) {
-                seenPaths.insert(entryPath)
+                seenPaths.insert(entryKey)
                 let requiresReboot = entryPath.contains("/Audio/Plug-Ins/HAL/")
                 matched.append(ServiceFile(
                     url: entry.url,
                     category: entry.category,
                     size: nil,
-                    isSelected: true,
+                    isSelected: match.defaultSelected,
                     requiresAdmin: entry.requiresAdmin,
                     requiresReboot: requiresReboot,
                     isSystemScope: entry.isSystemScope,
-                    matchReason: reason
+                    matchReason: match.reason,
+                    expectedCanonicalParent: entry.expectedCanonicalParent
                 ))
             }
         }
@@ -204,16 +308,18 @@ public struct ServiceFileMatcher: Sendable {
         allPackageIDs: [String],
         ambiguousNames: Set<String> = [],
         allInstalledBundleIDs: Set<String> = [],
-        otherInstalledAppPaths: Set<String> = []
+        otherInstalledAppPaths: Set<String> = [],
+        otherInstalledAppGroups: Set<String> = []
     ) -> ServiceMatchResult {
         var files = matchInMemory(
             app: app,
             index: index,
             ambiguousNames: ambiguousNames,
-            allInstalledBundleIDs: allInstalledBundleIDs
+            allInstalledBundleIDs: allInstalledBundleIDs,
+            otherInstalledAppGroups: otherInstalledAppGroups
         )
-        var seenPaths = Set(files.map { $0.url.standardizedFileURL.path })
-        seenPaths.insert(app.url.standardizedFileURL.path)
+        var seenPaths = Set(files.map { Self.normalizedPathKey($0.url.standardizedFileURL.path) })
+        seenPaths.insert(Self.normalizedPathKey(app.url.standardizedFileURL.path))
 
         let matchingPkgs = Self.findMatchingPackageIDs(
             bundleID: app.bundleID,
@@ -226,6 +332,7 @@ public struct ServiceFileMatcher: Sendable {
         let fm = FileManager.default
 
         for pkgID in matchingPkgs {
+            guard !safetyGuard.matchesProtectedBundleID(pkgID) else { continue }
             let infoRes = ProcessRunner.run(executable: "/usr/sbin/pkgutil", arguments: ["--pkg-info", pkgID])
             guard infoRes.succeeded, let pkgInfo = Self.parsePkgInfo(infoRes.stdout, fallbackID: pkgID) else {
                 continue
@@ -246,10 +353,11 @@ public struct ServiceFileMatcher: Sendable {
             )
 
             for absPath in collapsed {
-                guard !seenPaths.contains(absPath), fm.fileExists(atPath: absPath) else { continue }
+                let normAbs = Self.normalizedPathKey(absPath)
+                guard !seenPaths.contains(normAbs), fm.fileExists(atPath: absPath) else { continue }
                 let url = URL(fileURLWithPath: absPath)
                 guard safetyGuard.validateForRemoval(url).isAllowed else { continue }
-                seenPaths.insert(absPath)
+                seenPaths.insert(normAbs)
 
                 let category = Self.categorizePath(absPath)
                 let requiresReboot = absPath.contains("/Audio/Plug-Ins/HAL/")
@@ -262,7 +370,8 @@ public struct ServiceFileMatcher: Sendable {
                     requiresAdmin: safetyGuard.requiresAdmin(for: url),
                     requiresReboot: requiresReboot,
                     isSystemScope: isSys,
-                    matchReason: "pkgutil: \(pkgID)"
+                    matchReason: "pkgutil: \(pkgID)",
+                    expectedCanonicalParent: PrivilegedExecutor.canonicalParentPath(forTargetURL: url)
                 ))
             }
         }
@@ -294,13 +403,18 @@ public struct ServiceFileMatcher: Sendable {
         allInstalledBundleIDs: Set<String> = []
     ) -> [String] {
         let lowerBundle = bundleID.lowercased()
-        guard isMatchableBundleID(lowerBundle) else { return [] }
-        if !allowApple && lowerBundle.hasPrefix("com.apple.") { return [] }
+        guard isMatchableBundleID(lowerBundle, allowApple: allowApple) else { return [] }
+        let allowPrefix = allowsPrefixMatching(forBundleID: lowerBundle)
 
         return allPackageIDs.filter { pkg in
             let lowerPkg = pkg.lowercased()
-            if !allowApple && lowerPkg.hasPrefix("com.apple.") { return false }
-            guard isBoundaryPrefixMatch(candidate: lowerPkg, prefix: lowerBundle) else { return false }
+            let strippedPkg = InstalledAppInventory.stripContainerPrefixes(lowerPkg)
+            if !allowApple && (strippedPkg == "com.apple" || strippedPkg.hasPrefix("com.apple.")) {
+                return false
+            }
+            guard matchesBundleIdentifier(candidate: lowerPkg, bundleID: lowerBundle, allowPrefix: allowPrefix) else {
+                return false
+            }
             if isClaimedByLongerInstalledBundleID(lowerPkg, ownBundleID: lowerBundle, allInstalledBundleIDs: allInstalledBundleIDs) {
                 return false
             }
@@ -338,8 +452,8 @@ public struct ServiceFileMatcher: Sendable {
         safetyGuard: SafetyGuard,
         otherInstalledAppPaths: Set<String> = []
     ) -> [String] {
-        let stdApp = URL(fileURLWithPath: appBundlePath).standardizedFileURL.path
-        let stdOtherApps = Set(otherInstalledAppPaths.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
+        let stdAppNorm = normalizedPathKey(appBundlePath)
+        let stdOtherAppsNorm = Set(otherInstalledAppPaths.map(normalizedPathKey))
         let fm = FileManager.default
 
         // Resolve all non-empty lines first so we can identify plain parent directories present in `--files` input.
@@ -351,12 +465,13 @@ public struct ServiceFileMatcher: Sendable {
             resolvedAll.append(pkgInfo.resolveAbsolutePath(for: trimmed))
         }
 
-        let parentDirsOfOtherEntries: Set<String> = {
+        let parentDirsOfOtherEntriesNorm: Set<String> = {
             var parents = Set<String>()
             for path in resolvedAll {
                 var cur = URL(fileURLWithPath: path).deletingLastPathComponent().path
                 while cur.count > 1 {
-                    if !parents.insert(cur).inserted { break }
+                    let normCur = normalizedPathKey(cur)
+                    if !parents.insert(normCur).inserted { break }
                     cur = URL(fileURLWithPath: cur).deletingLastPathComponent().path
                 }
             }
@@ -364,23 +479,25 @@ public struct ServiceFileMatcher: Sendable {
         }()
 
         var results: [String] = []
-        var seen = Set<String>()
+        var seenNorm = Set<String>()
 
         for absPath in resolvedAll {
+            let absNorm = normalizedPathKey(absPath)
             // Exclude the app bundle itself and anything inside it (already handled as main app).
-            if absPath == stdApp || absPath.hasPrefix(stdApp + "/") {
+            if absNorm == stdAppNorm || absNorm.hasPrefix(stdAppNorm + "/") {
                 continue
             }
 
             // Collapse up to the outermost enclosing known bundle (e.g. `OrayVirtualAudioDevice.driver`),
             // never collapsing into a plain directory.
             let targetPath = outermostCollapsibleBundle(for: absPath) ?? absPath
+            let targetNorm = normalizedPathKey(targetPath)
 
-            if targetPath == stdApp || targetPath.hasPrefix(stdApp + "/") {
+            if targetNorm == stdAppNorm || targetNorm.hasPrefix(stdAppNorm + "/") {
                 continue
             }
-            // Do not claim separate installed `.app` bundles belonging to sibling products (e.g. Google Docs/Sheets/Slides).
-            if stdOtherApps.contains(targetPath) {
+            // Do not claim separate installed `.app` bundles (or files inside them) belonging to sibling products.
+            if stdOtherAppsNorm.contains(where: { targetNorm == $0 || targetNorm.hasPrefix($0 + "/") }) {
                 continue
             }
             let ext = URL(fileURLWithPath: targetPath).pathExtension.lowercased()
@@ -388,7 +505,7 @@ public struct ServiceFileMatcher: Sendable {
 
             if !isKnownBundle {
                 // Reject plain directories (either known parent of other entries in BOM, or existing directory on disk).
-                if parentDirsOfOtherEntries.contains(targetPath) {
+                if parentDirsOfOtherEntriesNorm.contains(targetNorm) {
                     continue
                 }
                 var isDir: ObjCBool = false
@@ -408,7 +525,7 @@ public struct ServiceFileMatcher: Sendable {
                 continue
             }
 
-            if seen.insert(targetPath).inserted {
+            if seenNorm.insert(targetNorm).inserted {
                 results.append(targetPath)
             }
         }
@@ -452,16 +569,21 @@ public struct ServiceFileMatcher: Sendable {
     private func matchReason(
         entry: LibraryEntry,
         bundleID: String?,
+        allowApple: Bool,
         appBundlePath: String,
         teamID: String?,
+        applicationGroups: [String],
         nameCandidates: [String],
-        allInstalledBundleIDs: Set<String>
-    ) -> String? {
+        allInstalledBundleIDs: Set<String>,
+        otherInstalledAppGroups: Set<String>
+    ) -> (reason: String, defaultSelected: Bool)? {
         // 1. LaunchAgent / LaunchDaemon referencing a binary inside this .app bundle (highest precision!)
         if !entry.launchProgramPaths.isEmpty {
+            let normAppBundle = Self.normalizedPathKey(appBundlePath)
             for prog in entry.launchProgramPaths {
-                if prog == appBundlePath || prog.hasPrefix(appBundlePath + "/") {
-                    return "Launch plist references app binary"
+                let normProg = Self.normalizedPathKey(prog)
+                if normProg == normAppBundle || normProg.hasPrefix(normAppBundle + "/") {
+                    return ("Launch plist references app binary", true)
                 }
             }
         }
@@ -469,48 +591,116 @@ public struct ServiceFileMatcher: Sendable {
         let lowerStem = entry.stem.lowercased()
         let lowerFull = entry.normalizedName
 
-        // 2. Bundle ID exact & boundary-prefix matches (excluding entries owned by a longer installed bundle ID)
+        // 2. Bundle ID exact & boundary-prefix matches (excluding entries owned by a longer installed bundle ID).
+        //    2-segment IDs only exact-match (plus ByHost UUID) so vendor prefixes like `com.docker` cannot
+        //    claim 3-segment sibling products or root LaunchDaemons.
+        //    LaunchDaemons/LaunchAgents matched without Rule 1 binary ownership default to unselected (`false`).
         if let bid = bundleID {
+            let allowPrefix = Self.allowsPrefixMatching(forBundleID: bid)
+            let isLaunchEntry = (entry.category == .launchDaemons || entry.category == .launchAgents)
+
             if let label = entry.launchLabel?.lowercased(),
-               Self.isBoundaryPrefixMatch(candidate: label, prefix: bid),
+               Self.matchesBundleIdentifier(candidate: label, bundleID: bid, allowPrefix: allowPrefix),
                !Self.isClaimedByLongerInstalledBundleID(label, ownBundleID: bid, allInstalledBundleIDs: allInstalledBundleIDs) {
-                return "Launch label matches bundle ID"
+                return ("Launch label matches bundle ID", false)
             }
 
-            let stripped = InstalledAppInventory.stripContainerPrefixes(lowerStem)
-            if (Self.isBoundaryPrefixMatch(candidate: lowerStem, prefix: bid)
-                || Self.isBoundaryPrefixMatch(candidate: lowerFull, prefix: bid)),
-               !Self.isClaimedByLongerInstalledBundleID(stripped, ownBundleID: bid, allInstalledBundleIDs: allInstalledBundleIDs) {
-                return "Bundle ID match"
+            if entry.category != .groupContainers {
+                let stripped = InstalledAppInventory.stripContainerPrefixes(lowerStem)
+                if (Self.matchesBundleIdentifier(candidate: lowerStem, bundleID: bid, allowPrefix: allowPrefix)
+                    || Self.matchesBundleIdentifier(candidate: lowerFull, bundleID: bid, allowPrefix: allowPrefix)),
+                   !Self.isClaimedByLongerInstalledBundleID(stripped, ownBundleID: bid, allInstalledBundleIDs: allInstalledBundleIDs) {
+                    return ("Bundle ID match", !isLaunchEntry)
+                }
             }
 
-            // Group Containers: `<TeamID>.<bundleID>`, `group.<bundleID>`, `<TeamID>.group.<bundleID>`
+            // Group Containers: require verified `com.apple.security.application-groups` entitlement match
+            // or strict verified `<TeamID>.<bundleID>` prefix match (never wildcard/unconditional `group.*`),
+            // and NEVER claim a container declared by any other installed app (protects shared suites like Office
+            // as well as installed third-party `group.*` containers).
             if entry.category == .groupContainers {
+                guard !otherInstalledAppGroups.contains(lowerFull) else {
+                    return nil
+                }
                 let strippedGroup = InstalledAppInventory.stripContainerPrefixes(lowerFull)
-                if Self.matchesGroupContainer(entryName: lowerFull, bundleID: bid, teamID: teamID),
+                let claimedByOtherInstalled = allInstalledBundleIDs.contains { other in
+                    let lowerOther = other.lowercased()
+                    guard lowerOther != bid else { return false }
+                    return Self.isBoundaryPrefixMatch(candidate: strippedGroup, prefix: lowerOther)
+                        || Self.isBoundaryPrefixMatch(candidate: lowerFull, prefix: lowerOther)
+                }
+                if !claimedByOtherInstalled,
+                   Self.matchesGroupContainer(
+                    entryName: lowerFull,
+                    bundleID: bid,
+                    teamID: teamID,
+                    applicationGroups: applicationGroups,
+                    allowApple: allowApple
+                   ),
                    !Self.isClaimedByLongerInstalledBundleID(strippedGroup, ownBundleID: bid, allInstalledBundleIDs: allInstalledBundleIDs) {
-                    return "App Group match"
+                    return ("App Group match", true)
                 }
             }
 
             // Preferences/ByHost: `<bundleID>.<UUID>.plist`
-            if entry.category == .preferences && lowerFull.hasPrefix(bid + "."),
-               !Self.isClaimedByLongerInstalledBundleID(lowerStem, ownBundleID: bid, allInstalledBundleIDs: allInstalledBundleIDs) {
-                return "Preference match"
+            if entry.category == .preferences {
+                let noUUIDStem = InstalledAppInventory.stripUUIDSuffix(lowerStem)
+                let prefMatches = allowPrefix
+                    ? lowerFull.hasPrefix(bid + ".")
+                    : (lowerStem == bid || noUUIDStem == bid)
+                if prefMatches,
+                   !Self.isClaimedByLongerInstalledBundleID(lowerStem, ownBundleID: bid, allInstalledBundleIDs: allInstalledBundleIDs) {
+                    return ("Preference match", true)
+                }
             }
         }
 
-        // 3. Name matching (strictly bounded & length >= 4 to prevent false positives)
+        // 3. Name matching (strictly bounded, length >= 4, never matches LaunchAgents/Daemons, Group Containers,
+        //    system/TCC ignore names, reverse-DNS names, or entries belonging to installed/protected bundle IDs).
+        if entry.category == .launchAgents || entry.category == .launchDaemons || entry.category == .groupContainers {
+            return nil
+        }
+        let strippedLowerStem = InstalledAppInventory.stripContainerPrefixes(lowerStem)
+        let strippedLowerFull = InstalledAppInventory.stripContainerPrefixes(lowerFull)
+        let noUUIDLowerStem = InstalledAppInventory.stripUUIDSuffix(lowerStem)
+
+        if SafetyGuard.leftoverSafeIgnoreNames.contains(lowerStem)
+            || SafetyGuard.leftoverSafeIgnoreNames.contains(lowerFull)
+            || SafetyGuard.leftoverSafeIgnoreNames.contains(noUUIDLowerStem) {
+            return nil
+        }
+        if LeftoverScanner.looksLikeReverseDNSBundleID(strippedLowerStem)
+            || LeftoverScanner.looksLikeReverseDNSBundleID(strippedLowerFull) {
+            return nil
+        }
+        if safetyGuard.matchesProtectedBundleID(lowerStem)
+            || safetyGuard.matchesProtectedBundleID(lowerFull)
+            || safetyGuard.matchesProtectedBundleID(noUUIDLowerStem) {
+            return nil
+        }
+        if !allInstalledBundleIDs.isEmpty {
+            let ownLower = bundleID?.lowercased()
+            for otherID in allInstalledBundleIDs {
+                let lowerOther = otherID.lowercased()
+                if lowerOther == ownLower { continue }
+                if Self.isBoundaryPrefixMatch(candidate: strippedLowerStem, prefix: lowerOther)
+                    || Self.isBoundaryPrefixMatch(candidate: strippedLowerFull, prefix: lowerOther)
+                    || Self.isBoundaryPrefixMatch(candidate: lowerStem, prefix: lowerOther) {
+                    return nil
+                }
+            }
+        }
+
         for name in nameCandidates {
             if lowerStem == name || lowerFull == name {
-                return "App name match"
+                return ("App name match", true)
             }
             if entry.isInsideVendorFolder && Self.isBoundaryPrefixMatch(candidate: lowerStem, prefix: name) {
-                return "Vendor subfolder match"
+                return ("Vendor subfolder match", true)
             }
             if entry.category == .logs,
                (lowerFull.hasPrefix(name + "-") || lowerFull.hasPrefix(name + "_")) {
-                return "Log / crash report match"
+                return ("Log / crash report match", true)
             }
         }
 
@@ -522,9 +712,12 @@ public struct ServiceFileMatcher: Sendable {
         if app.localizedName != app.name {
             rawNames.append(app.localizedName)
         }
-        if let exec = app.executableName,
-           !genericExecutableNames.contains(exec.lowercased()) {
-            rawNames.append(exec)
+        if let exec = app.executableName {
+            let execTrimmed = exec.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if !genericExecutableNames.contains(execTrimmed),
+               isExecutableNameRelated(execTrimmed, toAppNames: [app.name, app.localizedName]) {
+                rawNames.append(exec)
+            }
         }
 
         var results: [String] = []
@@ -535,6 +728,8 @@ public struct ServiceFileMatcher: Sendable {
             guard trimmed.count >= 4 else { continue }
             guard !Self.genericStopWords.contains(trimmed) else { continue }
             guard !SafetyGuard.sharedVendorFolderNames.contains(trimmed) else { continue }
+            guard !SafetyGuard.leftoverSafeIgnoreNames.contains(trimmed) else { continue }
+            guard !LeftoverScanner.looksLikeReverseDNSBundleID(trimmed) else { continue }
             if !seen.contains(trimmed) {
                 seen.insert(trimmed)
                 results.append(trimmed)
@@ -543,12 +738,29 @@ public struct ServiceFileMatcher: Sendable {
             if compact != trimmed, compact.count >= 6,
                !Self.genericStopWords.contains(compact),
                !SafetyGuard.sharedVendorFolderNames.contains(compact),
+               !SafetyGuard.leftoverSafeIgnoreNames.contains(compact),
+               !LeftoverScanner.looksLikeReverseDNSBundleID(compact),
                !seen.contains(compact) {
                 seen.insert(compact)
                 results.append(compact)
             }
         }
         return results
+    }
+
+    /// True if `CFBundleExecutable` matches or extends the visible bundle name
+    /// (prevents unsigned or arbitrarily signed apps from spoofing unrelated executable names like `Chrome` or `MobileSync`).
+    private static func isExecutableNameRelated(_ lowerExec: String, toAppNames names: [String]) -> Bool {
+        let compactExec = InstalledAppInventory.compact(lowerExec)
+        guard compactExec.count >= 4 else { return false }
+        for name in names {
+            let compactName = InstalledAppInventory.compact(name)
+            guard compactName.count >= 4 else { continue }
+            if compactExec == compactName || compactExec.hasPrefix(compactName) {
+                return true
+            }
+        }
+        return false
     }
 
     public static func isBoundaryPrefixMatch(candidate: String, prefix: String) -> Bool {
@@ -559,27 +771,68 @@ public struct ServiceFileMatcher: Sendable {
         return nextChar == "." || nextChar == "-" || nextChar == "_" || nextChar == " "
     }
 
-    public static func matchesGroupContainer(entryName: String, bundleID: String, teamID: String?) -> Bool {
-        if isBoundaryPrefixMatch(candidate: entryName, prefix: "group." + bundleID) {
-            return true
-        }
-        if let teamID, !teamID.isEmpty {
-            if isBoundaryPrefixMatch(candidate: entryName, prefix: "\(teamID).\(bundleID)")
-                || isBoundaryPrefixMatch(candidate: entryName, prefix: "\(teamID).group.\(bundleID)") {
-                return true
+    public static func matchesGroupContainer(
+        entryName: String,
+        bundleID: String,
+        teamID: String?,
+        applicationGroups: [String] = [],
+        allowApple: Bool = false
+    ) -> Bool {
+        let lowerEntry = entryName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let lowerBID = bundleID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !lowerEntry.isEmpty, !lowerBID.isEmpty else { return false }
+
+        let strippedEntry = InstalledAppInventory.stripContainerPrefixes(lowerEntry)
+        if !allowApple {
+            if SafetyGuard.isAppleGroupContainerName(lowerEntry)
+                || strippedEntry == "com.apple" || strippedEntry.hasPrefix("com.apple.")
+                || lowerBID == "com.apple" || lowerBID.hasPrefix("com.apple.") {
+                return false
             }
         }
-        if let dotIdx = entryName.firstIndex(of: ".") {
-            let prefixToken = entryName[..<dotIdx]
-            let remainder = String(entryName[entryName.index(after: dotIdx)...])
-            if prefixToken.count == 10, prefixToken.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) }) {
-                if isBoundaryPrefixMatch(candidate: remainder, prefix: bundleID)
-                    || isBoundaryPrefixMatch(candidate: remainder, prefix: "group." + bundleID) {
-                    return true
+
+        let allowPrefix = allowsPrefixMatching(forBundleID: lowerBID)
+
+        // 1. Verified `com.apple.security.application-groups` entitlement match (signed under `anchor apple generic`).
+        let declaredGroups = Set(
+            applicationGroups
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { !$0.isEmpty }
+        )
+        if declaredGroups.contains(lowerEntry) {
+            var hasTeamPrefix = false
+            if let dotIdx = lowerEntry.firstIndex(of: ".") {
+                let prefixToken = lowerEntry[..<dotIdx]
+                if prefixToken.count == 10, prefixToken.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) }) {
+                    hasTeamPrefix = true
+                    // If the group container carries a 10-char TeamID prefix, require it to match the app's verified TeamID.
+                    if !allowApple {
+                        guard let teamID, !teamID.isEmpty, teamID.lowercased() == String(prefixToken) else {
+                            return false
+                        }
+                    }
                 }
             }
+            if !hasTeamPrefix {
+                // Non-TeamID `group.*`/`groups.*` containers must ALSO match the app's own bundle ID so an
+                // arbitrary Apple Development signer (`com.evil.spoof`) cannot claim unrelated third-party
+                // `group.*` containers via self-declared entitlements.
+                guard matchesBundleIdentifier(candidate: strippedEntry, bundleID: lowerBID, allowPrefix: allowPrefix) else {
+                    return false
+                }
+            }
+            return true
         }
-        return false
+
+        // 2. Strict verified `<TeamID>.<bundleID>` / `<TeamID>.group(s).<bundleID>` match when TeamID is verified.
+        //    Never unconditionally match `"group." + lowerBID` or wildcard `<any-10-char>.<bundleID>`.
+        guard let teamID, !teamID.isEmpty else {
+            return false
+        }
+        let lowerTeam = teamID.lowercased()
+        return matchesBundleIdentifier(candidate: lowerEntry, bundleID: "\(lowerTeam).\(lowerBID)", allowPrefix: allowPrefix)
+            || matchesBundleIdentifier(candidate: lowerEntry, bundleID: "\(lowerTeam).group.\(lowerBID)", allowPrefix: allowPrefix)
+            || matchesBundleIdentifier(candidate: lowerEntry, bundleID: "\(lowerTeam).groups.\(lowerBID)", allowPrefix: allowPrefix)
     }
 
     private static func categorizePath(_ path: String) -> ServiceFileCategory {

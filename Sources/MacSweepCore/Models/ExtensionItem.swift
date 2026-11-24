@@ -53,6 +53,8 @@ public struct ExtensionItem: Identifiable, Hashable, Sendable {
     public let requiresAdmin: Bool
     public let requiresReboot: Bool
     public var isChecked: Bool
+    /// Canonical POSIX parent directory captured at scan / discovery time for TOCTOU verification.
+    public let expectedCanonicalParent: String
 
     public init(
         name: String,
@@ -71,7 +73,8 @@ public struct ExtensionItem: Identifiable, Hashable, Sendable {
         canRemove: Bool = true,
         requiresAdmin: Bool = false,
         requiresReboot: Bool = false,
-        isChecked: Bool = false
+        isChecked: Bool = false,
+        expectedCanonicalParent: String? = nil
     ) {
         self.id = "\(category.rawValue):\(identifier):\(path.path)"
         self.name = name
@@ -91,5 +94,7 @@ public struct ExtensionItem: Identifiable, Hashable, Sendable {
         self.requiresAdmin = requiresAdmin
         self.requiresReboot = requiresReboot
         self.isChecked = isChecked
+        self.expectedCanonicalParent = expectedCanonicalParent
+            ?? PrivilegedExecutor.canonicalParentPath(forTargetURL: path)
     }
 }

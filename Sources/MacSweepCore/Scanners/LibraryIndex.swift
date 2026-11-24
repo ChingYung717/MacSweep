@@ -15,6 +15,8 @@ public struct LibraryEntry: Hashable, Sendable {
     /// Result of `SafetyGuard.validateForRemoval` computed ONCE at index time, so per-app matching
     /// stays a pure in-memory pass (previously ~450k filesystem-touching validations ≈ 26 s).
     public let isRemovable: Bool
+    /// Canonical POSIX parent directory captured at scan / index time for TOCTOU verification.
+    public let expectedCanonicalParent: String
 
     public init(
         url: URL,
@@ -25,7 +27,8 @@ public struct LibraryEntry: Hashable, Sendable {
         launchLabel: String? = nil,
         launchProgramPaths: [String] = [],
         requiresAdmin: Bool = false,
-        isRemovable: Bool = true
+        isRemovable: Bool = true,
+        expectedCanonicalParent: String? = nil
     ) {
         self.url = url
         self.name = url.lastPathComponent
@@ -39,6 +42,8 @@ public struct LibraryEntry: Hashable, Sendable {
         self.launchProgramPaths = launchProgramPaths
         self.requiresAdmin = requiresAdmin
         self.isRemovable = isRemovable
+        self.expectedCanonicalParent = expectedCanonicalParent
+            ?? PrivilegedExecutor.canonicalParentPath(forTargetURL: url)
     }
 
     public static func stripKnownSuffixes(from name: String) -> String {
@@ -84,10 +89,13 @@ public struct LibraryIndex: Sendable {
     /// Returns a new index with any entries matching `paths` (or nested under them) pruned.
     public func removing(paths: Set<String>) -> LibraryIndex {
         guard !paths.isEmpty else { return self }
+        let normRemoved = Set(paths.map {
+            URL(fileURLWithPath: $0).standardizedFileURL.path.precomposedStringWithCanonicalMapping.lowercased()
+        })
         let filtered = entries.filter { entry in
-            let p = entry.url.standardizedFileURL.path
-            if paths.contains(p) { return false }
-            for removed in paths where p.hasPrefix(removed + "/") {
+            let p = entry.url.standardizedFileURL.path.precomposedStringWithCanonicalMapping.lowercased()
+            if normRemoved.contains(p) { return false }
+            for removed in normRemoved where p.hasPrefix(removed + "/") {
                 return false
             }
             return true
@@ -151,6 +159,7 @@ public struct LibraryIndex: Sendable {
             ) else {
                 return
             }
+            let dirCanonicalParent = PrivilegedExecutor.canonicalParentPath(for: dirURL.standardizedFileURL.path)
 
             for child in children {
                 let childName = child.lastPathComponent
@@ -173,12 +182,14 @@ public struct LibraryIndex: Sendable {
 
                 // Expand shared vendor folders 1 level deeper instead of treating the entire vendor dir as one app.
                 if expandVendors && SafetyGuard.sharedVendorFolderNames.contains(lowerName) {
-                    let isDir = (try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+                    let isDir = !safetyGuard.isSymbolicLink(child)
+                        && ((try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false)
                     if isDir, let subItems = try? fm.contentsOfDirectory(
                         at: child,
                         includingPropertiesForKeys: nil,
                         options: [.skipsHiddenFiles]
                     ) {
+                        let vendorCanonicalParent = PrivilegedExecutor.canonicalParentPath(for: child.standardizedFileURL.path)
                         for sub in subItems {
                             let admin = safetyGuard.requiresAdmin(for: sub)
                             collected.append(LibraryEntry(
@@ -188,7 +199,8 @@ public struct LibraryIndex: Sendable {
                                 isInsideVendorFolder: true,
                                 parentVendorName: childName,
                                 requiresAdmin: admin,
-                                isRemovable: safetyGuard.validateForRemoval(sub).isAllowed
+                                isRemovable: safetyGuard.validateForRemoval(sub).isAllowed,
+                                expectedCanonicalParent: vendorCanonicalParent
                             ))
                         }
                     }
@@ -212,7 +224,8 @@ public struct LibraryIndex: Sendable {
                     launchLabel: launchLabel,
                     launchProgramPaths: launchPrograms,
                     requiresAdmin: admin,
-                    isRemovable: safetyGuard.validateForRemoval(child).isAllowed
+                    isRemovable: safetyGuard.validateForRemoval(child).isAllowed,
+                    expectedCanonicalParent: dirCanonicalParent
                 ))
             }
         }
@@ -232,7 +245,7 @@ public struct LibraryIndex: Sendable {
     }
 
     public static func parseLaunchPlistMetadata(at url: URL) -> (label: String?, programs: [String]) {
-        guard let data = try? Data(contentsOf: url),
+        guard let data = SafeFileReader.readBoundedRegularFile(at: url),
               let raw = try? PropertyListSerialization.propertyList(from: data, format: nil),
               let dict = raw as? [String: Any] else {
             return (nil, [])

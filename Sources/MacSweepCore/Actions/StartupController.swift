@@ -60,19 +60,30 @@ public struct StartupController: Sendable {
     }
 
     private static func validatedLabel(_ raw: String) throws -> String {
+        guard !raw.contains("\0"), !raw.contains("\n"), !raw.contains("\r") else {
+            throw StartupControlError.invalidLabel
+        }
         let label = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let lower = label.lowercased()
         guard !label.isEmpty,
-              !label.contains("\0"),
               lower != "com.apple",
               !lower.hasPrefix("com.apple."),
               !label.contains("/"),
-              !label.contains("\n"),
-              !label.contains("\r"),
               !label.contains(where: { $0.isWhitespace || $0.isASCII && ($0.asciiValue ?? 32) < 32 }) else {
             throw StartupControlError.invalidLabel
         }
         return label
+    }
+
+    private static func isValidDomain(_ domain: String) -> Bool {
+        if domain == "system" { return true }
+        guard domain.hasPrefix("gui/") else { return false }
+        let uidPart = domain.dropFirst("gui/".count)
+        return !uidPart.isEmpty && uidPart.allSatisfy { $0.isASCII && $0.isNumber }
+    }
+
+    private static func normalizedForCompare(_ path: String) -> String {
+        path.precomposedStringWithCanonicalMapping.lowercased()
     }
 
     private static func isSymlink(at path: String) -> Bool {
@@ -97,7 +108,8 @@ public struct StartupController: Sendable {
         enable: Bool,
         uid: uid_t = getuid(),
         launchctl: String = "/bin/launchctl",
-        allowedLaunchDirs: [URL]? = nil
+        allowedLaunchDirs: [URL]? = nil,
+        systemLaunchDaemonsURL: URL = URL(fileURLWithPath: "/Library/LaunchDaemons")
     ) throws -> (domain: String, shellCommand: String) {
         guard item.canToggle else { throw StartupControlError.notToggleable }
         let label = try validatedLabel(item.label)
@@ -105,17 +117,34 @@ public struct StartupController: Sendable {
         let plistPath = stdPlist.path
         guard stdPlist.isFileURL,
               !plistPath.contains("\0"),
+              !plistPath.contains("\n"),
+              !plistPath.contains("\r"),
               stdPlist.pathExtension.lowercased() == "plist",
               !isSymlink(at: plistPath) else {
             throw StartupControlError.invalidLabel
         }
         if let allowedLaunchDirs {
-            let allowedLower = Set(allowedLaunchDirs.map { $0.standardizedFileURL.path.lowercased() })
-            let parentLower = stdPlist.deletingLastPathComponent().path.lowercased()
-            let resolvedParentLower = stdPlist.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL.path.lowercased()
-            let allowedResolvedLower = Set(allowedLaunchDirs.map { $0.resolvingSymlinksInPath().standardizedFileURL.path.lowercased() })
-            guard allowedLower.contains(parentLower) || allowedResolvedLower.contains(resolvedParentLower) else {
+            let parentURL = stdPlist.deletingLastPathComponent()
+            let parentRawPath = parentURL.path
+            guard !isSymlink(at: parentRawPath) else {
                 throw StartupControlError.invalidLabel
+            }
+            let nonSymlinkAllowed = allowedLaunchDirs.filter { !isSymlink(at: $0.standardizedFileURL.path) }
+            let allowedRawLower = Set(nonSymlinkAllowed.map { normalizedForCompare($0.standardizedFileURL.path) })
+            let allowedCanonicalLower = Set(nonSymlinkAllowed.map {
+                normalizedForCompare(PrivilegedExecutor.canonicalParentPath(for: $0.standardizedFileURL.path))
+            })
+            let parentRawLower = normalizedForCompare(parentRawPath)
+            let parentCanonicalLower = normalizedForCompare(PrivilegedExecutor.canonicalParentPath(for: parentRawPath))
+            guard allowedRawLower.contains(parentRawLower) && allowedCanonicalLower.contains(parentCanonicalLower) else {
+                throw StartupControlError.invalidLabel
+            }
+            if item.scope == .systemDaemon {
+                let sysRaw = systemLaunchDaemonsURL.standardizedFileURL.path
+                let sysCanonical = normalizedForCompare(PrivilegedExecutor.canonicalParentPath(for: sysRaw))
+                guard !isSymlink(at: sysRaw), parentCanonicalLower == sysCanonical else {
+                    throw StartupControlError.invalidLabel
+                }
             }
         }
         let domain = domain(for: item.scope, uid: uid)
@@ -134,32 +163,49 @@ public struct StartupController: Sendable {
     }
 
     /// Builds a script that boots out every target and then VERIFIES it is no longer loaded.
-    /// For unreadable root plists (`labelFromPlist == nil`), resolves `:Label` via PlistBuddy while root
-    /// and validates the resolved label (rejecting `com.apple.*`, `/`, and whitespace/control characters).
-    /// Exits non-zero (and prints `still-loaded:<plist>` lines to stderr) if any service survived.
+    /// Independently re-validates every target's `domain`, `label`, and `plistURL` (fail-closed).
+    /// For unreadable root plists (`labelFromPlist == nil`), verifies `[ ! -L $qPlist ]` before
+    /// resolving `:Label` via `LC_ALL=C PlistBuddy` while root and validates the resolved label.
+    /// Exits non-zero and prints `still-loaded-idx:<idx>` (plus `still-loaded:<plist>`) if any service survived.
     public static func buildUnloadShellCommand(
         targets: [LaunchServiceTarget],
         launchctl: String = "/bin/launchctl"
     ) -> String {
         guard !targets.isEmpty else { return "" }
         let qL = ProcessRunner.posixQuote(launchctl)
-        var statements = ["fail=0"]
-        for t in targets {
-            let plistPath = t.plistURL.standardizedFileURL.path
+        var statements = ["LC_ALL=C", "export LC_ALL", "fail=0"]
+        for (idx, t) in targets.enumerated() {
+            let stdPlist = t.plistURL.standardizedFileURL
+            let plistPath = stdPlist.path
+            guard isValidDomain(t.domain),
+                  let safeLabel = try? validatedLabel(t.label),
+                  stdPlist.isFileURL,
+                  !plistPath.contains("\0"),
+                  !plistPath.contains("\n"),
+                  !plistPath.contains("\r") else {
+                statements.append("echo 'still-loaded-idx:\(idx)' >&2; fail=1")
+                continue
+            }
+
             let qPlist = ProcessRunner.posixQuote(plistPath)
             let qDomain = ProcessRunner.posixQuote(t.domain)
-            let qFallbackLabel = ProcessRunner.posixQuote(t.label)
+            let qFallbackLabel = ProcessRunner.posixQuote(safeLabel)
             let qMarker = ProcessRunner.posixQuote("still-loaded:\(plistPath)")
 
-            if t.labelFromPlist != nil {
-                let qTarget = ProcessRunner.posixQuote(t.serviceTarget)
+            if let rawPlistLabel = t.labelFromPlist, let safePlistLabel = try? validatedLabel(rawPlistLabel) {
+                let qTarget = ProcessRunner.posixQuote("\(t.domain)/\(safePlistLabel)")
+                statements.append("tgt=\(qTarget)")
+            } else if t.labelFromPlist != nil {
+                let qTarget = ProcessRunner.posixQuote("\(t.domain)/\(safeLabel)")
                 statements.append("tgt=\(qTarget)")
             } else {
                 // Dynamically read Label as root when non-root could not open a 0600 plist,
-                // then validate against com.apple.*, '/', and whitespace/control chars.
+                // verifying non-symlink regular file and guarding against com.apple.*, '/', and control chars.
                 statements.append(
-                    "lbl=$(/usr/libexec/PlistBuddy -c 'Print :Label' \(qPlist) 2>/dev/null | /usr/bin/tr -d '\\r\\n' || true); "
-                        + "lbl_lc=$(printf '%s' \"$lbl\" | /usr/bin/tr '[:upper:]' '[:lower:]'); "
+                    "if [ ! -L \(qPlist) ] && [ -f \(qPlist) ]; then "
+                        + "lbl=$(LC_ALL=C /usr/libexec/PlistBuddy -c 'Print :Label' \(qPlist) 2>/dev/null | /usr/bin/tr -d '\\r\\n' || true); "
+                        + "else lbl=''; fi; "
+                        + "lbl_lc=$(printf '%s' \"$lbl\" | LC_ALL=C /usr/bin/tr '[:upper:]' '[:lower:]'); "
                         + "case \"$lbl_lc\" in ''|'com.apple'|'com.apple.'*|*/*|*[[:space:]]*|*[[:cntrl:]]*) lbl=\(qFallbackLabel) ;; esac; "
                         + "tgt=\(qDomain)/\"$lbl\""
                 )
@@ -172,7 +218,12 @@ public struct StartupController: Sendable {
                 "n=0; while \(qL) print \"$tgt\" >/dev/null 2>&1 && [ $n -lt 10 ]; do "
                     + "/bin/sleep 0.2; \(qL) bootout \"$tgt\" >/dev/null 2>&1; n=$((n+1)); done"
             )
-            statements.append("if \(qL) print \"$tgt\" >/dev/null 2>&1; then echo \(qMarker) >&2; fail=1; fi")
+            statements.append(
+                "if \(qL) print \"$tgt\" >/dev/null 2>&1; then "
+                    + "echo 'still-loaded-idx:\(idx)' >&2; "
+                    + "echo \(qMarker) >&2; "
+                    + "fail=1; fi"
+            )
         }
         statements.append("exit $fail")
         return statements.joined(separator: "; ")
@@ -189,34 +240,53 @@ public struct StartupController: Sendable {
         ]
     }
 
-    /// Derives launchd targets ONLY from plists located directly inside `allowedLaunchDirs`
-    /// (defaults to `~/Library/LaunchAgents`, `/Library/LaunchAgents`, `/Library/LaunchDaemons`).
-    /// Deduplicates by plist path (NOT by `serviceTarget`) so duplicate-label plists across user &
-    /// system LaunchAgents are BOTH tracked and protected.
+    /// Derives launchd targets ONLY from plists located directly inside non-symlink `allowedLaunchDirs`
+    /// where BOTH raw AND canonical `realpath(3)` parent match an allowed directory (`&&`).
+    /// Derives `domain == "system"` strictly from canonical `realpath(3)` parent matching canonical
+    /// `systemLaunchDaemonsURL` (defaults to `/Library/LaunchDaemons`), never from `lastPathComponent`.
     public static func launchTargets(
         for urls: [URL],
         uid: uid_t = getuid(),
-        allowedLaunchDirs: [URL]? = nil
+        allowedLaunchDirs: [URL]? = nil,
+        systemLaunchDaemonsURL: URL = URL(fileURLWithPath: "/Library/LaunchDaemons")
     ) -> [LaunchServiceTarget] {
-        let dirs = allowedLaunchDirs ?? defaultLaunchDirectories()
-        let allowedLower = Set(dirs.map { $0.standardizedFileURL.path.lowercased() })
-        let allowedResolvedLower = Set(dirs.map { $0.resolvingSymlinksInPath().standardizedFileURL.path.lowercased() })
+        let dirs = (allowedLaunchDirs ?? defaultLaunchDirectories())
+            .filter { !isSymlink(at: $0.standardizedFileURL.path) }
+        let allowedRawLower = Set(dirs.map { normalizedForCompare($0.standardizedFileURL.path) })
+        let allowedCanonicalLower = Set(dirs.map {
+            normalizedForCompare(PrivilegedExecutor.canonicalParentPath(for: $0.standardizedFileURL.path))
+        })
+
+        let sysDaemonsRaw = systemLaunchDaemonsURL.standardizedFileURL.path
+        let canonicalSystemDaemonsLower: String? = isSymlink(at: sysDaemonsRaw)
+            ? nil
+            : normalizedForCompare(PrivilegedExecutor.canonicalParentPath(for: sysDaemonsRaw))
+
         var result: [LaunchServiceTarget] = []
         var seenPlistPaths = Set<String>()
 
         for url in urls {
             let std = url.standardizedFileURL
+            let plistPath = std.path
             guard std.isFileURL,
-                  !std.path.contains("\0"),
+                  !plistPath.contains("\0"),
+                  !plistPath.contains("\n"),
+                  !plistPath.contains("\r"),
                   std.pathExtension.lowercased() == "plist",
-                  !isSymlink(at: std.path) else { continue }
-            let parentPath = std.deletingLastPathComponent().path.lowercased()
-            let resolvedParent = std.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL.path.lowercased()
-            guard allowedLower.contains(parentPath) || allowedResolvedLower.contains(resolvedParent) else { continue }
-            guard seenPlistPaths.insert(std.path.lowercased()).inserted else { continue }
+                  !isSymlink(at: plistPath) else { continue }
+            let parentURL = std.deletingLastPathComponent()
+            let parentRawPath = parentURL.path
+            guard !isSymlink(at: parentRawPath) else { continue }
 
-            let parentName = std.deletingLastPathComponent().lastPathComponent.lowercased()
-            let domain = (parentName == "launchdaemons") ? "system" : "gui/\(uid)"
+            let parentRawLower = normalizedForCompare(parentRawPath)
+            let parentCanonicalLower = normalizedForCompare(PrivilegedExecutor.canonicalParentPath(for: parentRawPath))
+            guard allowedRawLower.contains(parentRawLower) && allowedCanonicalLower.contains(parentCanonicalLower) else {
+                continue
+            }
+            guard seenPlistPaths.insert(normalizedForCompare(plistPath)).inserted else { continue }
+
+            let isSystemDaemon = (canonicalSystemDaemonsLower != nil && parentCanonicalLower == canonicalSystemDaemonsLower)
+            let domain = isSystemDaemon ? "system" : "gui/\(uid)"
             let parsed = LibraryIndex.parseLaunchPlistMetadata(at: std)
             let rawLabel = parsed.label ?? std.deletingPathExtension().lastPathComponent
             guard let label = try? validatedLabel(rawLabel) else { continue }
@@ -243,6 +313,22 @@ public struct StartupController: Sendable {
             }
             if !path.isEmpty {
                 result.insert(path)
+            }
+        }
+        return result
+    }
+
+    /// Extracts `still-loaded-idx:<idx>` integer target indices from raw stderr or osascript error strings.
+    public static func parseStillLoadedIndices(from stderr: String) -> Set<Int> {
+        var result = Set<Int>()
+        for line in stderr.split(whereSeparator: \.isNewline) {
+            guard let range = line.range(of: "still-loaded-idx:") else { continue }
+            var token = String(line[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+            if let paren = token.range(of: #" \(\d+\)$"#, options: .regularExpression) {
+                token = String(token[..<paren.lowerBound])
+            }
+            if let idx = Int(token) {
+                result.insert(idx)
             }
         }
         return result
@@ -281,10 +367,12 @@ public struct StartupController: Sendable {
         let userTargets = targets.filter { !$0.needsAdmin }
 
         func record(_ batch: [LaunchServiceTarget], stderr: String, succeeded: Bool) {
-            let survivors = Self.parseStillLoadedPlists(from: stderr)
-            for t in batch {
+            let survivorPaths = Self.parseStillLoadedPlists(from: stderr)
+            let survivorIndices = Self.parseStillLoadedIndices(from: stderr)
+            let hasAnyMarker = !survivorPaths.isEmpty || !survivorIndices.isEmpty
+            for (idx, t) in batch.enumerated() {
                 let p = t.plistURL.standardizedFileURL.path
-                if survivors.contains(p) || (!succeeded && survivors.isEmpty) {
+                if survivorIndices.contains(idx) || survivorPaths.contains(p) || (!succeeded && !hasAnyMarker) {
                     stillLoaded.insert(p)
                 } else {
                     unloaded.insert(p)

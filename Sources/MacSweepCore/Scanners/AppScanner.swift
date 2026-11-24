@@ -1,7 +1,45 @@
 import AppKit
 import CoreServices
+import Darwin
 import Foundation
 import Security
+
+public struct CodeSigningIdentity: Sendable, Equatable {
+    public let teamIdentifier: String?
+    public let signingIdentifier: String
+    public let isAppleSigned: Bool
+
+    public init(teamIdentifier: String?, signingIdentifier: String, isAppleSigned: Bool) {
+        self.teamIdentifier = teamIdentifier
+        self.signingIdentifier = signingIdentifier
+        self.isAppleSigned = isAppleSigned
+    }
+
+    /// True if a running process carrying `self` cryptographically belongs to the same signing
+    /// identity as `appIdentity`.
+    public func matchesAppIdentity(_ appIdentity: CodeSigningIdentity) -> Bool {
+        if isAppleSigned != appIdentity.isAppleSigned {
+            return false
+        }
+        if isAppleSigned {
+            // Apple OS / Mac App Store apps must match sealed signing identifier too, so
+            // uninstalling Pages never terminates Keynote despite sharing the iWork TeamID.
+            guard !signingIdentifier.isEmpty,
+                  signingIdentifier.caseInsensitiveCompare(appIdentity.signingIdentifier) == .orderedSame else {
+                return false
+            }
+            if let appTeam = appIdentity.teamIdentifier, !appTeam.isEmpty {
+                return teamIdentifier?.caseInsensitiveCompare(appTeam) == .orderedSame
+            }
+            return true
+        }
+        guard let appTeam = appIdentity.teamIdentifier, !appTeam.isEmpty,
+              let procTeam = teamIdentifier, !procTeam.isEmpty else {
+            return false
+        }
+        return procTeam.caseInsensitiveCompare(appTeam) == .orderedSame
+    }
+}
 
 public struct RunningProcessMatch: Sendable, Equatable {
     public let bundleID: String
@@ -64,28 +102,46 @@ public struct AppScanner: Sendable {
         return ids
     }
 
-    /// Returns running processes matching any target bundle ID OR whose `bundleURL` lives inside
-    /// any target `.app` bundle (catches embedded MenuBar / Helper processes).
+    /// Returns running processes matching any target bundle ID OR whose `bundleURL` / `executableURL`
+    /// lives inside any target `.app` bundle (catches embedded MenuBar / Helper processes).
+    ///
+    /// When `bundleURLs` is non-empty, any match made solely by `bundleID` (outside `bundleURLs`) MUST
+    /// pass cryptographic `SecCodeCopyGuestWithAttributes` (`kSecGuestAttributePid`) signing-identity
+    /// verification against the uninstalling `.app` bundle(s).
     public static func runningProcesses(
         matchingBundleIDs bundleIDs: [String],
         bundleURLs: [URL]
     ) -> [RunningProcessMatch] {
-        let lowerIDs = Set(bundleIDs.map { $0.lowercased() }.filter { !$0.isEmpty && !$0.hasPrefix("unknown.") })
-        let appPaths = bundleURLs.map { $0.standardizedFileURL.path }
-        guard !lowerIDs.isEmpty || !appPaths.isEmpty else { return [] }
+        let lowerIDs = Set(bundleIDs.map { $0.lowercased() }.filter {
+            !$0.isEmpty && !$0.hasPrefix("unknown.") && $0 != "com.apple"
+        })
+        guard !lowerIDs.isEmpty || !bundleURLs.isEmpty else { return [] }
+
+        let cachedAppIdentities: [CodeSigningIdentity]? = bundleURLs.isEmpty
+            ? nil
+            : bundleURLs.compactMap { extractAppSigningIdentity(at: $0) }
 
         var matches: [RunningProcessMatch] = []
         var seenPIDs = Set<pid_t>()
 
         for proc in NSWorkspace.shared.runningApplications where !proc.isTerminated {
             let bid = proc.bundleIdentifier ?? ""
-            let procPath = proc.bundleURL?.standardizedFileURL.path
-            let matchedByID = !bid.isEmpty && lowerIDs.contains(bid.lowercased())
-            let matchedByPath = procPath.map { p in
-                appPaths.contains { base in p == base || p.hasPrefix(base + "/") }
-            } ?? false
+            let matched: Bool
+            if bundleURLs.isEmpty {
+                matched = !bid.isEmpty && lowerIDs.contains(bid.lowercased())
+            } else {
+                matched = isProcessAuthorizedForAppMatch(
+                    pid: proc.processIdentifier,
+                    processBundleID: proc.bundleIdentifier,
+                    processBundleURL: proc.bundleURL,
+                    processExecutableURL: proc.executableURL,
+                    targetBundleIDs: lowerIDs,
+                    targetAppURLs: bundleURLs,
+                    cachedAppIdentities: cachedAppIdentities
+                )
+            }
 
-            if (matchedByID || matchedByPath), seenPIDs.insert(proc.processIdentifier).inserted {
+            if matched, seenPIDs.insert(proc.processIdentifier).inserted {
                 matches.append(RunningProcessMatch(
                     bundleID: bid,
                     name: proc.localizedName ?? bid,
@@ -94,6 +150,77 @@ public struct AppScanner: Sendable {
             }
         }
         return matches
+    }
+
+    /// True if `url` itself is a symbolic link (`lstat` without following links).
+    private static func isSymbolicLink(at url: URL) -> Bool {
+        var st = stat()
+        guard lstat(url.standardizedFileURL.path, &st) == 0 else { return false }
+        return (st.st_mode & S_IFMT) == S_IFLNK
+    }
+
+    /// True if `processURL` equals or resides inside any non-symlink URL in `targetAppURLs`
+    /// (standardized, symlink-resolved, and POSIX `realpath(3)` checked case- and Unicode-normalization-insensitively).
+    /// Symlink `.app` entries in `targetAppURLs` are always skipped so removing a symlink never terminates its target.
+    public static func isProcessURL(_ processURL: URL?, insideAnyOf targetAppURLs: [URL]) -> Bool {
+        guard let processURL, !targetAppURLs.isEmpty else { return false }
+        func pathVariants(_ url: URL) -> [String] {
+            let std = url.standardizedFileURL.path
+            let res = url.resolvingSymlinksInPath().standardizedFileURL.path
+            let real = SafetyGuard.posixRealpath(std)
+            return Array(Set([std, res, real].compactMap {
+                $0?.precomposedStringWithCanonicalMapping.lowercased()
+            }))
+        }
+        let procVariants = pathVariants(processURL)
+        for appURL in targetAppURLs {
+            guard !isSymbolicLink(at: appURL) else { continue }
+            let baseVariants = pathVariants(appURL)
+            for p in procVariants {
+                for base in baseVariants {
+                    if p == base || p.hasPrefix(base + "/") {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
+    }
+
+    /// Authorizes whether a running PID belongs to the uninstalling `.app` bundle(s):
+    /// 1. Always authorizes if the process's `bundleURL` or `executableURL` resides inside `targetAppURLs`.
+    /// 2. Otherwise, if `processBundleID` is in `targetBundleIDs`, requires BOTH the uninstalling `.app`
+    ///    and the live running PID (via `SecCodeCopyGuestWithAttributes` + `kSecGuestAttributePid`) to carry
+    ///    valid `anchor apple generic` signatures whose verified `CodeSigningIdentity` matches.
+    public static func isProcessAuthorizedForAppMatch(
+        pid: pid_t,
+        processBundleID: String?,
+        processBundleURL: URL?,
+        processExecutableURL: URL?,
+        targetBundleIDs: Set<String>,
+        targetAppURLs: [URL],
+        cachedAppIdentities: [CodeSigningIdentity]? = nil,
+        processIdentityOverride: CodeSigningIdentity? = nil
+    ) -> Bool {
+        guard pid > 0, pid != getpid() else { return false }
+        if isProcessURL(processBundleURL, insideAnyOf: targetAppURLs)
+            || isProcessURL(processExecutableURL, insideAnyOf: targetAppURLs) {
+            return true
+        }
+        guard !targetAppURLs.isEmpty,
+              let procBID = processBundleID?.lowercased(),
+              !procBID.isEmpty,
+              targetBundleIDs.contains(procBID) else {
+            return false
+        }
+        let appIdentities = cachedAppIdentities ?? targetAppURLs.compactMap { extractAppSigningIdentity(at: $0) }
+        guard !appIdentities.isEmpty else {
+            return false
+        }
+        guard let procIdentity = processIdentityOverride ?? extractProcessSigningIdentity(pid: pid) else {
+            return false
+        }
+        return appIdentities.contains { procIdentity.matchesAppIdentity($0) }
     }
 
     public func scanApplications(runningIDs: Set<String>? = nil) -> [AppItem] {
@@ -192,7 +319,28 @@ public struct AppScanner: Sendable {
         let version = (info["CFBundleShortVersionString"] as? String)
             ?? (info["CFBundleVersion"] as? String)
             ?? ""
-        let executableName = info["CFBundleExecutable"] as? String
+        let rawExecutable = (info["CFBundleExecutable"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let executableName: String? = {
+            guard let exec = rawExecutable,
+                  !exec.isEmpty,
+                  exec != ".",
+                  exec != "..",
+                  !exec.contains("/"),
+                  !exec.contains("\0") else {
+                return nil
+            }
+            let macOSDir = appURL.appendingPathComponent("Contents/MacOS")
+            var dirStat = stat()
+            guard lstat(macOSDir.path, &dirStat) == 0, (dirStat.st_mode & S_IFMT) == S_IFDIR else {
+                return nil
+            }
+            let execURL = macOSDir.appendingPathComponent(exec)
+            var execStat = stat()
+            guard lstat(execURL.path, &execStat) == 0, (execStat.st_mode & S_IFMT) == S_IFREG else {
+                return nil
+            }
+            return exec
+        }()
 
         let displayName = (localizedInfo["CFBundleDisplayName"] as? String)
             ?? (localizedInfo["CFBundleName"] as? String)
@@ -203,7 +351,10 @@ public struct AppScanner: Sendable {
         let localizedViaFS = Self.strippingAppExtension(fm.displayName(atPath: appURL.path))
         let finalLocalizedName = !localizedViaFS.isEmpty ? localizedViaFS : displayName
 
-        let teamID = Self.extractTeamIdentifier(at: appURL)
+        let signing = Self.extractSigningMetadata(at: appURL)
+        let teamID = signing.identity?.teamIdentifier
+        let applicationGroups = signing.applicationGroups
+        let expectedCanonicalParent = PrivilegedExecutor.canonicalParentPath(forTargetURL: appURL)
         let resVals = try? appURL.resourceValues(forKeys: [.contentModificationDateKey, .contentAccessDateKey])
         let spotlightLastUsed = Self.spotlightLastUsedDate(for: appURL)
         let lastUsed = spotlightLastUsed ?? resVals?.contentAccessDate
@@ -215,9 +366,23 @@ public struct AppScanner: Sendable {
             && Self.hasValidAppleSignature(at: appURL, expectedBundleID: bundleID)
         let isUserProtected = safetyGuard.isUserProtected(bundleID: bundleID, url: appURL)
         let requiresAdmin = safetyGuard.requiresAdmin(for: appURL)
-        let stdAppPath = appURL.standardizedFileURL.path
-        let isRunning = activeRunning.contains(bundleID.lowercased())
-            || activePaths.contains { $0 == stdAppPath || $0.hasPrefix(stdAppPath + "/") }
+        let isSymlinkBundle = Self.isSymbolicLink(at: appURL)
+        let stdAppPath = appURL.standardizedFileURL.path.precomposedStringWithCanonicalMapping.lowercased()
+        let lowerBID = bundleID.lowercased()
+        let matchedByPath = !isSymlinkBundle
+            && activePaths.contains { $0 == stdAppPath || $0.hasPrefix(stdAppPath + "/") }
+        let canMatchRunningByID = !isSymlinkBundle
+            && (isAppleAppStoreApp || (teamID != nil && !lowerBID.hasPrefix("com.apple.") && lowerBID != "com.apple"))
+            && !lowerBID.hasPrefix("unknown.")
+            && Self.isInStandardApplicationsRoot(appURL)
+        let isRunning: Bool
+        if matchedByPath {
+            isRunning = true
+        } else if canMatchRunningByID && activeRunning.contains(lowerBID) {
+            isRunning = !Self.runningProcesses(matchingBundleIDs: [bundleID], bundleURLs: [appURL]).isEmpty
+        } else {
+            isRunning = false
+        }
 
         return AppItem(
             url: appURL,
@@ -227,6 +392,8 @@ public struct AppScanner: Sendable {
             version: version,
             executableName: executableName,
             teamIdentifier: teamID,
+            applicationGroups: applicationGroups,
+            expectedCanonicalParent: expectedCanonicalParent,
             lastUsedDate: lastUsed,
             modifiedDate: modified,
             bundleSize: nil,
@@ -242,8 +409,59 @@ public struct AppScanner: Sendable {
         )
     }
 
+    /// True when `appURL` resides inside a standard macOS applications root (`/Applications`,
+    /// `~/Applications`, or `/System/Applications`), as opposed to an arbitrary dropped bundle.
+    public static func isInStandardApplicationsRoot(
+        _ appURL: URL,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> Bool {
+        let roots = [
+            URL(fileURLWithPath: "/Applications"),
+            homeDirectory.appendingPathComponent("Applications"),
+            URL(fileURLWithPath: "/System/Applications"),
+        ]
+        let normApp = appURL.standardizedFileURL.path.precomposedStringWithCanonicalMapping.lowercased()
+        let normRes = appURL.resolvingSymlinksInPath().standardizedFileURL.path.precomposedStringWithCanonicalMapping.lowercased()
+        for root in roots {
+            let normRoot = root.standardizedFileURL.path.precomposedStringWithCanonicalMapping.lowercased()
+            let normRootRes = root.resolvingSymlinksInPath().standardizedFileURL.path.precomposedStringWithCanonicalMapping.lowercased()
+            if (normApp.hasPrefix(normRoot + "/") && normRes.hasPrefix(normRootRes + "/")) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Returns `app.bundleID` only when it is safe to match/terminate running processes by bundle ID.
+    /// Returns `nil` (forcing strict `bundleURL`-only process matching) when the app shares a bundle ID
+    /// with another installed app, resides outside standard application roots (e.g. dropped bundle),
+    /// carries an unmatchable bundle ID, or claims `com.apple.*` without a valid Apple signature.
+    public static func safeProcessMatchBundleID(
+        for app: AppItem,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> String? {
+        guard !app.sharesBundleIDWithOtherApp,
+              !isSymbolicLink(at: app.url),
+              isInStandardApplicationsRoot(app.url, homeDirectory: homeDirectory) else {
+            return nil
+        }
+        let lower = app.bundleID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !lower.isEmpty,
+              !lower.hasPrefix("unknown."),
+              lower != "com.apple",
+              ServiceFileMatcher.isMatchableBundleID(lower, allowApple: app.isAppleAppStoreApp) else {
+            return nil
+        }
+        if lower.hasPrefix("com.apple.") && !app.isAppleAppStoreApp {
+            return nil
+        }
+        return app.bundleID
+    }
+
     private static func runningAppBundlePaths() -> [String] {
-        NSWorkspace.shared.runningApplications.compactMap { $0.bundleURL?.standardizedFileURL.path }
+        NSWorkspace.shared.runningApplications.compactMap {
+            $0.bundleURL?.standardizedFileURL.path.precomposedStringWithCanonicalMapping.lowercased()
+        }
     }
 
     private static func spotlightLastUsedDate(for url: URL) -> Date? {
@@ -256,25 +474,29 @@ public struct AppScanner: Sendable {
         return value as? Date
     }
 
+    private static let appleGenericRequirementString = "anchor apple generic"
+    private static let appleOfficialRequirementString = "anchor apple or (anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.9])"
+
+    private static func makeRequirement(_ text: String) -> SecRequirement? {
+        var req: SecRequirement?
+        guard SecRequirementCreateWithString(text as CFString, SecCSFlags(), &req) == errSecSuccess else {
+            return nil
+        }
+        return req
+    }
+
     /// Verifies that an `.app` bundle carries a valid Apple OS or Mac App Store code signature
     /// whose cryptographically sealed `kSecCodeInfoIdentifier` matches `expectedBundleID`.
     /// Prevents unsigned/spoofed `.app` bundles from bypassing `com.apple.` filtering via `Info.plist`.
     public static func hasValidAppleSignature(at appURL: URL, expectedBundleID: String) -> Bool {
+        guard !isSymbolicLink(at: appURL) else { return false }
         let lowerExpected = expectedBundleID.lowercased()
         guard lowerExpected.hasPrefix("com.apple.") else { return false }
 
         var staticCode: SecStaticCode?
         guard SecStaticCodeCreateWithPath(appURL as CFURL, SecCSFlags(), &staticCode) == errSecSuccess,
-              let code = staticCode else {
-            return false
-        }
-
-        // Matches Apple OS-signed apps (`anchor apple`) AND Apple Mac App Store apps
-        // (Mac App Store signing cert OID 1.2.840.113635.100.6.1.9).
-        let reqString = "anchor apple or (anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.9])" as CFString
-        var requirement: SecRequirement?
-        guard SecRequirementCreateWithString(reqString, SecCSFlags(), &requirement) == errSecSuccess,
-              let req = requirement else {
+              let code = staticCode,
+              let req = makeRequirement(appleOfficialRequirementString) else {
             return false
         }
 
@@ -293,27 +515,123 @@ public struct AppScanner: Sendable {
         return signedID.lowercased() == lowerExpected
     }
 
-    /// Reads the verified code-signing Team Identifier via Security framework (no subprocess overhead).
-    /// Requires a cryptographically valid code signature before trusting TeamIdentifier.
-    public static func extractTeamIdentifier(at appURL: URL) -> String? {
+    /// Extracts cryptographically verified signing identity and `com.apple.security.application-groups`
+    /// entitlements from an `.app` bundle passing `anchor apple generic` (rejects unsigned, ad-hoc, and
+    /// arbitrary self-signed certificates).
+    public static func extractSigningMetadata(
+        at appURL: URL
+    ) -> (identity: CodeSigningIdentity?, applicationGroups: [String]) {
+        guard !isSymbolicLink(at: appURL) else {
+            return (nil, [])
+        }
         var staticCode: SecStaticCode?
         guard SecStaticCodeCreateWithPath(appURL as CFURL, SecCSFlags(), &staticCode) == errSecSuccess,
-              let code = staticCode else {
-            return nil
+              let code = staticCode,
+              let genericReq = makeRequirement(appleGenericRequirementString) else {
+            return (nil, [])
         }
         let checkFlags = SecCSFlags(rawValue: kSecCSDoNotValidateResources)
-        guard SecStaticCodeCheckValidity(code, checkFlags, nil) == errSecSuccess else {
-            return nil
+        guard SecStaticCodeCheckValidity(code, checkFlags, genericReq) == errSecSuccess else {
+            return (nil, [])
         }
+        let isAppleSigned: Bool = {
+            guard let appleReq = makeRequirement(appleOfficialRequirementString) else { return false }
+            return SecStaticCodeCheckValidity(code, checkFlags, appleReq) == errSecSuccess
+        }()
+
         var infoRef: CFDictionary?
         let flags = SecCSFlags(rawValue: kSecCSSigningInformation)
         guard SecCodeCopySigningInformation(code, flags, &infoRef) == errSecSuccess,
-              let dict = infoRef as? [String: Any],
-              let team = dict[kSecCodeInfoTeamIdentifier as String] as? String,
-              !team.isEmpty else {
+              let dict = infoRef as? [String: Any] else {
+            return (nil, [])
+        }
+        let rawTeam = (dict[kSecCodeInfoTeamIdentifier as String] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let team = (rawTeam?.isEmpty == false) ? rawTeam : nil
+        let signedID = (dict[kSecCodeInfoIdentifier as String] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        var groups: [String] = []
+        if let entitlements = dict[kSecCodeInfoEntitlementsDict as String] as? [String: Any] {
+            var seen = Set<String>()
+            for key in ["com.apple.security.application-groups", "com.apple.security.restricted-application-groups"] {
+                if let entries = entitlements[key] as? [String] {
+                    for entry in entries {
+                        let trimmed = entry.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let lower = trimmed.lowercased()
+                        if !lower.isEmpty, seen.insert(lower).inserted {
+                            groups.append(trimmed)
+                        }
+                    }
+                }
+            }
+        }
+
+        let identity = CodeSigningIdentity(
+            teamIdentifier: team,
+            signingIdentifier: signedID,
+            isAppleSigned: isAppleSigned
+        )
+        return (identity, groups)
+    }
+
+    /// Reads the verified code-signing Team Identifier via Security framework (no subprocess overhead).
+    /// Requires a cryptographically valid code signature satisfying `anchor apple generic`.
+    public static func extractTeamIdentifier(at appURL: URL) -> String? {
+        extractSigningMetadata(at: appURL).identity?.teamIdentifier
+    }
+
+    /// Reads verified `com.apple.security.application-groups` entitlements from an `.app` passing
+    /// `anchor apple generic`.
+    public static func extractApplicationGroups(at appURL: URL) -> [String] {
+        extractSigningMetadata(at: appURL).applicationGroups
+    }
+
+    /// Reads the verified `CodeSigningIdentity` of an `.app` bundle passing `anchor apple generic`.
+    public static func extractAppSigningIdentity(at appURL: URL) -> CodeSigningIdentity? {
+        extractSigningMetadata(at: appURL).identity
+    }
+
+    /// Reads the verified `CodeSigningIdentity` of a live running PID via
+    /// `SecCodeCopyGuestWithAttributes` (`kSecGuestAttributePid`) requiring `anchor apple generic`.
+    public static func extractProcessSigningIdentity(pid: pid_t) -> CodeSigningIdentity? {
+        guard pid > 0, let genericReq = makeRequirement(appleGenericRequirementString) else {
             return nil
         }
-        return team
+        let attrs = [kSecGuestAttributePid as String: NSNumber(value: pid)] as CFDictionary
+        var guestCode: SecCode?
+        guard SecCodeCopyGuestWithAttributes(nil, attrs, SecCSFlags(), &guestCode) == errSecSuccess,
+              let code = guestCode else {
+            return nil
+        }
+        guard SecCodeCheckValidity(code, SecCSFlags(), genericReq) == errSecSuccess else {
+            return nil
+        }
+        let isAppleSigned: Bool = {
+            guard let appleReq = makeRequirement(appleOfficialRequirementString) else { return false }
+            return SecCodeCheckValidity(code, SecCSFlags(), appleReq) == errSecSuccess
+        }()
+
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, SecCSFlags(), &staticCode) == errSecSuccess,
+              let sCode = staticCode else {
+            return nil
+        }
+        var infoRef: CFDictionary?
+        guard SecCodeCopySigningInformation(sCode, SecCSFlags(rawValue: kSecCSSigningInformation), &infoRef) == errSecSuccess,
+              let dict = infoRef as? [String: Any] else {
+            return nil
+        }
+        let rawTeam = (dict[kSecCodeInfoTeamIdentifier as String] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let team = (rawTeam?.isEmpty == false) ? rawTeam : nil
+        let signedID = (dict[kSecCodeInfoIdentifier as String] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return CodeSigningIdentity(
+            teamIdentifier: team,
+            signingIdentifier: signedID,
+            isAppleSigned: isAppleSigned
+        )
     }
 
     /// Collects bundle IDs and bundle paths of all apps across standard roots INCLUDING
@@ -361,5 +679,35 @@ public struct AppScanner: Sendable {
         }
         for root in roots { scan(root, depth: 0) }
         return (ids, pathsByID)
+    }
+
+    /// Extracts verified `application-groups` owners for non-`/System/` apps present in
+    /// `bundlePathsByID` that were not already inspected in `excludingNormalizedPaths`
+    /// (for example `/Applications/Utilities` when Utilities scanning is disabled).
+    public static func supplementalApplicationGroupOwners(
+        from bundlePathsByID: [String: Set<String>],
+        excludingNormalizedPaths: Set<String>
+    ) -> [String: Set<String>] {
+        var owners: [String: Set<String>] = [:]
+        var visited = excludingNormalizedPaths
+        for paths in bundlePathsByID.values {
+            for rawPath in paths {
+                let normPath = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+                    .precomposedStringWithCanonicalMapping.lowercased()
+                guard !normPath.hasPrefix("/system/"),
+                      visited.insert(normPath).inserted else {
+                    continue
+                }
+                let url = URL(fileURLWithPath: rawPath)
+                let groups = extractApplicationGroups(at: url)
+                for group in groups {
+                    let lower = group.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                    if !lower.isEmpty {
+                        owners[lower, default: []].insert(normPath)
+                    }
+                }
+            }
+        }
+        return owners
     }
 }

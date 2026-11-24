@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public struct ExtensionScanResult: Sendable {
@@ -31,14 +32,41 @@ public enum ExtensionControlError: Error, LocalizedError, Sendable {
 }
 
 public enum ExtensionController {
+    /// Dedicated validation for `/usr/bin/pluginkit` extension identifiers.
+    /// Rejects `com.apple` / `com.apple.*`, Apple group namespaces, synthetic `unknown.*`,
+    /// leading `-` (option injection), whitespace, slashes, control/NUL chars, and single-segment IDs,
+    /// while permitting legitimate third-party `group.*` and 2-segment vendor extension IDs.
+    public static func isValidPluginKitIdentifier(_ identifier: String) -> Bool {
+        guard !identifier.isEmpty,
+              !identifier.hasPrefix("-"),
+              !identifier.contains("\0"),
+              !identifier.contains("/"),
+              !identifier.contains(where: { $0.isWhitespace || $0.isNewline || ($0.isASCII && ($0.asciiValue ?? 32) < 32) }) else {
+            return false
+        }
+        let lower = identifier.lowercased()
+        guard lower != "com.apple",
+              !lower.hasPrefix("com.apple."),
+              !lower.hasPrefix("unknown.") else {
+            return false
+        }
+        let parts = lower.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count >= 2, parts.allSatisfy({ !$0.isEmpty }) else {
+            return false
+        }
+        if SafetyGuard.isAppleGroupContainerName(lower) {
+            return false
+        }
+        return true
+    }
+
     /// Toggles a macOS `.appex` (Safari / App Extension) using `/usr/bin/pluginkit`.
     public static func setPluginEnabled(_ enabled: Bool, identifier: String) throws {
-        let trimmed = identifier.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !trimmed.lowercased().hasPrefix("com.apple.") else {
+        guard isValidPluginKitIdentifier(identifier) else {
             throw ExtensionControlError.notToggleable
         }
         let mode = enabled ? "use" : "ignore"
-        let res = ProcessRunner.run(executable: "/usr/bin/pluginkit", arguments: ["-e", mode, "-i", trimmed])
+        let res = ProcessRunner.run(executable: "/usr/bin/pluginkit", arguments: ["-e", mode, "-i", identifier])
         if !res.succeeded {
             throw ExtensionControlError.failed(res.stderr.isEmpty ? "pluginkit failed" : res.stderr)
         }
@@ -168,6 +196,7 @@ public struct ExtensionScanner: Sendable {
         browserBundleID: String,
         computeSize: Bool = true
     ) -> [ExtensionItem] {
+        guard !safetyGuard.isSymbolicLink(userDataURL) else { return [] }
         let fm = FileManager.default
         let resolvedUserData = userDataURL.resolvingSymlinksInPath().standardizedFileURL.path
         guard let children = try? fm.contentsOfDirectory(
@@ -180,10 +209,12 @@ public struct ExtensionScanner: Sendable {
 
         var results: [ExtensionItem] = []
         for profileDir in children {
+            guard !safetyGuard.isSymbolicLink(profileDir) else { continue }
             let profileVals = try? profileDir.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
             guard profileVals?.isDirectory == true, profileVals?.isSymbolicLink != true else { continue }
 
             let extRoot = profileDir.appendingPathComponent("Extensions")
+            guard !safetyGuard.isSymbolicLink(extRoot) else { continue }
             let extRootVals = try? extRoot.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
             guard extRootVals?.isDirectory == true, extRootVals?.isSymbolicLink != true,
                   let extDirs = try? fm.contentsOfDirectory(
@@ -195,12 +226,15 @@ public struct ExtensionScanner: Sendable {
             }
 
             let profileName = profileDir.lastPathComponent
+            let extRootCanonical = PrivilegedExecutor.canonicalParentPath(for: extRoot.standardizedFileURL.path)
             for extDir in extDirs {
+                guard !safetyGuard.isSymbolicLink(extDir) else { continue }
                 let extVals = try? extDir.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
                 guard extVals?.isDirectory == true, extVals?.isSymbolicLink != true else { continue }
                 let resolvedExt = extDir.resolvingSymlinksInPath().standardizedFileURL.path
                 guard resolvedExt.hasPrefix(resolvedUserData + "/"),
-                      safetyGuard.validateForRemoval(extDir).isAllowed else {
+                      safetyGuard.validateForRemoval(extDir).isAllowed,
+                      !safetyGuard.requiresAdmin(for: extDir) else {
                     continue
                 }
                 let extID = extDir.lastPathComponent
@@ -211,7 +245,8 @@ public struct ExtensionScanner: Sendable {
                     profileName: profileName,
                     category: category,
                     browserBundleID: browserBundleID,
-                    computeSize: computeSize
+                    computeSize: computeSize,
+                    expectedCanonicalParent: extRootCanonical
                 ) else {
                     continue
                 }
@@ -227,7 +262,8 @@ public struct ExtensionScanner: Sendable {
         profileName: String,
         category: ExtensionCategory,
         browserBundleID: String,
-        computeSize: Bool = true
+        computeSize: Bool = true,
+        expectedCanonicalParent: String? = nil
     ) -> ExtensionItem? {
         let fm = FileManager.default
         guard let versionDirs = try? fm.contentsOfDirectory(
@@ -244,7 +280,7 @@ public struct ExtensionScanner: Sendable {
 
         guard let latestDir = sortedVersions.first else { return nil }
         let manifestURL = latestDir.appendingPathComponent("manifest.json")
-        guard let data = try? Data(contentsOf: manifestURL),
+        guard let data = SafeFileReader.readBoundedRegularFile(at: manifestURL),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
@@ -274,7 +310,8 @@ public struct ExtensionScanner: Sendable {
             canToggle: false,
             canRemove: true,
             requiresAdmin: false,
-            requiresReboot: false
+            requiresReboot: false,
+            expectedCanonicalParent: expectedCanonicalParent
         )
     }
 
@@ -304,7 +341,7 @@ public struct ExtensionScanner: Sendable {
 
         for locale in candidates {
             let msgURL = localesDir.appendingPathComponent(locale).appendingPathComponent("messages.json")
-            guard let data = try? Data(contentsOf: msgURL),
+            guard let data = SafeFileReader.readBoundedRegularFile(at: msgURL),
                   let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 continue
             }
@@ -324,28 +361,35 @@ public struct ExtensionScanner: Sendable {
     // MARK: - Firefox Scanner (profiles.ini + Profiles/ fallback)
 
     public func scanFirefoxBase(at firefoxBaseURL: URL, computeSize: Bool = true) -> [ExtensionItem] {
+        guard !safetyGuard.isSymbolicLink(firefoxBaseURL) else { return [] }
         let fm = FileManager.default
         var profileDirs: [URL] = []
         var seenPaths = Set<String>()
 
         let iniURL = firefoxBaseURL.appendingPathComponent("profiles.ini")
-        if let iniText = try? String(contentsOf: iniURL, encoding: .utf8) {
-            for dir in Self.parseFirefoxProfilesINI(iniText, firefoxBaseURL: firefoxBaseURL) {
+        if let iniText = SafeFileReader.readBoundedUTF8String(at: iniURL) {
+            for dir in Self.parseFirefoxProfilesINI(
+                iniText,
+                firefoxBaseURL: firefoxBaseURL,
+                allowedAbsoluteRoot: homeDirectory
+            ) {
                 let p = dir.standardizedFileURL.path
-                if fm.fileExists(atPath: p), seenPaths.insert(p).inserted {
+                if fm.fileExists(atPath: p), !safetyGuard.isSymbolicLink(dir), seenPaths.insert(p).inserted {
                     profileDirs.append(dir)
                 }
             }
         }
 
-        // Also include any folders inside `Profiles/` not listed in `profiles.ini`
+        // Also include any non-symlink folders inside non-symlink `Profiles/` not listed in `profiles.ini`
         let profilesRoot = firefoxBaseURL.appendingPathComponent("Profiles")
-        if let dirs = try? fm.contentsOfDirectory(
+        if !safetyGuard.isSymbolicLink(profilesRoot),
+           let dirs = try? fm.contentsOfDirectory(
             at: profilesRoot,
-            includingPropertiesForKeys: [.isDirectoryKey],
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
             options: [.skipsHiddenFiles]
-        ) {
+           ) {
             for dir in dirs {
+                guard !safetyGuard.isSymbolicLink(dir) else { continue }
                 let p = dir.standardizedFileURL.path
                 if seenPaths.insert(p).inserted {
                     profileDirs.append(dir)
@@ -355,10 +399,17 @@ public struct ExtensionScanner: Sendable {
 
         var results: [ExtensionItem] = []
         for profile in profileDirs {
-            let profVals = try? profile.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-            guard profVals?.isDirectory == true, profVals?.isSymbolicLink != true else { continue }
+            var profStat = stat()
+            guard lstat(profile.path, &profStat) == 0,
+                  (profStat.st_mode & S_IFMT) == S_IFDIR,
+                  !safetyGuard.isSymbolicLink(profile) else {
+                continue
+            }
+            let extDir = profile.appendingPathComponent("extensions")
+            guard !safetyGuard.isSymbolicLink(extDir) else { continue }
+
             let extJSON = profile.appendingPathComponent("extensions.json")
-            guard let data = try? Data(contentsOf: extJSON) else { continue }
+            guard let data = SafeFileReader.readBoundedRegularFile(at: extJSON) else { continue }
             results.append(contentsOf: Self.parseFirefoxExtensionsJSON(
                 data,
                 profileName: profile.lastPathComponent,
@@ -370,24 +421,62 @@ public struct ExtensionScanner: Sendable {
         return results
     }
 
-    /// Parses Mozilla `profiles.ini` sections (`[Profile*]`) into resolved profile directory URLs.
-    /// Relative profile paths (`IsRelative=1`) must stay contained within `firefoxBaseURL`.
-    public static func parseFirefoxProfilesINI(_ content: String, firefoxBaseURL: URL) -> [URL] {
+    /// Parses Mozilla `profiles.ini` sections (`[Profile*]`) into profile directory URLs.
+    /// - Relative profile paths (`IsRelative=1`) must stay contained within BOTH raw and symlink-resolved `firefoxBaseURL`.
+    /// - Absolute profile paths (`IsRelative=0`) are confined within `allowedAbsoluteRoot` when provided.
+    public static func parseFirefoxProfilesINI(
+        _ content: String,
+        firefoxBaseURL: URL,
+        allowedAbsoluteRoot: URL? = nil
+    ) -> [URL] {
         var results: [URL] = []
         var inProfileSection = false
         var currentPath: String?
         var currentIsRelative = true
-        let basePath = firefoxBaseURL.standardizedFileURL.path
+
+        let baseRaw = firefoxBaseURL.standardizedFileURL.path
+        let baseRes = firefoxBaseURL.resolvingSymlinksInPath().standardizedFileURL.path
+        let baseCanonical = PrivilegedExecutor.canonicalParentPath(for: baseRaw)
+
+        let allowedRootRaw = allowedAbsoluteRoot?.standardizedFileURL.path
+        let allowedRootRes = allowedAbsoluteRoot?.resolvingSymlinksInPath().standardizedFileURL.path
+        let allowedRootCanonical = allowedRootRaw.map { PrivilegedExecutor.canonicalParentPath(for: $0) }
+
+        func isSymlink(_ path: String) -> Bool {
+            var st = stat()
+            guard lstat(path, &st) == 0 else { return false }
+            return (st.st_mode & S_IFMT) == S_IFLNK
+        }
 
         func flushSection() {
             guard inProfileSection, let path = currentPath, !path.isEmpty, !path.contains("\0") else { return }
             if currentIsRelative {
                 let candidate = firefoxBaseURL.appendingPathComponent(path).standardizedFileURL
-                guard candidate.path.hasPrefix(basePath + "/") else { return }
+                let candRaw = candidate.path
+                let candRes = candidate.resolvingSymlinksInPath().standardizedFileURL.path
+                let candCanonical = PrivilegedExecutor.canonicalParentPath(for: candRaw)
+                guard !isSymlink(candRaw),
+                      candRaw.hasPrefix(baseRaw + "/"),
+                      candRes.hasPrefix(baseRes + "/"),
+                      candCanonical.hasPrefix(baseCanonical + "/") else {
+                    return
+                }
                 results.append(candidate)
             } else {
                 guard path.hasPrefix("/") else { return }
-                results.append(URL(fileURLWithPath: path).standardizedFileURL)
+                let candidate = URL(fileURLWithPath: path).standardizedFileURL
+                let candRaw = candidate.path
+                if let rootRaw = allowedRootRaw, let rootRes = allowedRootRes, let rootCanonical = allowedRootCanonical {
+                    let candRes = candidate.resolvingSymlinksInPath().standardizedFileURL.path
+                    let candCanonical = PrivilegedExecutor.canonicalParentPath(for: candRaw)
+                    guard !isSymlink(candRaw),
+                          candRaw.hasPrefix(rootRaw + "/"),
+                          candRes.hasPrefix(rootRes + "/"),
+                          candCanonical.hasPrefix(rootCanonical + "/") else {
+                        return
+                    }
+                }
+                results.append(candidate)
             }
         }
 
@@ -428,8 +517,30 @@ public struct ExtensionScanner: Sendable {
         }
 
         let fm = FileManager.default
-        let expectedExtensionsRaw = profileDirectory?.appendingPathComponent("extensions").standardizedFileURL.path
-        let expectedExtensionsResolved = profileDirectory?.appendingPathComponent("extensions").resolvingSymlinksInPath().standardizedFileURL.path
+        var expectedExtensionsRaw: String?
+        var expectedExtensionsResolved: String?
+        var expectedExtensionsCanonical: String?
+
+        if let profileDir = profileDirectory {
+            guard !safetyGuard.isSymbolicLink(profileDir) else { return [] }
+            let extDirURL = profileDir.appendingPathComponent("extensions").standardizedFileURL
+            guard !safetyGuard.isSymbolicLink(extDirURL) else { return [] }
+
+            let profRes = profileDir.resolvingSymlinksInPath().standardizedFileURL.path
+            let profCanonical = PrivilegedExecutor.canonicalParentPath(for: profileDir.standardizedFileURL.path)
+            let expRaw = extDirURL.path
+            let expRes = extDirURL.resolvingSymlinksInPath().standardizedFileURL.path
+            let expCanonical = PrivilegedExecutor.canonicalParentPath(for: expRaw)
+
+            // Verify `<profile>/extensions` resolves strictly inside the resolved profile directory.
+            guard expRes.hasPrefix(profRes + "/") && expCanonical.hasPrefix(profCanonical + "/") else {
+                return []
+            }
+            expectedExtensionsRaw = expRaw
+            expectedExtensionsResolved = expRes
+            expectedExtensionsCanonical = expCanonical
+        }
+
         var items: [ExtensionItem] = []
 
         for addon in addons {
@@ -447,16 +558,28 @@ public struct ExtensionScanner: Sendable {
             }
 
             let url = URL(fileURLWithPath: pathStr).standardizedFileURL
-            if let expRaw = expectedExtensionsRaw, let expRes = expectedExtensionsResolved {
+            guard !safetyGuard.isSymbolicLink(url) else {
+                continue
+            }
+            if let expRaw = expectedExtensionsRaw,
+               let expRes = expectedExtensionsResolved,
+               let expCanonical = expectedExtensionsCanonical {
                 let rawPath = url.path
                 let resPath = url.resolvingSymlinksInPath().standardizedFileURL.path
-                let rawInside = rawPath.hasPrefix(expRaw + "/") || rawPath.hasPrefix(expRes + "/")
-                let resInside = resPath.hasPrefix(expRaw + "/") || resPath.hasPrefix(expRes + "/")
-                guard rawInside && resInside else {
+                let canonicalPath = PrivilegedExecutor.canonicalParentPath(for: rawPath)
+                let rawInside = rawPath.hasPrefix(expRaw + "/")
+                let resInside = resPath.hasPrefix(expRes + "/")
+                let canonicalInside = canonicalPath.hasPrefix(expCanonical + "/")
+                let isDirectChild = url.deletingLastPathComponent().path == expRaw
+                guard rawInside && resInside && canonicalInside && isDirectChild else {
                     continue
                 }
             }
             guard safetyGuard.validateForRemoval(url).isAllowed else {
+                continue
+            }
+            // User Firefox extensions must never require elevated/root privileges to remove.
+            guard !safetyGuard.requiresAdmin(for: url) else {
                 continue
             }
 
@@ -482,7 +605,9 @@ public struct ExtensionScanner: Sendable {
                 canToggle: false,
                 canRemove: exists,
                 requiresAdmin: false,
-                requiresReboot: false
+                requiresReboot: false,
+                expectedCanonicalParent: expectedExtensionsCanonical
+                    ?? PrivilegedExecutor.canonicalParentPath(forTargetURL: url)
             ))
         }
         return items
@@ -534,7 +659,8 @@ public struct ExtensionScanner: Sendable {
                 browserBundleID: isSafari ? "com.apple.Safari" : nil,
                 size: (computeSize && pathExists) ? DirectorySizer.computeSizeSync(of: url) : 0,
                 isEnabled: entry.isEnabled,
-                canToggle: true,
+                canToggle: ExtensionController.isValidPluginKitIdentifier(entry.identifier)
+                    && !safetyGuard.matchesProtectedBundleID(entry.identifier),
                 canRemove: false, // Embedded .appex MUST NOT be individually deleted (breaks host app signature)
                 requiresAdmin: false,
                 requiresReboot: false
@@ -597,7 +723,8 @@ public struct ExtensionScanner: Sendable {
                 }
             }
 
-            guard !identifier.isEmpty, !identifier.lowercased().hasPrefix("com.apple.") else { continue }
+            let lowerID = identifier.lowercased()
+            guard !identifier.isEmpty, lowerID != "com.apple", !lowerID.hasPrefix("com.apple.") else { continue }
             entries.append(PluginkitEntry(
                 identifier: identifier,
                 version: version,
@@ -637,19 +764,23 @@ public struct ExtensionScanner: Sendable {
         var results: [ExtensionItem] = []
 
         for spec in specs {
-            guard let children = try? fm.contentsOfDirectory(
+            guard !safetyGuard.isSymbolicLink(spec.dir),
+                  let children = try? fm.contentsOfDirectory(
                 at: spec.dir,
                 includingPropertiesForKeys: nil,
                 options: [.skipsHiddenFiles]
             ) else {
                 continue
             }
+            let dirCanonicalParent = PrivilegedExecutor.canonicalParentPath(for: spec.dir.standardizedFileURL.path)
 
             for itemURL in children {
                 guard safetyGuard.validateForRemoval(itemURL).isAllowed else { continue }
                 let bundle = Bundle(url: itemURL)
                 let bid = bundle?.bundleIdentifier ?? itemURL.deletingPathExtension().lastPathComponent
-                if bid.lowercased().hasPrefix("com.apple.") { continue }
+                let lowerBID = bid.lowercased()
+                if lowerBID == "com.apple" || lowerBID.hasPrefix("com.apple.") { continue }
+                if safetyGuard.matchesProtectedBundleID(bid) { continue }
 
                 let name = (bundle?.localizedInfoDictionary?["CFBundleDisplayName"] as? String)
                     ?? (bundle?.infoDictionary?["CFBundleName"] as? String)
@@ -672,7 +803,8 @@ public struct ExtensionScanner: Sendable {
                     canToggle: false,
                     canRemove: true,
                     requiresAdmin: safetyGuard.requiresAdmin(for: itemURL),
-                    requiresReboot: spec.isHAL
+                    requiresReboot: spec.isHAL,
+                    expectedCanonicalParent: dirCanonicalParent
                 ))
             }
         }

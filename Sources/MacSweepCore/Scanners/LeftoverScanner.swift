@@ -58,7 +58,7 @@ public struct InstalledAppInventory: Sendable {
             let lower = lproj.lowercased()
             guard lower.hasPrefix("zh") || lower.hasPrefix("en") || lower == "base.lproj" else { continue }
             let stringsURL = resources.appendingPathComponent(lproj).appendingPathComponent("InfoPlist.strings")
-            guard let data = try? Data(contentsOf: stringsURL),
+            guard let data = SafeFileReader.readBoundedRegularFile(at: stringsURL),
                   let dict = (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? [String: Any] else {
                 continue
             }
@@ -282,17 +282,23 @@ public struct InstalledAppInventory: Sendable {
     }
 
     public static func stripContainerPrefixes(_ raw: String) -> String {
-        var value = raw
-        if value.hasPrefix("group.") {
-            value = String(value.dropFirst("group.".count))
+        func stripLeadingGroupPrefix(_ input: String) -> String {
+            let lower = input.lowercased()
+            if lower.hasPrefix("groups.") {
+                return String(input.dropFirst("groups.".count))
+            }
+            if lower.hasPrefix("group.") {
+                return String(input.dropFirst("group.".count))
+            }
+            return input
         }
+
+        var value = stripLeadingGroupPrefix(raw)
         if let dot = value.firstIndex(of: ".") {
             let prefix = value[..<dot]
             if prefix.count == 10, prefix.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) }) {
                 value = String(value[value.index(after: dot)...])
-                if value.hasPrefix("group.") {
-                    value = String(value.dropFirst("group.".count))
-                }
+                value = stripLeadingGroupPrefix(value)
             }
         }
         return value
@@ -433,7 +439,8 @@ public struct LeftoverScanner: Sendable {
                 requiresReboot: entry.url.path.contains("/Audio/Plug-Ins/HAL/"),
                 isSystemScope: entry.isSystemScope,
                 confidence: confidence,
-                matchReason: confidence == .high ? "Orphaned app identifier" : "Unmatched directory (review)"
+                matchReason: confidence == .high ? "Orphaned app identifier" : "Unmatched directory (review)",
+                expectedCanonicalParent: entry.expectedCanonicalParent
             )
 
             if var existing = groupedFiles[groupKey] {

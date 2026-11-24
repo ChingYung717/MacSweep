@@ -51,7 +51,8 @@ func runServiceFileMatcherChecks(_ runner: CheckRunner) {
             localizedName: "NovaNote",
             bundleID: "com.acme.NovaNote",
             version: "2.1.0",
-            executableName: "NovaNote"
+            executableName: "NovaNote",
+            teamIdentifier: "ABCDE12345"
         )
 
         let matched = matcher.matchInMemory(app: app, index: index)

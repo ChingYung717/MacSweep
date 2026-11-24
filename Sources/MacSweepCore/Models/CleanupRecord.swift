@@ -28,8 +28,12 @@ public struct CleanupRecord: Identifiable, Codable, Sendable, Hashable {
     }
 }
 
-public final class CleanupHistoryStore: Sendable {
+public final class CleanupHistoryStore: @unchecked Sendable {
+    public static let maxBytes: Int = 4 * 1024 * 1024
+
     private let fileURL: URL
+    private let lock = NSLock()
+    private var hasWriteBlock: Bool = false
 
     public init(fileURL: URL? = nil) {
         if let fileURL {
@@ -41,37 +45,72 @@ public final class CleanupHistoryStore: Sendable {
         }
     }
 
+    public var isWriteBlockedDueToLoadError: Bool {
+        lock.withLock { hasWriteBlock }
+    }
+
     public func load() -> [CleanupRecord] {
-        guard let data = try? Data(contentsOf: fileURL) else { return [] }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return (try? decoder.decode([CleanupRecord].self, from: data)) ?? []
-    }
-
-    public func append(_ record: CleanupRecord) {
-        var existing = load()
-        existing.insert(record, at: 0)
-        if existing.count > 100 {
-            existing = Array(existing.prefix(100))
+        lock.withLock {
+            let (records, canOverwrite) = loadDetailedUnlocked()
+            if !canOverwrite {
+                hasWriteBlock = true
+            }
+            return records
         }
-        save(existing)
     }
 
-    public func clear() {
-        save([])
+    @discardableResult
+    public func append(_ record: CleanupRecord) -> Bool {
+        lock.withLock {
+            guard !hasWriteBlock else { return false }
+            var (existing, canOverwrite) = loadDetailedUnlocked()
+            guard canOverwrite else {
+                hasWriteBlock = true
+                return false
+            }
+            existing.insert(record, at: 0)
+            if existing.count > 100 {
+                existing = Array(existing.prefix(100))
+            }
+            return saveUnlocked(existing)
+        }
     }
 
-    private func save(_ records: [CleanupRecord]) {
-        let fm = FileManager.default
-        let dir = fileURL.deletingLastPathComponent()
-        try? fm.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
+    @discardableResult
+    public func clear() -> Bool {
+        lock.withLock {
+            guard !hasWriteBlock else { return false }
+            let (_, canOverwrite) = loadDetailedUnlocked()
+            guard canOverwrite else {
+                hasWriteBlock = true
+                return false
+            }
+            return saveUnlocked([])
+        }
+    }
+
+    private func loadDetailedUnlocked() -> (records: [CleanupRecord], canOverwrite: Bool) {
+        switch SafeFileReader.readBoundedRegularFileDetailed(at: fileURL, maxBytes: Self.maxBytes) {
+        case .notFound:
+            return ([], true)
+        case let .success(data):
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            if let decoded = try? decoder.decode([CleanupRecord].self, from: data) {
+                return (decoded, true)
+            }
+            return ([], false)
+        case .oversized, .notRegularFile, .readError:
+            return ([], false)
+        }
+    }
+
+    @discardableResult
+    private func saveUnlocked(_ records: [CleanupRecord]) -> Bool {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
-        if let data = try? encoder.encode(records) {
-            try? data.write(to: fileURL, options: .atomic)
-            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
-        }
+        guard let data = try? encoder.encode(records) else { return false }
+        return SafeFileReader.writePrivateAtomically(data, to: fileURL)
     }
 }

@@ -26,6 +26,8 @@ public struct StartupItem: Identifiable, Hashable, Sendable {
     public let canToggle: Bool
     public let canRemove: Bool
     public let fileSize: Int64
+    /// Canonical POSIX parent directory captured at scan / discovery time for TOCTOU verification.
+    public let expectedCanonicalParent: String
 
     public init(
         label: String,
@@ -44,7 +46,8 @@ public struct StartupItem: Identifiable, Hashable, Sendable {
         requiresAdmin: Bool = false,
         canToggle: Bool = true,
         canRemove: Bool = true,
-        fileSize: Int64 = 0
+        fileSize: Int64 = 0,
+        expectedCanonicalParent: String? = nil
     ) {
         self.id = "\(scope.rawValue):\(plistURL.path)"
         self.label = label
@@ -64,5 +67,7 @@ public struct StartupItem: Identifiable, Hashable, Sendable {
         self.canToggle = canToggle
         self.canRemove = canRemove
         self.fileSize = fileSize
+        self.expectedCanonicalParent = expectedCanonicalParent
+            ?? PrivilegedExecutor.canonicalParentPath(forTargetURL: plistURL)
     }
 }

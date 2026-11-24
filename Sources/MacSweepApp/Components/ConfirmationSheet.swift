@@ -58,7 +58,7 @@ struct ConfirmationSheet: View {
                     Text(confirmation.isReset ? l10n.confirmResetTitle : l10n.confirmUninstallTitle)
                         .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle(palette.primaryText)
-                    Text("\(confirmation.title) · \(l10n.selectedSummary(count: confirmation.targets.count, bytes: totalBytes))")
+                    Text(verbatim: "\(SafeFileReader.sanitizeForDisplay(confirmation.title)) · \(l10n.selectedSummary(count: confirmation.targets.count, bytes: totalBytes))")
                         .font(.system(size: 12.5))
                         .foregroundStyle(palette.secondaryText)
                 }
@@ -67,10 +67,13 @@ struct ConfirmationSheet: View {
 
             // Contextual Warnings
             if !confirmation.runningAppNames.isEmpty {
+                let safeRunningNames = confirmation.runningAppNames
+                    .map(SafeFileReader.sanitizeForDisplay)
+                    .joined(separator: ", ")
                 warningBox(
                     icon: "bolt.circle.fill",
                     color: palette.warning,
-                    text: "\(l10n.runningAppsWarning) \(confirmation.runningAppNames.joined(separator: ", "))"
+                    text: "\(l10n.runningAppsWarning) \(safeRunningNames)"
                         + (confirmation.isReset ? "\n\(l10n.resetForceQuitNote)" : "")
                 )
             }
@@ -88,6 +91,14 @@ struct ConfirmationSheet: View {
                     icon: "lock.shield.fill",
                     color: palette.accent,
                     text: l10n.adminAuthNote
+                )
+            }
+
+            if confirmation.hasUserLockedItems {
+                warningBox(
+                    icon: "lock.open.fill",
+                    color: palette.warning,
+                    text: l10n.userLockedItemsNote
                 )
             }
 
@@ -134,7 +145,7 @@ struct ConfirmationSheet: View {
                                     .foregroundStyle(target.requiresAdmin ? palette.warning : palette.tertiaryText)
                                     .frame(width: 14)
 
-                                Text(target.url.path)
+                                Text(verbatim: SafeFileReader.sanitizeForDisplay(target.url.path))
                                     .font(.system(size: 11.5, design: .monospaced))
                                     .foregroundStyle(palette.primaryText)
                                     .lineLimit(1)
@@ -153,7 +164,7 @@ struct ConfirmationSheet: View {
 
                         if !effectivePackageIDs.isEmpty {
                             Divider().opacity(0.3).padding(.vertical, 4)
-                            Text("\(l10n.pkgReceiptsNote): \(effectivePackageIDs.joined(separator: ", "))")
+                            Text(verbatim: "\(l10n.pkgReceiptsNote): \(effectivePackageIDs.map(SafeFileReader.sanitizeForDisplay).joined(separator: ", "))")
                                 .font(.system(size: 11, design: .monospaced))
                                 .foregroundStyle(palette.secondaryText)
                         }
@@ -171,22 +182,34 @@ struct ConfirmationSheet: View {
                 )
             }
 
-            // Action Buttons
+            // Action Buttons (disable Return-key default action in permanent delete mode to prevent accidental loss)
             HStack {
                 Spacer()
                 Button(l10n.cancel, action: onCancel)
                     .keyboardShortcut(.cancelAction)
 
-                Button {
-                    onConfirm(selectedMode)
-                } label: {
-                    Text(selectedMode == .permanent ? l10n.t("确认永久删除", "Delete Permanently") : l10n.t("移至废纸篓", "Move to Trash"))
-                        .fontWeight(.semibold)
-                        .padding(.horizontal, 12)
+                if selectedMode == .permanent {
+                    Button {
+                        onConfirm(.permanent)
+                    } label: {
+                        Text(l10n.t("确认永久删除", "Delete Permanently"))
+                            .fontWeight(.semibold)
+                            .padding(.horizontal, 12)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(palette.danger)
+                } else {
+                    Button {
+                        onConfirm(.trash)
+                    } label: {
+                        Text(l10n.t("移至废纸篓", "Move to Trash"))
+                            .fontWeight(.semibold)
+                            .padding(.horizontal, 12)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(palette.accent)
+                    .keyboardShortcut(.defaultAction)
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(selectedMode == .permanent ? palette.danger : palette.accent)
-                .keyboardShortcut(.defaultAction)
             }
         }
         .padding(20)
@@ -201,7 +224,7 @@ struct ConfirmationSheet: View {
                 .font(.system(size: 13))
                 .foregroundStyle(color)
                 .padding(.top, 1)
-            Text(text)
+            Text(verbatim: text)
                 .font(.system(size: 12))
                 .foregroundStyle(palette.primaryText)
                 .fixedSize(horizontal: false, vertical: true)

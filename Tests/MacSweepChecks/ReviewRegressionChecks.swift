@@ -74,9 +74,9 @@ func runReviewRegressionChecks(_ runner: CheckRunner) {
         try runner.expect(report.failures.contains { $0.url.path == stuck.path }, "stuck item must be a failure")
     }
 
-    // MARK: F3 — privileged Trash fallback: independent items, recursive chown, collision naming
+    // MARK: F3 — privileged Trash fallback: independent items, Scheme A (no root chown), collision naming
 
-    runner.run("F3: privileged-trash script is per-item, recursive-chown, and reports partial failure") {
+    runner.run("F3: privileged-trash script is per-item, avoids root chown (Scheme A), and reports partial failure") {
         let sandbox = try runner.makeTempSandbox(prefix: "f3")
         defer { try? FileManager.default.removeItem(at: sandbox) }
         let fm = FileManager.default
@@ -95,7 +95,8 @@ func runReviewRegressionChecks(_ runner: CheckRunner) {
             trashDirectory: trash,
             timestamp: "T"
         )
-        try runner.expect(script.contains("chown -R -P"), "must chown recursively without following symlinks")
+        try runner.expect(!script.contains("chown"), "Scheme A must not run chown as root")
+        try runner.expect(script.contains("cd -P -- "), "must pin parent and Trash directories inside subshells")
         let res = ProcessRunner.run(executable: "/bin/sh", arguments: ["-c", script])
         try runner.expect(res.exitCode != 0, "a failing item must make the script exit non-zero")
         try runner.expect(fm.fileExists(atPath: trash.appendingPathComponent("Tool.app/Contents/Resources").path),

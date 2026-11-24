@@ -67,6 +67,10 @@ struct PendingConfirmation: Identifiable {
     /// Preference domains eligible for `cfprefsd` cache flush after a successful reset (only flushed if
     /// their preference `.plist` was actually removed).
     var resetBundleIDs: [String] = []
+    /// Whether the reset target is a cryptographically verified Mac App Store Apple app (`defaults delete com.apple.*` allowed).
+    var resetAllowApple: Bool = false
+    /// Whether any target carries the user-immutable (`chflags uchg`) lock flag and will be unlocked upon confirmation.
+    var hasUserLockedItems: Bool = false
 }
 
 struct OperationBanner: Identifiable, Equatable {
@@ -102,6 +106,25 @@ final class AppState: ObservableObject {
     private var ambiguousNames: Set<String> = []
     private var allInstalledBundleIDs: Set<String> = []
     private var allInstalledAppPaths: Set<String> = []
+    private var allInstalledGroupOwners: [String: Set<String>] = [:]
+    private var systemInventoryBundleIDs: Set<String> = []
+    private var systemInventoryPathsByID: [String: Set<String>] = [:]
+    private var systemInventoryGroupOwners: [String: Set<String>] = [:]
+
+    private nonisolated static func mergeGroupOwners(
+        _ lhs: [String: Set<String>],
+        _ rhs: [String: Set<String>]
+    ) -> [String: Set<String>] {
+        var merged = lhs
+        for (groupID, paths) in rhs {
+            merged[groupID, default: []].formUnion(paths)
+        }
+        return merged
+    }
+
+    private nonisolated static func normalizedPathKey(_ path: String) -> String {
+        URL(fileURLWithPath: path).standardizedFileURL.path.precomposedStringWithCanonicalMapping.lowercased()
+    }
 
     // Tab 1: Applications
     @Published var apps: [AppItem] = []
@@ -200,7 +223,7 @@ final class AppState: ObservableObject {
         let includeUtil = preferences.includeUtilitiesFolder
         let showSys = preferences.showSystemApps
 
-        let (scannedApps, index, thirdPartyPkgs, ambiguous, installedIDs, installedPaths) = await Task.detached(priority: .userInitiated) {
+        let (scannedApps, index, thirdPartyPkgs, ambiguous, installedIDs, installedPaths, fullInventory, sysGroupOwners, allGroupOwners) = await Task.detached(priority: .userInitiated) {
             let index = LibraryIndex.build(safetyGuard: guardCopy)
             let scanner = AppScanner(
                 includeUtilities: includeUtil,
@@ -215,36 +238,58 @@ final class AppState: ObservableObject {
             let installedIDs = scannedIDs.union(fullInventory.bundleIDs)
             let installedPaths = Set(found.map { $0.url.standardizedFileURL.path })
                 .union(fullInventory.bundlePathsByID.values.flatMap { $0 })
+            let scannedPathKeys = Set(found.map { Self.normalizedPathKey($0.url.path) })
+            let scannedGroupOwners = ServiceFileMatcher.applicationGroupOwners(across: found)
+            let sysGroupOwners = AppScanner.supplementalApplicationGroupOwners(
+                from: fullInventory.bundlePathsByID,
+                excludingNormalizedPaths: scannedPathKeys
+            )
+            let allGroupOwners = Self.mergeGroupOwners(scannedGroupOwners, sysGroupOwners)
 
             var bundleIDCounts: [String: Int] = [:]
             for app in found { bundleIDCounts[app.bundleID.lowercased(), default: 0] += 1 }
             for i in found.indices {
                 let lowerID = found[i].bundleID.lowercased()
-                let appPath = found[i].url.standardizedFileURL.path
-                let hasOtherSystemCopy = (fullInventory.bundlePathsByID[lowerID] ?? []).contains { $0 != appPath }
+                let appPathNorm = Self.normalizedPathKey(found[i].url.path)
+                let hasOtherSystemCopy = (fullInventory.bundlePathsByID[lowerID] ?? []).contains {
+                    Self.normalizedPathKey($0) != appPathNorm
+                }
+                let otherGroups = ServiceFileMatcher.otherInstalledApplicationGroups(
+                    for: found[i],
+                    groupOwners: allGroupOwners
+                )
                 var matched = matcher.matchInMemory(
                     app: found[i],
                     index: index,
                     ambiguousNames: ambiguous,
-                    allInstalledBundleIDs: installedIDs
+                    allInstalledBundleIDs: installedIDs,
+                    otherInstalledAppGroups: otherGroups
                 )
                 if (bundleIDCounts[lowerID] ?? 0) > 1 || hasOtherSystemCopy {
                     found[i].sharesBundleIDWithOtherApp = true
+                    found[i].isRunning = !AppScanner.runningProcesses(
+                        matchingBundleIDs: [],
+                        bundleURLs: [found[i].url]
+                    ).isEmpty
                     for j in matched.indices { matched[j].isSelected = false }
                 }
                 found[i].serviceFiles = matched
                 found[i].scanState = .ready
             }
             let pkgs = ServiceFileMatcher.listThirdPartyPackages()
-            return (found, index, pkgs, ambiguous, installedIDs, installedPaths)
+            return (found, index, pkgs, ambiguous, installedIDs, installedPaths, fullInventory, sysGroupOwners, allGroupOwners)
         }.value
 
         guard gen == scanGeneration else { return }
         self.libraryIndex = index
         self.cachedThirdPartyPackages = thirdPartyPkgs
         self.ambiguousNames = ambiguous
+        self.systemInventoryBundleIDs = fullInventory.bundleIDs
+        self.systemInventoryPathsByID = fullInventory.bundlePathsByID
+        self.systemInventoryGroupOwners = sysGroupOwners
         self.allInstalledBundleIDs = installedIDs
         self.allInstalledAppPaths = installedPaths
+        self.allInstalledGroupOwners = allGroupOwners
         self.apps = scannedApps
         self.isScanningApps = false
 
@@ -324,6 +369,10 @@ final class AppState: ObservableObject {
         let ambiguous = ambiguousNames
         let installedIDs = allInstalledBundleIDs
         let otherPaths = allInstalledAppPaths.subtracting([targetApp.url.standardizedFileURL.path])
+        let otherGroups = ServiceFileMatcher.otherInstalledApplicationGroups(
+            for: targetApp,
+            groupOwners: allInstalledGroupOwners
+        )
         let shared = targetApp.sharesBundleIDWithOtherApp
 
         Task.detached(priority: .userInitiated) { [weak self] in
@@ -334,7 +383,8 @@ final class AppState: ObservableObject {
                 allPackageIDs: allPkgs,
                 ambiguousNames: ambiguous,
                 allInstalledBundleIDs: installedIDs,
-                otherInstalledAppPaths: otherPaths
+                otherInstalledAppPaths: otherPaths,
+                otherInstalledAppGroups: otherGroups
             )
             // Keep only entries still present on disk so deleted files can never resurrect.
             let liveFiles = result.files.filter { RemovalEngine.entryExists($0.url) }
@@ -348,8 +398,9 @@ final class AppState: ObservableObject {
             }
             let bundleSize = sizeMap[targetApp.url.standardizedFileURL.path] ?? targetApp.bundleSize ?? 0
             let pkgIDs = shared ? [] : result.matchedPackageIDs
+            let safeMatchIDs = AppScanner.safeProcessMatchBundleID(for: targetApp).map { [$0] } ?? []
             let isRunningNow = !AppScanner.runningProcesses(
-                matchingBundleIDs: [targetApp.bundleID],
+                matchingBundleIDs: safeMatchIDs,
                 bundleURLs: [targetApp.url]
             ).isEmpty
 
@@ -394,7 +445,8 @@ final class AppState: ObservableObject {
         activeTab = .applications
 
         let stdPath = url.standardizedFileURL.path
-        if let existing = apps.first(where: { $0.url.standardizedFileURL.path == stdPath }) {
+        let stdPathNorm = Self.normalizedPathKey(stdPath)
+        if let existing = apps.first(where: { Self.normalizedPathKey($0.url.path) == stdPathNorm }) {
             selectApp(id: existing.id)
             return
         }
@@ -404,6 +456,7 @@ final class AppState: ObservableObject {
         let existingPkgs = cachedThirdPartyPackages
         let sizerRef = sizer
         let knownApps = apps
+        let knownSysGroupOwners = systemInventoryGroupOwners
         let includeUtil = preferences.includeUtilitiesFolder
         let showSys = preferences.showSystemApps
 
@@ -422,16 +475,31 @@ final class AppState: ObservableObject {
             let ambiguous = ServiceFileMatcher.ambiguousNameCandidates(across: allApps)
             let installedIDs = Set(allApps.map { $0.bundleID.lowercased() }.filter { !$0.hasPrefix("unknown.") })
                 .union(fullInventory.bundleIDs)
-            let otherPaths = Set(installedApps.map { $0.url.standardizedFileURL.path })
-                .union(fullInventory.bundlePathsByID.values.flatMap { $0 })
-                .subtracting([stdPath])
+            let otherPaths = Set(
+                (installedApps.map { $0.url.standardizedFileURL.path }
+                    + fullInventory.bundlePathsByID.values.flatMap { $0 })
+                    .filter { Self.normalizedPathKey($0) != stdPathNorm }
+            )
+            let installedPathKeys = Set(installedApps.map { Self.normalizedPathKey($0.url.path) })
+            let installedGroupOwners = ServiceFileMatcher.applicationGroupOwners(across: installedApps)
+            let supplementalOwners = knownApps.isEmpty
+                ? AppScanner.supplementalApplicationGroupOwners(
+                    from: fullInventory.bundlePathsByID,
+                    excludingNormalizedPaths: installedPathKeys
+                )
+                : knownSysGroupOwners
+            let combinedGroupOwners = Self.mergeGroupOwners(installedGroupOwners, supplementalOwners)
+            let otherGroups = ServiceFileMatcher.otherInstalledApplicationGroups(
+                for: inspected,
+                groupOwners: combinedGroupOwners
+            )
             let lowerInspectedID = inspected.bundleID.lowercased()
             let sharedWithScanned = installedApps.contains {
                 $0.bundleID.lowercased() == lowerInspectedID
-                    && $0.url.standardizedFileURL.path != stdPath
+                    && Self.normalizedPathKey($0.url.path) != stdPathNorm
             }
             let sharedWithSystemOrUtilities = (fullInventory.bundlePathsByID[lowerInspectedID] ?? []).contains {
-                $0 != stdPath
+                Self.normalizedPathKey($0) != stdPathNorm
             }
             let shared = sharedWithScanned || sharedWithSystemOrUtilities
             let matcher = ServiceFileMatcher(safetyGuard: guardCopy)
@@ -441,7 +509,8 @@ final class AppState: ObservableObject {
                 allPackageIDs: pkgs,
                 ambiguousNames: ambiguous,
                 allInstalledBundleIDs: installedIDs,
-                otherInstalledAppPaths: otherPaths
+                otherInstalledAppPaths: otherPaths,
+                otherInstalledAppGroups: otherGroups
             )
 
             let urls = [inspected.url] + matched.files.map(\.url)
@@ -450,6 +519,11 @@ final class AppState: ObservableObject {
             inspected.bundleSize = sizes[inspected.url.standardizedFileURL.path] ?? 0
             inspected.sharesBundleIDWithOtherApp = shared
             inspected.hasEnrichedPackages = true
+            let safeMatchIDs = AppScanner.safeProcessMatchBundleID(for: inspected).map { [$0] } ?? []
+            inspected.isRunning = !AppScanner.runningProcesses(
+                matchingBundleIDs: safeMatchIDs,
+                bundleURLs: [inspected.url]
+            ).isEmpty
             inspected.serviceFiles = matched.files.map { sf in
                 var copy = sf
                 copy.size = sizes[sf.url.standardizedFileURL.path] ?? 0
@@ -593,13 +667,14 @@ final class AppState: ObservableObject {
     }
 
     func quitApp(_ app: AppItem) async {
+        let safeIDs = AppScanner.safeProcessMatchBundleID(for: app).map { [$0] } ?? []
         _ = await RemovalEngine.terminateRunningApps(
-            bundleIDs: [app.bundleID],
+            bundleIDs: safeIDs,
             bundleURLs: [app.url],
             forceAfterTimeout: false
         )
         let stillRunning = !AppScanner.runningProcesses(
-            matchingBundleIDs: [app.bundleID],
+            matchingBundleIDs: safeIDs,
             bundleURLs: [app.url]
         ).isEmpty
         if let idx = apps.firstIndex(where: { $0.id == app.id }) {
@@ -634,24 +709,30 @@ final class AppState: ObservableObject {
         if batch.count >= 2 && droppedApp == nil {
             for app in batch {
                 affectedIDs.append(app.id)
-                targetBundleIDs.append(app.bundleID)
+                if let safeID = AppScanner.safeProcessMatchBundleID(for: app) {
+                    targetBundleIDs.append(safeID)
+                }
                 targetAppURLs.append(app.url)
                 if app.isAppleAppStoreApp { hasAppleStore = true }
                 appendTarget(RemovalTarget(
                     url: app.url,
                     estimatedSize: app.bundleSize ?? 0,
-                    requiresAdmin: app.requiresAdmin
+                    requiresAdmin: app.requiresAdmin,
+                    expectedCanonicalParent: app.expectedCanonicalParent
                 ))
                 for sf in app.serviceFiles where sf.isSelected {
                     appendTarget(RemovalTarget(
                         url: sf.url,
                         estimatedSize: sf.size ?? 0,
-                        requiresAdmin: sf.requiresAdmin
+                        requiresAdmin: sf.requiresAdmin,
+                        expectedCanonicalParent: sf.expectedCanonicalParent
                     ))
                 }
                 pkgIDs.append(contentsOf: app.matchedPackageIDs)
             }
             guard !targets.isEmpty else { return }
+            let guardCopy = safetyGuard
+            let hasLocked = targets.contains { guardCopy.isUserImmutable($0.url) }
             let running = AppScanner.runningProcesses(matchingBundleIDs: targetBundleIDs, bundleURLs: targetAppURLs)
             let title = l10n.isChinese
                 ? "批量卸载 \(batch.count) 个应用"
@@ -672,7 +753,8 @@ final class AppState: ObservableObject {
                 affectedAppIDs: affectedIDs,
                 affectedStartupIDs: [],
                 affectedExtensionIDs: [],
-                affectedLeftoverIDs: []
+                affectedLeftoverIDs: [],
+                hasUserLockedItems: hasLocked
             )
             return
         }
@@ -680,7 +762,7 @@ final class AppState: ObservableObject {
         guard let app = activeDetailApp, app.canUninstall else { return }
         let isReset = (appActionMode == .reset)
         affectedIDs = [app.id]
-        targetBundleIDs = [app.bundleID]
+        targetBundleIDs = AppScanner.safeProcessMatchBundleID(for: app).map { [$0] } ?? []
         targetAppURLs = [app.url]
         if app.isAppleAppStoreApp && !isReset { hasAppleStore = true }
 
@@ -688,7 +770,8 @@ final class AppState: ObservableObject {
             appendTarget(RemovalTarget(
                 url: app.url,
                 estimatedSize: app.bundleSize ?? 0,
-                requiresAdmin: app.requiresAdmin
+                requiresAdmin: app.requiresAdmin,
+                expectedCanonicalParent: app.expectedCanonicalParent
             ))
             pkgIDs = app.matchedPackageIDs
         }
@@ -697,11 +780,14 @@ final class AppState: ObservableObject {
             appendTarget(RemovalTarget(
                 url: sf.url,
                 estimatedSize: sf.size ?? 0,
-                requiresAdmin: sf.requiresAdmin
+                requiresAdmin: sf.requiresAdmin,
+                expectedCanonicalParent: sf.expectedCanonicalParent
             ))
         }
 
         guard !targets.isEmpty else { return }
+        let guardCopy = safetyGuard
+        let hasLocked = targets.contains { guardCopy.isUserImmutable($0.url) }
         let running = AppScanner.runningProcesses(matchingBundleIDs: targetBundleIDs, bundleURLs: targetAppURLs)
         let title = isReset
             ? (l10n.isChinese ? "重置 \(app.localizedName)" : "Reset \(app.localizedName)")
@@ -724,7 +810,9 @@ final class AppState: ObservableObject {
             affectedStartupIDs: [],
             affectedExtensionIDs: [],
             affectedLeftoverIDs: [],
-            resetBundleIDs: isReset ? [app.bundleID] : []
+            resetBundleIDs: isReset ? [app.bundleID] : [],
+            resetAllowApple: isReset && app.isAppleAppStoreApp,
+            hasUserLockedItems: hasLocked
         )
     }
 
@@ -756,15 +844,16 @@ final class AppState: ObservableObject {
         }
 
         // 1. TOCTOU re-check & graceful quit for target apps AND embedded Helpers/MenuBar processes.
+        //    Never copy unvetted `liveProcesses.map(\.bundleID)` into `bundleIDs`, so a dropped/spoofed
+        //    bundle cannot cause an unrelated app sharing its forged CFBundleIdentifier to be terminated.
         if !conf.targetAppBundleIDs.isEmpty || !conf.targetAppURLs.isEmpty {
             let liveProcesses = AppScanner.runningProcesses(
                 matchingBundleIDs: conf.targetAppBundleIDs,
                 bundleURLs: conf.targetAppURLs
             )
             if !liveProcesses.isEmpty {
-                let idsToQuit = Array(Set(conf.targetAppBundleIDs + liveProcesses.map(\.bundleID)))
                 let stillRunning = await RemovalEngine.terminateRunningApps(
-                    bundleIDs: idsToQuit,
+                    bundleIDs: conf.targetAppBundleIDs,
                     bundleURLs: conf.targetAppURLs,
                     forceAfterTimeout: false
                 )
@@ -778,7 +867,7 @@ final class AppState: ObservableObject {
                         ),
                         showAppManagementLink: false,
                         showFDALink: false,
-                        forceQuitBundleIDs: stillRunning,
+                        forceQuitBundleIDs: conf.targetAppBundleIDs,
                         forceQuitBundleURLs: conf.targetAppURLs
                     )
                     return
@@ -790,7 +879,13 @@ final class AppState: ObservableObject {
         let histStore = historyStore
 
         // 2. Unload launchd services whose plists are about to be removed (F2).
-        let launchTargets = StartupController.launchTargets(for: conf.targets.map(\.url))
+        //    Only pass plists whose canonical parent still matches scan time (TOCTOU guard).
+        let verifiedLaunchURLs = conf.targets.compactMap { target -> URL? in
+            PrivilegedExecutor.canonicalParentPath(forTargetURL: target.url) == target.expectedCanonicalParent
+                ? target.url
+                : nil
+        }
+        let launchTargets = StartupController.launchTargets(for: verifiedLaunchURLs)
         var targetsToRemove = conf.targets
         var stillLoadedPlists = Set<String>()
         var unloadErrorMessage: String?
@@ -854,7 +949,8 @@ final class AppState: ObservableObject {
         if conf.isReset && !report.succeededURLs.isEmpty {
             let removedPrefDomains = Self.preferenceDomainsRemoved(
                 in: report.succeededURLs,
-                candidateDomains: conf.resetBundleIDs
+                candidateDomains: conf.resetBundleIDs,
+                allowApple: conf.resetAllowApple
             )
             if !removedPrefDomains.isEmpty {
                 await Task.detached(priority: .utility) {
@@ -895,9 +991,14 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// Returns only candidate bundle IDs (excluding synthetic `unknown.*`, leading `-`, and global domains)
-    /// that had a matching preference `.plist` actually removed under a `/Preferences/` directory.
-    static func preferenceDomainsRemoved(in removedURLs: [URL], candidateDomains: [String]) -> [String] {
+    /// Returns only candidate bundle IDs (excluding synthetic `unknown.*`, leading `-`, `com.apple.*`
+    /// unless `allowApple == true`, and global domains) that had a matching preference `.plist` actually
+    /// removed under a `/Preferences/` directory.
+    static func preferenceDomainsRemoved(
+        in removedURLs: [URL],
+        candidateDomains: [String],
+        allowApple: Bool = false
+    ) -> [String] {
         let forbiddenGlobalDomains: Set<String> = [
             "nsglobaldomain",
             "apple global domain",
@@ -912,6 +1013,7 @@ final class AppState: ObservableObject {
         guard !removedPrefFilenames.isEmpty else { return [] }
 
         return candidateDomains.filter { domain in
+            guard !domain.contains("\0"), !domain.contains("\n"), !domain.contains("\r") else { return false }
             let trimmed = domain.trimmingCharacters(in: .whitespacesAndNewlines)
             let lower = trimmed.lowercased()
             guard !lower.isEmpty,
@@ -920,7 +1022,8 @@ final class AppState: ObservableObject {
                   !lower.contains(where: { $0.isWhitespace }),
                   !lower.hasPrefix("unknown."),
                   !forbiddenGlobalDomains.contains(lower),
-                  ServiceFileMatcher.isMatchableBundleID(lower) else { return false }
+                  (allowApple || !lower.hasPrefix("com.apple.")),
+                  ServiceFileMatcher.isMatchableBundleID(lower, allowApple: allowApple) else { return false }
             return removedPrefFilenames.contains { file in
                 file == "\(lower).plist" || file.hasPrefix("\(lower).")
             }
@@ -935,13 +1038,17 @@ final class AppState: ObservableObject {
             forceAfterTimeout: true,
             timeoutSeconds: 0.5
         )
-        let running = AppScanner.runningBundleIDs()
         for i in apps.indices {
-            apps[i].isRunning = running.contains(apps[i].bundleID.lowercased())
+            let safeIDs = AppScanner.safeProcessMatchBundleID(for: apps[i]).map { [$0] } ?? []
+            apps[i].isRunning = !AppScanner.runningProcesses(
+                matchingBundleIDs: safeIDs,
+                bundleURLs: [apps[i].url]
+            ).isEmpty
         }
         if var dropped = droppedApp {
+            let safeIDs = AppScanner.safeProcessMatchBundleID(for: dropped).map { [$0] } ?? []
             dropped.isRunning = !AppScanner.runningProcesses(
-                matchingBundleIDs: [dropped.bundleID],
+                matchingBundleIDs: safeIDs,
                 bundleURLs: [dropped.url]
             ).isEmpty
             droppedApp = dropped
@@ -957,8 +1064,11 @@ final class AppState: ObservableObject {
     }
 
     /// Synchronizes ALL caches and ALL four tabs after any removal so deleted entries can never resurrect.
+    /// Preserves `systemInventoryBundleIDs` and `systemInventoryPathsByID` (pruning only actually removed paths)
+    /// so system/Utilities/CoreServices collision protection remains intact across incremental removals.
     private func applyIncrementalRemoval(removedPaths: Set<String>, forgottenPackageIDs: [String]) {
         guard !removedPaths.isEmpty else { return }
+        let removedNorm = Set(removedPaths.map(Self.normalizedPathKey))
 
         // Prune cached index & packages
         if let idx = libraryIndex {
@@ -976,33 +1086,65 @@ final class AppState: ObservableObject {
             }
         }
 
+        // Preserve system/Utilities/CoreServices inventory while pruning only paths actually removed.
+        var updatedSysPaths: [String: Set<String>] = [:]
+        var updatedSysIDs = Set<String>()
+        for (bid, paths) in systemInventoryPathsByID {
+            let remaining = paths.filter { !removedNorm.contains(Self.normalizedPathKey($0)) }
+            if !remaining.isEmpty {
+                updatedSysPaths[bid] = remaining
+                updatedSysIDs.insert(bid)
+            }
+        }
+        systemInventoryPathsByID = updatedSysPaths
+        systemInventoryBundleIDs = updatedSysIDs
+        var updatedSysGroupOwners: [String: Set<String>] = [:]
+        for (groupID, paths) in systemInventoryGroupOwners {
+            let remaining = paths.filter { !removedNorm.contains($0) }
+            if !remaining.isEmpty {
+                updatedSysGroupOwners[groupID] = remaining
+            }
+        }
+        systemInventoryGroupOwners = updatedSysGroupOwners
+
         // 1. Sync Applications tab & dropped app
         if var dropped = droppedApp {
-            if removedPaths.contains(dropped.url.standardizedFileURL.path) {
+            if removedNorm.contains(Self.normalizedPathKey(dropped.url.path)) {
                 droppedApp = nil
             } else {
-                dropped.serviceFiles.removeAll { removedPaths.contains($0.url.standardizedFileURL.path) }
+                dropped.serviceFiles.removeAll { removedNorm.contains(Self.normalizedPathKey($0.url.path)) }
                 droppedApp = dropped
             }
         }
-        apps.removeAll { removedPaths.contains($0.url.standardizedFileURL.path) }
+        apps.removeAll { removedNorm.contains(Self.normalizedPathKey($0.url.path)) }
         var bundleCounts: [String: Int] = [:]
         for app in apps { bundleCounts[app.bundleID.lowercased(), default: 0] += 1 }
         for i in apps.indices {
-            apps[i].serviceFiles.removeAll { removedPaths.contains($0.url.standardizedFileURL.path) }
-            apps[i].sharesBundleIDWithOtherApp = (bundleCounts[apps[i].bundleID.lowercased()] ?? 0) > 1
+            apps[i].serviceFiles.removeAll { removedNorm.contains(Self.normalizedPathKey($0.url.path)) }
+            let lowerID = apps[i].bundleID.lowercased()
+            let appPathNorm = Self.normalizedPathKey(apps[i].url.path)
+            let hasOtherSystemCopy = (systemInventoryPathsByID[lowerID] ?? []).contains {
+                Self.normalizedPathKey($0) != appPathNorm
+            }
+            apps[i].sharesBundleIDWithOtherApp = (bundleCounts[lowerID] ?? 0) > 1 || hasOtherSystemCopy
         }
-        allInstalledBundleIDs = Set(apps.map { $0.bundleID.lowercased() }.filter { !$0.hasPrefix("unknown.") })
+        let scannedIDs = Set(apps.map { $0.bundleID.lowercased() }.filter { !$0.hasPrefix("unknown.") })
+        allInstalledBundleIDs = scannedIDs.union(systemInventoryBundleIDs)
         allInstalledAppPaths = Set(apps.map { $0.url.standardizedFileURL.path })
+            .union(systemInventoryPathsByID.values.flatMap { $0 })
+        allInstalledGroupOwners = Self.mergeGroupOwners(
+            ServiceFileMatcher.applicationGroupOwners(across: apps),
+            systemInventoryGroupOwners
+        )
         if let sel = selectedAppID, !apps.contains(where: { $0.id == sel }) {
             selectedAppID = nil
         }
 
         // 2. Sync Startup tab (direct plist removal OR parent app removal)
         startupItems.removeAll { item in
-            let plistPath = item.plistURL.standardizedFileURL.path
-            if removedPaths.contains(plistPath) { return true }
-            if let assoc = item.associatedAppPath, removedPaths.contains(assoc) {
+            let plistKey = Self.normalizedPathKey(item.plistURL.path)
+            if removedNorm.contains(plistKey) { return true }
+            if let assoc = item.associatedAppPath, removedNorm.contains(Self.normalizedPathKey(assoc)) {
                 return item.scope == .appLoginItem
             }
             return false
@@ -1010,9 +1152,9 @@ final class AppState: ObservableObject {
 
         // 3. Sync Extensions tab (direct removal OR host app removal)
         extensionItems.removeAll { item in
-            let extPath = item.path.standardizedFileURL.path
-            if removedPaths.contains(extPath) { return true }
-            if let host = item.hostAppPath?.standardizedFileURL.path, removedPaths.contains(host) {
+            let extKey = Self.normalizedPathKey(item.path.path)
+            if removedNorm.contains(extKey) { return true }
+            if let host = item.hostAppPath?.path, removedNorm.contains(Self.normalizedPathKey(host)) {
                 return true
             }
             return false
@@ -1020,7 +1162,7 @@ final class AppState: ObservableObject {
 
         // 4. Sync Leftovers tab
         for i in leftoverGroups.indices {
-            leftoverGroups[i].files.removeAll { removedPaths.contains($0.url.standardizedFileURL.path) }
+            leftoverGroups[i].files.removeAll { removedNorm.contains(Self.normalizedPathKey($0.url.path)) }
             leftoverGroups[i].isChecked = leftoverGroups[i].files.contains(where: \.isSelected)
         }
         leftoverGroups.removeAll { $0.files.isEmpty }
@@ -1085,10 +1227,16 @@ final class AppState: ObservableObject {
 
     func prepareRemovalForStartupItem(_ item: StartupItem) {
         guard item.canRemove, !isPerformingRemoval else { return }
+        let target = RemovalTarget(
+            url: item.plistURL,
+            estimatedSize: item.fileSize,
+            requiresAdmin: item.requiresAdmin,
+            expectedCanonicalParent: item.expectedCanonicalParent
+        )
         pendingConfirmation = PendingConfirmation(
             title: l10n.isChinese ? "移除启动项 \(item.label)" : "Remove startup item \(item.label)",
             isReset: false,
-            targets: [RemovalTarget(url: item.plistURL, estimatedSize: item.fileSize, requiresAdmin: item.requiresAdmin)],
+            targets: [target],
             packageIDsToForget: [],
             runningAppBundleIDs: [],
             runningAppNames: [],
@@ -1101,7 +1249,8 @@ final class AppState: ObservableObject {
             affectedAppIDs: [],
             affectedStartupIDs: [item.id],
             affectedExtensionIDs: [],
-            affectedLeftoverIDs: []
+            affectedLeftoverIDs: [],
+            hasUserLockedItems: safetyGuard.isUserImmutable(item.plistURL)
         )
     }
 
@@ -1195,12 +1344,15 @@ final class AppState: ObservableObject {
                     targets.append(RemovalTarget(
                         url: file.url,
                         estimatedSize: file.size ?? 0,
-                        requiresAdmin: file.requiresAdmin
+                        requiresAdmin: file.requiresAdmin,
+                        expectedCanonicalParent: file.expectedCanonicalParent
                     ))
                 }
             }
         }
         guard !targets.isEmpty else { return }
+        let guardCopy = safetyGuard
+        let hasLocked = targets.contains { guardCopy.isUserImmutable($0.url) }
         pendingConfirmation = PendingConfirmation(
             title: l10n.isChinese
                 ? "清理 \(groupIDs.count) 组残留文件"
@@ -1219,7 +1371,8 @@ final class AppState: ObservableObject {
             affectedAppIDs: [],
             affectedStartupIDs: [],
             affectedExtensionIDs: [],
-            affectedLeftoverIDs: groupIDs
+            affectedLeftoverIDs: groupIDs,
+            hasUserLockedItems: hasLocked
         )
     }
 
@@ -1288,7 +1441,13 @@ final class AppState: ObservableObject {
 
     func quitBrowser(for item: ExtensionItem) async {
         guard let bid = item.browserBundleID else { return }
-        _ = await RemovalEngine.terminateRunningApps(bundleIDs: [bid], forceAfterTimeout: false)
+        let browserURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bid)
+        _ = await RemovalEngine.terminateRunningApps(
+            bundleIDs: [bid],
+            bundleURLs: browserURL.map { [$0] } ?? [],
+            allowBundleIDOnlyWithoutAppURL: browserURL == nil,
+            forceAfterTimeout: false
+        )
         objectWillChange.send()
     }
 
@@ -1307,10 +1466,16 @@ final class AppState: ObservableObject {
             )
             return
         }
+        let target = RemovalTarget(
+            url: item.path,
+            estimatedSize: item.size,
+            requiresAdmin: item.requiresAdmin,
+            expectedCanonicalParent: item.expectedCanonicalParent
+        )
         pendingConfirmation = PendingConfirmation(
             title: l10n.isChinese ? "移除扩展 \(item.name)" : "Remove extension \(item.name)",
             isReset: false,
-            targets: [RemovalTarget(url: item.path, estimatedSize: item.size, requiresAdmin: item.requiresAdmin)],
+            targets: [target],
             packageIDsToForget: [],
             runningAppBundleIDs: [],
             runningAppNames: [],
@@ -1323,7 +1488,8 @@ final class AppState: ObservableObject {
             affectedAppIDs: [],
             affectedStartupIDs: [],
             affectedExtensionIDs: [item.id],
-            affectedLeftoverIDs: []
+            affectedLeftoverIDs: [],
+            hasUserLockedItems: safetyGuard.isUserImmutable(item.path)
         )
     }
 }

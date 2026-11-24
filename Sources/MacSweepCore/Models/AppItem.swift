@@ -33,6 +33,8 @@ public struct AppItem: Identifiable, Hashable, Sendable {
     public let version: String
     public let executableName: String?
     public let teamIdentifier: String?
+    public let applicationGroups: [String]
+    public let expectedCanonicalParent: String
     public let lastUsedDate: Date?
     public let modifiedDate: Date?
     public var bundleSize: Int64?
@@ -59,6 +61,8 @@ public struct AppItem: Identifiable, Hashable, Sendable {
         version: String,
         executableName: String? = nil,
         teamIdentifier: String? = nil,
+        applicationGroups: [String] = [],
+        expectedCanonicalParent: String? = nil,
         lastUsedDate: Date? = nil,
         modifiedDate: Date? = nil,
         bundleSize: Int64? = nil,
@@ -80,6 +84,9 @@ public struct AppItem: Identifiable, Hashable, Sendable {
         self.version = version
         self.executableName = executableName
         self.teamIdentifier = teamIdentifier
+        self.applicationGroups = applicationGroups
+        self.expectedCanonicalParent = expectedCanonicalParent
+            ?? PrivilegedExecutor.canonicalParentPath(forTargetURL: url)
         self.lastUsedDate = lastUsedDate
         self.modifiedDate = modifiedDate
         self.bundleSize = bundleSize

@@ -51,8 +51,11 @@ public struct PrivilegedExecutor: Sendable {
 
     /// Builds an injection-safe AppleScript delegating Trash move to Finder (preserves Put Back metadata).
     /// Uses `appleScriptExpression` so paths containing CR/LF (e.g. `Icon\r`) are preserved accurately.
-    public func buildFinderTrashAppleScript(urls: [URL]) throws -> String {
-        let validated = try validatePaths(urls)
+    public func buildFinderTrashAppleScript(
+        urls: [URL],
+        expectedCanonicalParents: [String: String] = [:]
+    ) throws -> String {
+        let validated = try validatePaths(urls, expectedCanonicalParents: expectedCanonicalParents)
         let posixItems = validated.map { path in
             "(POSIX file (\(ProcessRunner.appleScriptExpression(path))))"
         }.joined(separator: ", ")
@@ -66,31 +69,63 @@ public struct PrivilegedExecutor: Sendable {
 
     /// Builds a POSIX-quoted shell script moving privileged items to the user's `~/.Trash` with unique names.
     ///
-    /// Error-propagation contract:
-    /// Builds an atomic, symlink- and hardlink-safe shell script that moves elevated targets into the
-    /// user's Trash via a root-exclusive `0700` staging directory, verifies no hardlinked inodes are
-    /// chowned, and moves into Trash without following target symlinks (`mv -h -n`).
+    /// Security guarantees (Scheme A):
+    /// - Sets `umask 077` and ignores `$TMPDIR`, staging inside root-only `/private/var/root` when `euid == 0`
+    ///   (or sticky `/private/tmp` in non-root unit tests).
+    /// - Pins each item's scan-time canonical parent directory inside a subshell (`cd -P` + `pwd -P` sentinel check)
+    ///   and moves `./<base>`.
+    /// - Never runs `chown -R` as root (eliminating open-dirfd `linkat(2)` / hardlink / ACL LPE classes).
+    ///   Root-owned regular files and directories moved as root emit `root-owned-trash:<name>` so the UI warns the user.
+    /// - Pins `~/.Trash` inside a subshell verifying BOTH canonical path AND ownership (`stat -f '%u'`), then moves
+    ///   into relative `./<target>` with `mv -h -n`.
+    /// - If placing into Trash fails, attempts rollback to the pinned original parent and emits
+    ///   `trash-move-failed-idx:<idx>` / `trash-move-failed:<path>` (plus `trash-stranded-idx:<idx>:<staged>` whenever
+    ///   rollback fails or is skipped) so `RemovalEngine` surfaces stranded staging paths and never misreports success.
     public func buildPrivilegedTrashShellCommand(
         urls: [URL],
         trashDirectory: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".Trash"),
         uid: uid_t = getuid(),
         gid: gid_t = getgid(),
-        timestamp: String? = nil
+        timestamp: String? = nil,
+        expectedCanonicalParents: [String: String] = [:]
     ) throws -> String {
-        let validated = try validatePaths(urls)
+        _ = gid // Retained in signature for source compatibility; Scheme A intentionally avoids root chown.
+        let validated = try validatePaths(urls, expectedCanonicalParents: expectedCanonicalParents)
         let suffix = timestamp ?? String(UUID().uuidString.prefix(8).lowercased())
-        let trashPath = trashDirectory.standardizedFileURL.path
-        if trashPath.isEmpty || trashPath == "/" || trashPath.contains("\0") {
+        let trashURL = trashDirectory.standardizedFileURL
+        let trashPath = trashURL.path
+        let trashBase = trashURL.lastPathComponent
+        if trashPath.isEmpty || trashPath == "/" || trashPath.contains("\0")
+            || trashBase.isEmpty || trashBase == "." || trashBase == ".." || trashBase.contains("/") {
             throw PrivilegedError.blockedBySafetyGuard(path: trashPath, reason: "Invalid Trash directory")
         }
+        let trashParentPath = trashURL.deletingLastPathComponent().path
+        let expectedTrashParent = Self.canonicalParentPath(for: trashParentPath)
+        let expectedTrash = Self.canonicalParentPath(for: trashPath)
+
         let quotedTrash = ProcessRunner.posixQuote(trashPath)
+        let qTrashParent = ProcessRunner.posixQuote(trashParentPath)
+        let qExpectedTrashParentX = ProcessRunner.posixQuote("\(expectedTrashParent)\nx")
+        let qRelTrashBase = ProcessRunner.posixQuote("./\(trashBase)")
+        let qExpectedTrashX = ProcessRunner.posixQuote("\(expectedTrash)\nx")
         let qSuffix = ProcessRunner.posixQuote(suffix)
+        let targetUID = String(uid)
 
         var statements: [String] = [
+            "umask 077",
             "fail=0",
+            "target_uid=\(targetUID)",
             "[ ! -L \(quotedTrash) ] || exit 1",
-            "[ -d \(quotedTrash) ] || /bin/mkdir -p -- \(quotedTrash) || exit 1",
-            "stage=$(/usr/bin/mktemp -d \"${TMPDIR:-/tmp}/.macsweep-trash.XXXXXXXXXX\") || exit 1",
+            "if [ ! -d \(quotedTrash) ]; then "
+                + "[ \"$(/usr/bin/id -u)\" = \"$target_uid\" ] || exit 1; "
+                + "( cd -P -- \(qTrashParent) 2>/dev/null "
+                + "&& cur_tp=$(pwd -P; printf x) "
+                + "&& [ \"$cur_tp\" = \(qExpectedTrashParentX) ] "
+                + "&& [ \"$(/usr/bin/stat -f '%u' . 2>/dev/null)\" = \"$target_uid\" ] "
+                + "&& /bin/mkdir -- \(qRelTrashBase) ) || exit 1; "
+                + "fi",
+            "if [ \"$(/usr/bin/id -u)\" -eq 0 ]; then stage_base='/private/var/root'; else stage_base='/private/tmp'; fi",
+            "stage=$(/usr/bin/mktemp -d \"$stage_base/.macsweep-trash.XXXXXXXXXX\") || exit 1",
             "/bin/chmod 0700 \"$stage\" || { /bin/rmdir \"$stage\" >/dev/null 2>&1 || true; exit 1; }",
             "trap '/bin/rmdir \"$stage\" >/dev/null 2>&1 || true' EXIT",
         ]
@@ -98,42 +133,57 @@ public struct PrivilegedExecutor: Sendable {
             let url = URL(fileURLWithPath: path)
             let base = url.lastPathComponent
             let parentPath = url.deletingLastPathComponent().path
-            let expectedParent = Self.canonicalParentPath(for: parentPath)
+            let expectedParent = expectedCanonicalParents[path] ?? Self.canonicalParentPath(for: parentPath)
             let qSrc = ProcessRunner.posixQuote(path)
             let qParent = ProcessRunner.posixQuote(parentPath)
-            let qExpectedParent = ProcessRunner.posixQuote(expectedParent)
+            let qExpectedParentX = ProcessRunner.posixQuote("\(expectedParent)\nx")
+            let qRelBase = ProcessRunner.posixQuote("./\(base)")
             let qBase = ProcessRunner.posixQuote(base)
-            let qDest = ProcessRunner.posixQuote("\(trashPath)/\(base)")
-            let qFallback = ProcessRunner.posixQuote("\(trashPath)/\(base)_\(suffix)_\(idx)")
-            let qOwner = ProcessRunner.posixQuote("\(uid):\(gid)")
+            let qFallbackRel = ProcessRunner.posixQuote("\(base)_\(suffix)_\(idx)")
+            let unlockStep = safetyGuard.isUserImmutable(url)
+                ? "{ [ -L \(qRelBase) ] || { [ ! -d \(qRelBase) ] && [ \"$(/usr/bin/stat -f '%l' \(qRelBase) 2>/dev/null)\" != \"1\" ]; } || /usr/bin/chflags -h nouchg -- \(qRelBase) 2>/dev/null || true; } && "
+                : ""
 
-            // 1. Verify parent canonical path matches pre-validated parent (blocks parent-symlink TOCTOU).
-            // 2. Move into root-exclusive 0700 `$stage` before any ownership change.
-            // 3. Refuse `chown -R -P` if any non-directory hardlink (`nlink > 1`) exists inside `$staged`
-            //    to prevent deterministic hardlink-to-root LPE; only chown dirs and `nlink == 1` entries.
-            // 4. Move from `$stage` into Trash using `mv -h -n` (never follows symlinked target dir,
-            //    never overwrites existing entry, and never runs `chown` inside user-writable `~/.Trash`).
             statements.append(
-                "{ cur_p=$(cd -P -- \(qParent) 2>/dev/null && pwd -P); "
-                    + "[ \"$cur_p\" = \(qExpectedParent) ] && "
-                    + "staged=\"$stage/item_\(idx)\" && "
-                    + "/bin/mv -h -n -- \(qSrc) \"$staged\" && "
-                    + "[ ! -e \(qSrc) ] && [ ! -L \(qSrc) ] && "
-                    + "{ if [ -z \"$(/usr/bin/find -P \"$staged\" ! -type d -links +1 -print -quit 2>/dev/null)\" ]; then "
-                    + "/usr/sbin/chown -R -P -- \(qOwner) \"$staged\" || { echo \"chown-failed:$staged\" >&2; fail=1; }; "
-                    + "else "
-                    + "/usr/bin/find -P \"$staged\" \\( -type d -o -links 1 \\) -exec /usr/sbin/chown -h -- \(qOwner) {} + 2>/dev/null || true; "
-                    + "echo \"chown-failed:$staged (hardlink)\" >&2; fail=1; "
-                    + "fi; } && "
-                    + "{ target=\(qDest); "
-                    + "if [ -e \(qDest) ] || [ -L \(qDest) ]; then target=\(qFallback); fi; "
-                    + "if [ -e \"$target\" ] || [ -L \"$target\" ]; then "
+                "{ staged=\"$stage/item_\(idx)\"; "
+                    + "if ( cd -P -- \(qParent) 2>/dev/null "
+                    + "&& cur_p=$(pwd -P; printf x) "
+                    + "&& [ \"$cur_p\" = \(qExpectedParentX) ] "
+                    + "&& { [ -e \(qRelBase) ] || [ -L \(qRelBase) ]; } "
+                    + "&& \(unlockStep)/bin/mv -h -n -- \(qRelBase) \"$staged\" "
+                    + "&& [ ! -e \(qRelBase) ] && [ ! -L \(qRelBase) ] ); then "
+                    + "was_root_item=0; "
+                    + "if [ \"$(/usr/bin/id -u)\" -eq 0 ] && [ \"$target_uid\" != \"0\" ] "
+                    + "&& [ ! -L \"$staged\" ] && { [ -d \"$staged\" ] || [ -f \"$staged\" ]; } "
+                    + "&& [ \"$(/usr/bin/stat -f '%u' \"$staged\" 2>/dev/null)\" = \"0\" ]; then "
+                    + "was_root_item=1; fi; "
+                    + "if ! ( cd -P -- \(quotedTrash) 2>/dev/null "
+                    + "&& cur_t=$(pwd -P; printf x) "
+                    + "&& [ \"$cur_t\" = \(qExpectedTrashX) ] "
+                    + "&& [ \"$(/usr/bin/stat -f '%u' . 2>/dev/null)\" = \"$target_uid\" ] "
+                    + "&& rel_target=\(qBase) "
+                    + "&& { if [ -e \"./$rel_target\" ] || [ -L \"./$rel_target\" ]; then rel_target=\(qFallbackRel); fi; } "
+                    + "&& { if [ -e \"./$rel_target\" ] || [ -L \"./$rel_target\" ]; then "
                     + "rnd=$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]' | /usr/bin/cut -c1-8); "
-                    + "target=\(quotedTrash)/\(qBase)_\(qSuffix)_\(idx)_\"$rnd\"; fi; "
-                    + "[ ! -e \"$target\" ] && [ ! -L \"$target\" ] && "
-                    + "/bin/mv -h -n -- \"$staged\" \"$target\" && "
-                    + "[ ! -e \"$staged\" ] && [ ! -L \"$staged\" ]; }; "
-                    + "} || fail=1"
+                    + "rel_target=\(qBase)_\(qSuffix)_\(idx)_\"$rnd\"; fi; } "
+                    + "&& [ ! -e \"./$rel_target\" ] && [ ! -L \"./$rel_target\" ] "
+                    + "&& /bin/mv -h -n -- \"$staged\" \"./$rel_target\" "
+                    + "&& [ ! -e \"$staged\" ] && [ ! -L \"$staged\" ] "
+                    + "&& { [ \"$was_root_item\" -eq 0 ] || { printf 'root-owned-trash:%s\\n' \"$rel_target\" || true; printf 'root-owned-trash:%s\\n' \"$rel_target\" >&2 || true; }; } ); then "
+                    + "( cd -P -- \(qParent) 2>/dev/null "
+                    + "&& cur_p=$(pwd -P; printf x) "
+                    + "&& [ \"$cur_p\" = \(qExpectedParentX) ] "
+                    + "&& [ ! -e \(qRelBase) ] && [ ! -L \(qRelBase) ] "
+                    + "&& /bin/mv -h -n -- \"$staged\" \(qRelBase) >/dev/null 2>&1 ) || true; "
+                    + "if [ -e \"$staged\" ] || [ -L \"$staged\" ]; then "
+                    + "printf 'trash-stranded-idx:%s:%s\\n' '\(idx)' \"$staged\" >&2; fi; "
+                    + "printf 'trash-move-failed-idx:%s\\ntrash-move-failed:%s\\n' '\(idx)' \(qSrc) >&2; "
+                    + "fail=1; fi; "
+                    + "else "
+                    + "if [ -e \"$staged\" ] || [ -L \"$staged\" ]; then "
+                    + "printf 'trash-stranded-idx:%s:%s\\n' '\(idx)' \"$staged\" >&2; "
+                    + "printf 'trash-move-failed-idx:%s\\ntrash-move-failed:%s\\n' '\(idx)' \(qSrc) >&2; fi; "
+                    + "fail=1; fi; }"
             )
         }
         statements.append("exit $fail")
@@ -143,30 +193,38 @@ public struct PrivilegedExecutor: Sendable {
     /// Builds a POSIX-quoted permanent delete script plus optional `pkgutil --forget`.
     ///
     /// Error-propagation contract:
-    /// - Re-verifies each item's canonical parent directory right before `rm -rf` to block parent-symlink TOCTOU.
+    /// - Pins each item's scan-time canonical parent directory inside a subshell (`cd -P` + `pwd -P` sentinel check)
+    ///   and operates strictly on relative `./<base>` to block parent-symlink TOCTOU.
     /// - The exit status of `rm` is captured into `ec` and is the exit status of the whole script.
     /// - Receipt forgetting is best-effort, runs ONLY when `rm` succeeded, and lives in its own group so its
     ///   `|| true` can never swallow the `rm` status.
     public func buildPermanentDeleteShellCommand(
         urls: [URL],
-        packageIDsToForget: [String] = []
+        packageIDsToForget: [String] = [],
+        expectedCanonicalParents: [String: String] = [:]
     ) throws -> String {
-        let validated = try validatePaths(urls)
+        let validated = try validatePaths(urls, expectedCanonicalParents: expectedCanonicalParents)
         let safePkgIDs = Self.sanitizedPackageIDs(packageIDsToForget)
         guard !validated.isEmpty || !safePkgIDs.isEmpty else { return "" }
 
         var statements: [String] = ["ec=0"]
         for path in validated {
             let url = URL(fileURLWithPath: path)
+            let base = url.lastPathComponent
             let parentPath = url.deletingLastPathComponent().path
-            let expectedParent = Self.canonicalParentPath(for: parentPath)
-            let qPath = ProcessRunner.posixQuote(path)
+            let expectedParent = expectedCanonicalParents[path] ?? Self.canonicalParentPath(for: parentPath)
             let qParent = ProcessRunner.posixQuote(parentPath)
-            let qExpectedParent = ProcessRunner.posixQuote(expectedParent)
+            let qExpectedParentX = ProcessRunner.posixQuote("\(expectedParent)\nx")
+            let qRelBase = ProcessRunner.posixQuote("./\(base)")
+            let unlockStep = safetyGuard.isUserImmutable(url)
+                ? "{ [ -L \(qRelBase) ] || { [ ! -d \(qRelBase) ] && [ \"$(/usr/bin/stat -f '%l' \(qRelBase) 2>/dev/null)\" != \"1\" ]; } || /usr/bin/chflags -h nouchg -- \(qRelBase) 2>/dev/null || true; } && "
+                : ""
             statements.append(
-                "{ { [ ! -e \(qPath) ] && [ ! -L \(qPath) ]; } || "
-                    + "{ cur_p=$(cd -P -- \(qParent) 2>/dev/null && pwd -P); "
-                    + "[ \"$cur_p\" = \(qExpectedParent) ] && /bin/rm -rf -- \(qPath); }; } || ec=1"
+                "{ { [ ! -e \(qParent) ] && [ ! -L \(qParent) ]; } || "
+                    + "( cd -P -- \(qParent) 2>/dev/null "
+                    + "&& cur_p=$(pwd -P; printf x) "
+                    + "&& [ \"$cur_p\" = \(qExpectedParentX) ] "
+                    + "&& { { [ ! -e \(qRelBase) ] && [ ! -L \(qRelBase) ]; } || { \(unlockStep)/bin/rm -rf -- \(qRelBase); }; } ); } || ec=1"
             )
         }
         if !safePkgIDs.isEmpty {
@@ -204,9 +262,12 @@ public struct PrivilegedExecutor: Sendable {
 
     /// Option A1: Delegates Trash move to Finder so macOS preserves "Put Back" ("放回原处")
     /// and prompts Touch ID / password natively when needed.
-    public func moveToTrashViaFinder(urls: [URL]) throws {
+    public func moveToTrashViaFinder(
+        urls: [URL],
+        expectedCanonicalParents: [String: String] = [:]
+    ) throws {
         guard !urls.isEmpty else { return }
-        let script = try buildFinderTrashAppleScript(urls: urls)
+        let script = try buildFinderTrashAppleScript(urls: urls, expectedCanonicalParents: expectedCanonicalParents)
         let res = finderAppleScriptRunner?(script)
             ?? ProcessRunner.run(executable: "/usr/bin/osascript", arguments: ["-"], stdinData: Data(script.utf8))
         if res.succeeded { return }
@@ -222,24 +283,57 @@ public struct PrivilegedExecutor: Sendable {
     }
 
     /// Fallback for Option A1 if Finder automation is denied or Finder cannot handle an entry:
-    /// elevated single-prompt staged move to `~/.Trash` with hardlink-safe ownership handoff.
-    public func moveToTrashPrivileged(urls: [URL]) throws {
-        guard !urls.isEmpty else { return }
-        let shellCmd = try buildPrivilegedTrashShellCommand(urls: urls, trashDirectory: trashDirectory)
-        try runWithAdministratorPrivileges(shellCommand: shellCmd)
+    /// elevated single-prompt staged move to `~/.Trash` without running `chown -R` as root.
+    public func moveToTrashPrivileged(
+        urls: [URL],
+        expectedCanonicalParents: [String: String] = [:]
+    ) throws {
+        _ = try moveToTrashPrivilegedWithOutput(urls: urls, expectedCanonicalParents: expectedCanonicalParents)
+    }
+
+    internal func moveToTrashPrivilegedWithOutput(
+        urls: [URL],
+        expectedCanonicalParents: [String: String] = [:]
+    ) throws -> ProcessResult {
+        guard !urls.isEmpty else { return ProcessResult(exitCode: 0, stdout: "", stderr: "") }
+        if adminShellRunner == nil,
+           !safetyGuard.isSymbolicLink(trashDirectory),
+           !RemovalEngine.entryExists(trashDirectory) {
+            try? FileManager.default.createDirectory(
+                at: trashDirectory,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
+        }
+        let shellCmd = try buildPrivilegedTrashShellCommand(
+            urls: urls,
+            trashDirectory: trashDirectory,
+            expectedCanonicalParents: expectedCanonicalParents
+        )
+        return try runWithAdministratorPrivileges(shellCommand: shellCmd)
     }
 
     /// Permanent removal + optional `pkgutil --forget` in one administrator prompt.
-    public func removePermanentlyPrivileged(urls: [URL], packageIDsToForget: [String] = []) throws {
+    public func removePermanentlyPrivileged(
+        urls: [URL],
+        packageIDsToForget: [String] = [],
+        expectedCanonicalParents: [String: String] = [:]
+    ) throws {
         guard !urls.isEmpty || !packageIDsToForget.isEmpty else { return }
-        let shellCmd = try buildPermanentDeleteShellCommand(urls: urls, packageIDsToForget: packageIDsToForget)
+        let shellCmd = try buildPermanentDeleteShellCommand(
+            urls: urls,
+            packageIDsToForget: packageIDsToForget,
+            expectedCanonicalParents: expectedCanonicalParents
+        )
         guard !shellCmd.isEmpty else { return }
-        try runWithAdministratorPrivileges(shellCommand: shellCmd)
+        _ = try runWithAdministratorPrivileges(shellCommand: shellCmd)
     }
 
     /// Executes an arbitrary validated shell command with macOS administrator prompt.
+    /// Restricted to `internal` so external callers cannot pass arbitrary shell commands.
     /// Passes the AppleScript via stdin (`/usr/bin/osascript -`) so target paths never leak in `ps` `argv`.
-    public func runWithAdministratorPrivileges(shellCommand: String) throws {
+    @discardableResult
+    internal func runWithAdministratorPrivileges(shellCommand: String) throws -> ProcessResult {
         let res: ProcessResult
         if let adminShellRunner {
             res = adminShellRunner(shellCommand)
@@ -248,7 +342,7 @@ public struct PrivilegedExecutor: Sendable {
             let script = "do shell script (\(expr)) with administrator privileges"
             res = ProcessRunner.run(executable: "/usr/bin/osascript", arguments: ["-"], stdinData: Data(script.utf8))
         }
-        if res.succeeded { return }
+        if res.succeeded { return res }
 
         let err = res.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
         if err.contains("(-128)") || err.localizedCaseInsensitiveContains("User canceled") {
@@ -257,7 +351,10 @@ public struct PrivilegedExecutor: Sendable {
         throw PrivilegedError.commandFailed(detail: err.isEmpty ? "Administrator command failed" : err)
     }
 
-    private func validatePaths(_ urls: [URL]) throws -> [String] {
+    private func validatePaths(
+        _ urls: [URL],
+        expectedCanonicalParents: [String: String] = [:]
+    ) throws -> [String] {
         var validated: [String] = []
         validated.reserveCapacity(urls.count)
         for url in urls {
@@ -265,7 +362,22 @@ public struct PrivilegedExecutor: Sendable {
             let result = safetyGuard.validateForRemoval(url)
             switch result {
             case .allowed:
-                validated.append(url.standardizedFileURL.path)
+                let std = url.standardizedFileURL
+                let base = std.lastPathComponent
+                guard !base.isEmpty, base != ".", base != "..", !base.contains("/") else {
+                    throw PrivilegedError.blockedBySafetyGuard(path: url.path, reason: "Invalid target basename")
+                }
+                if let expectedParent = expectedCanonicalParents[std.path] {
+                    let parentURL = std.deletingLastPathComponent()
+                    let liveParent = Self.canonicalParentPath(for: parentURL.path)
+                    if liveParent != expectedParent {
+                        throw PrivilegedError.blockedBySafetyGuard(
+                            path: std.path,
+                            reason: "Parent directory changed since scan (TOCTOU blocked)"
+                        )
+                    }
+                }
+                validated.append(std.path)
             case let .blocked(reason):
                 throw PrivilegedError.blockedBySafetyGuard(path: url.path, reason: reason)
             }
@@ -273,13 +385,46 @@ public struct PrivilegedExecutor: Sendable {
         return validated
     }
 
+    /// Resolves the canonical parent directory of a target file/bundle URL at scan/discovery time.
+    public static func canonicalParentPath(forTargetURL url: URL) -> String {
+        canonicalParentPath(for: url.standardizedFileURL.deletingLastPathComponent().path)
+    }
+
     /// Resolves `parentPath` using POSIX `realpath(3)` so it matches `/bin/sh`'s `cd -P && pwd -P`
     /// identically (unlike Foundation's `resolvingSymlinksInPath`, which strips `/private` on macOS).
-    private static func canonicalParentPath(for parentPath: String) -> String {
+    /// On failure (e.g. `EACCES` or `ENOENT`), resolves the deepest existing ancestor and normalizes
+    /// macOS `/var`, `/tmp`, `/etc` roots to `/private/...`.
+    public static func canonicalParentPath(for parentPath: String) -> String {
         if let resolved = realpath(parentPath, nil) {
             defer { free(resolved) }
             return String(cString: resolved)
         }
-        return URL(fileURLWithPath: parentPath).resolvingSymlinksInPath().standardizedFileURL.path
+        var current = URL(fileURLWithPath: parentPath).standardizedFileURL
+        var trailing: [String] = []
+        while current.path != "/" {
+            let parent = current.deletingLastPathComponent()
+            if parent.path == current.path { break }
+            trailing.append(current.lastPathComponent)
+            current = parent
+            if let resolved = realpath(current.path, nil) {
+                defer { free(resolved) }
+                var base = URL(fileURLWithPath: String(cString: resolved))
+                for comp in trailing.reversed() {
+                    base.appendPathComponent(comp)
+                }
+                return applyMacOSPrivatePrefix(base.standardizedFileURL.path)
+            }
+        }
+        let fallback = URL(fileURLWithPath: parentPath).resolvingSymlinksInPath().standardizedFileURL.path
+        return applyMacOSPrivatePrefix(fallback)
+    }
+
+    private static func applyMacOSPrivatePrefix(_ path: String) -> String {
+        for prefix in ["/var", "/tmp", "/etc"] {
+            if path == prefix || path.hasPrefix(prefix + "/") {
+                return "/private" + path
+            }
+        }
+        return path
     }
 }

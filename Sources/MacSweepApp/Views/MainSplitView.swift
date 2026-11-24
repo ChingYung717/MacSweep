@@ -56,7 +56,7 @@ struct MainSplitView: View {
                         .controlSize(.mini)
                     }
 
-                    if !banner.forceQuitBundleIDs.isEmpty {
+                    if !banner.forceQuitBundleIDs.isEmpty || !banner.forceQuitBundleURLs.isEmpty {
                         Button(state.l10n.t("强制退出", "Force Quit")) {
                             let ids = banner.forceQuitBundleIDs
                             let urls = banner.forceQuitBundleURLs
