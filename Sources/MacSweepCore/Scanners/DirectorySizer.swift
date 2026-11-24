@@ -3,10 +3,14 @@ import Foundation
 
 public struct DirectorySizeMeasurement: Sendable, Equatable {
     public let bytes: Int64
+    public let fileCount: Int
+    public let folderCount: Int
     public let isTruncated: Bool
 
-    public init(bytes: Int64, isTruncated: Bool) {
+    public init(bytes: Int64, fileCount: Int = 0, folderCount: Int = 0, isTruncated: Bool) {
         self.bytes = bytes
+        self.fileCount = fileCount
+        self.folderCount = folderCount
         self.isTruncated = isTruncated
     }
 }
@@ -14,7 +18,7 @@ public struct DirectorySizeMeasurement: Sendable, Equatable {
 /// Concurrent, bounded, cached disk-size calculator that skips symbolic links to avoid loops.
 public actor DirectorySizer {
     public static let defaultMaxEntriesPerDirectory: Int = 250_000
-    private var cache: [String: Int64] = [:]
+    private var cache: [String: DirectorySizeMeasurement] = [:]
 
     public init() {}
 
@@ -30,32 +34,38 @@ public actor DirectorySizer {
         cache[URL(fileURLWithPath: path).standardizedFileURL.path] != nil
     }
 
-    public func size(
+    public func measure(
         of url: URL,
         useCache: Bool = true,
         maxEntries: Int = defaultMaxEntriesPerDirectory
-    ) -> Int64 {
+    ) -> DirectorySizeMeasurement {
         let key = url.standardizedFileURL.path
         if useCache, let cached = cache[key] {
             return cached
         }
         let measurement = Self.measureSizeSync(of: url, maxEntries: maxEntries)
         if useCache && !measurement.isTruncated {
-            cache[key] = measurement.bytes
+            cache[key] = measurement
         }
-        return measurement.bytes
+        return measurement
     }
 
-    /// Computes sizes for multiple URLs concurrently with a fixed concurrency bound.
-    /// Truncated measurements (hitting `maxEntries` or cancellation) are returned for display
-    /// without being permanently cached as authoritative sizes.
-    public func sizes(
+    public func size(
+        of url: URL,
+        useCache: Bool = true,
+        maxEntries: Int = defaultMaxEntriesPerDirectory
+    ) -> Int64 {
+        measure(of: url, useCache: useCache, maxEntries: maxEntries).bytes
+    }
+
+    /// Computes full size + file/folder measurements for multiple URLs concurrently.
+    public func measurements(
         of urls: [URL],
         maxConcurrency: Int = 6,
         useCache: Bool = true,
         maxEntries: Int = defaultMaxEntriesPerDirectory
-    ) async -> [String: Int64] {
-        var results: [String: Int64] = [:]
+    ) async -> [String: DirectorySizeMeasurement] {
+        var results: [String: DirectorySizeMeasurement] = [:]
         var toCompute: [URL] = []
 
         for url in urls {
@@ -87,9 +97,9 @@ public actor DirectorySizer {
                     group.cancelAll()
                     break
                 }
-                results[key] = measurement.bytes
+                results[key] = measurement
                 if useCache && !measurement.isTruncated {
-                    cache[key] = measurement.bytes
+                    cache[key] = measurement
                 }
                 if index < toCompute.count {
                     let target = toCompute[index]
@@ -102,6 +112,24 @@ public actor DirectorySizer {
         }
 
         return results
+    }
+
+    /// Computes sizes for multiple URLs concurrently with a fixed concurrency bound.
+    /// Truncated measurements (hitting `maxEntries` or cancellation) are returned for display
+    /// without being permanently cached as authoritative sizes.
+    public func sizes(
+        of urls: [URL],
+        maxConcurrency: Int = 6,
+        useCache: Bool = true,
+        maxEntries: Int = defaultMaxEntriesPerDirectory
+    ) async -> [String: Int64] {
+        let map = await measurements(
+            of: urls,
+            maxConcurrency: maxConcurrency,
+            useCache: useCache,
+            maxEntries: maxEntries
+        )
+        return map.mapValues(\.bytes)
     }
 
     public nonisolated static func computeSizeSync(
@@ -118,21 +146,22 @@ public actor DirectorySizer {
         let path = url.path
         var st = stat()
         guard lstat(path, &st) == 0 else {
-            return DirectorySizeMeasurement(bytes: 0, isTruncated: false)
+            return DirectorySizeMeasurement(bytes: 0, fileCount: 0, folderCount: 0, isTruncated: false)
         }
 
         let fileType = st.st_mode & S_IFMT
         if fileType == S_IFLNK {
             // Symbolic link itself occupies negligible metadata blocks; never follow target.
-            return DirectorySizeMeasurement(bytes: Int64(st.st_size), isTruncated: false)
+            return DirectorySizeMeasurement(bytes: Int64(st.st_size), fileCount: 1, folderCount: 0, isTruncated: false)
         }
         if fileType != S_IFDIR {
             let bytes = st.st_blocks > 0 ? Int64(st.st_blocks) * 512 : Int64(st.st_size)
-            return DirectorySizeMeasurement(bytes: bytes, isTruncated: false)
+            return DirectorySizeMeasurement(bytes: bytes, fileCount: 1, folderCount: 0, isTruncated: false)
         }
 
         let keys: Set<URLResourceKey> = [
             .isRegularFileKey,
+            .isDirectoryKey,
             .isSymbolicLinkKey,
             .totalFileAllocatedSizeKey,
             .fileAllocatedSizeKey,
@@ -144,11 +173,13 @@ public actor DirectorySizer {
             options: [],
             errorHandler: { _, _ in true }
         ) else {
-            return DirectorySizeMeasurement(bytes: 0, isTruncated: false)
+            return DirectorySizeMeasurement(bytes: 0, fileCount: 0, folderCount: 0, isTruncated: false)
         }
 
         let cap = max(0, maxEntries)
         var total: Int64 = 0
+        var fileCount = 0
+        var folderCount = 0
         var visited = 0
         var isTruncated = false
         for case let itemURL as URL in enumerator {
@@ -163,9 +194,15 @@ public actor DirectorySizer {
             }
             guard let values = try? itemURL.resourceValues(forKeys: keys) else { continue }
             if values.isSymbolicLink == true {
+                fileCount += 1
+                continue
+            }
+            if values.isDirectory == true {
+                folderCount += 1
                 continue
             }
             if values.isRegularFile == true {
+                fileCount += 1
                 if let allocated = values.totalFileAllocatedSize ?? values.fileAllocatedSize {
                     total += Int64(allocated)
                 } else if let size = values.fileSize {
@@ -173,6 +210,11 @@ public actor DirectorySizer {
                 }
             }
         }
-        return DirectorySizeMeasurement(bytes: total, isTruncated: isTruncated)
+        return DirectorySizeMeasurement(
+            bytes: total,
+            fileCount: fileCount,
+            folderCount: folderCount,
+            isTruncated: isTruncated
+        )
     }
 }

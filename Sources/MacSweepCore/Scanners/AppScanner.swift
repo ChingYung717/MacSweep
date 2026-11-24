@@ -351,9 +351,14 @@ public struct AppScanner: Sendable {
         let localizedViaFS = Self.strippingAppExtension(fm.displayName(atPath: appURL.path))
         let finalLocalizedName = !localizedViaFS.isEmpty ? localizedViaFS : displayName
 
-        let signing = Self.extractSigningMetadata(at: appURL)
+        let signing = Self.extractDetailedSigningMetadata(at: appURL)
         let teamID = signing.identity?.teamIdentifier
         let applicationGroups = signing.applicationGroups
+        let architectures = Self.extractArchitectures(from: bundle)
+        let minimumSystemVersion = (info["LSMinimumSystemVersion"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let embedded = Self.extractVerifiedEmbeddedBundles(at: appURL, parentTeamID: teamID, parentBundleID: bundleID)
+        let helperLabels = Self.extractPrivilegedHelperLabels(from: info, teamID: teamID)
         let expectedCanonicalParent = PrivilegedExecutor.canonicalParentPath(forTargetURL: appURL)
         let resVals = try? appURL.resourceValues(forKeys: [.contentModificationDateKey, .contentAccessDateKey])
         let spotlightLastUsed = Self.spotlightLastUsedDate(for: appURL)
@@ -384,6 +389,9 @@ public struct AppScanner: Sendable {
             isRunning = false
         }
 
+        let resolvedDeveloper = signing.developerName
+            ?? Self.fallbackDeveloperName(from: info, isApple: isSystemProtected || isAppleAppStoreApp)
+
         return AppItem(
             url: appURL,
             name: rawName,
@@ -392,7 +400,14 @@ public struct AppScanner: Sendable {
             version: version,
             executableName: executableName,
             teamIdentifier: teamID,
+            developerName: resolvedDeveloper,
+            verificationStatus: signing.verificationStatus,
+            architectures: architectures,
+            minimumSystemVersion: (minimumSystemVersion?.isEmpty == false) ? minimumSystemVersion : nil,
             applicationGroups: applicationGroups,
+            embeddedBundleIDs: embedded.bundleIDs,
+            embeddedAppNames: embedded.appNames,
+            privilegedHelperLabels: helperLabels,
             expectedCanonicalParent: expectedCanonicalParent,
             lastUsedDate: lastUsed,
             modifiedDate: modified,
@@ -475,7 +490,17 @@ public struct AppScanner: Sendable {
     }
 
     private static let appleGenericRequirementString = "anchor apple generic"
+    private static let appleOSOnlyRequirementString = "anchor apple"
+    private static let appleAppStoreRequirementString = "anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.9]"
+    private static let appleDeveloperIDRequirementString = "anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13]"
     private static let appleOfficialRequirementString = "anchor apple or (anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.9])"
+
+    public struct AppSigningDetails: Sendable {
+        public let identity: CodeSigningIdentity?
+        public let applicationGroups: [String]
+        public let developerName: String?
+        public let verificationStatus: AppVerificationStatus
+    }
 
     private static func makeRequirement(_ text: String) -> SecRequirement? {
         var req: SecRequirement?
@@ -515,35 +540,41 @@ public struct AppScanner: Sendable {
         return signedID.lowercased() == lowerExpected
     }
 
-    /// Extracts cryptographically verified signing identity and `com.apple.security.application-groups`
-    /// entitlements from an `.app` bundle passing `anchor apple generic` (rejects unsigned, ad-hoc, and
-    /// arbitrary self-signed certificates).
-    public static func extractSigningMetadata(
-        at appURL: URL
-    ) -> (identity: CodeSigningIdentity?, applicationGroups: [String]) {
+    /// Extracts cryptographically verified signing identity, `com.apple.security.application-groups`,
+    /// human-readable developer name, and verification status from an `.app` passing `anchor apple generic`.
+    public static func extractDetailedSigningMetadata(at appURL: URL) -> AppSigningDetails {
         guard !isSymbolicLink(at: appURL) else {
-            return (nil, [])
+            return AppSigningDetails(identity: nil, applicationGroups: [], developerName: nil, verificationStatus: .adHocOrUnsigned)
         }
         var staticCode: SecStaticCode?
         guard SecStaticCodeCreateWithPath(appURL as CFURL, SecCSFlags(), &staticCode) == errSecSuccess,
               let code = staticCode,
               let genericReq = makeRequirement(appleGenericRequirementString) else {
-            return (nil, [])
+            return AppSigningDetails(identity: nil, applicationGroups: [], developerName: nil, verificationStatus: .adHocOrUnsigned)
         }
         let checkFlags = SecCSFlags(rawValue: kSecCSDoNotValidateResources)
         guard SecStaticCodeCheckValidity(code, checkFlags, genericReq) == errSecSuccess else {
-            return (nil, [])
+            return AppSigningDetails(identity: nil, applicationGroups: [], developerName: nil, verificationStatus: .adHocOrUnsigned)
         }
-        let isAppleSigned: Bool = {
-            guard let appleReq = makeRequirement(appleOfficialRequirementString) else { return false }
-            return SecStaticCodeCheckValidity(code, checkFlags, appleReq) == errSecSuccess
+        let isAppleOS: Bool = {
+            guard let req = makeRequirement(appleOSOnlyRequirementString) else { return false }
+            return SecStaticCodeCheckValidity(code, checkFlags, req) == errSecSuccess
         }()
+        let isAppStore: Bool = {
+            guard let req = makeRequirement(appleAppStoreRequirementString) else { return false }
+            return SecStaticCodeCheckValidity(code, checkFlags, req) == errSecSuccess
+        }()
+        let isDeveloperID: Bool = {
+            guard let req = makeRequirement(appleDeveloperIDRequirementString) else { return false }
+            return SecStaticCodeCheckValidity(code, checkFlags, req) == errSecSuccess
+        }()
+        let isAppleSigned = isAppleOS || isAppStore
 
         var infoRef: CFDictionary?
         let flags = SecCSFlags(rawValue: kSecCSSigningInformation)
         guard SecCodeCopySigningInformation(code, flags, &infoRef) == errSecSuccess,
               let dict = infoRef as? [String: Any] else {
-            return (nil, [])
+            return AppSigningDetails(identity: nil, applicationGroups: [], developerName: nil, verificationStatus: .adHocOrUnsigned)
         }
         let rawTeam = (dict[kSecCodeInfoTeamIdentifier as String] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -567,12 +598,260 @@ public struct AppScanner: Sendable {
             }
         }
 
+        let developerName = Self.extractDeveloperName(from: dict, isAppleOS: isAppleOS)
+        let codeFlags = (dict[kSecCodeInfoFlags as String] as? UInt32) ?? 0
+        let hasHardenedRuntime = (codeFlags & SecCodeSignatureFlags.runtime.rawValue) != 0
+        let hasTimestamp = dict[kSecCodeInfoTimestamp as String] != nil
+        let hasStapledTicket = FileManager.default.fileExists(
+            atPath: appURL.appendingPathComponent("Contents/CodeResources").path
+        ) && (
+            dict["notarization-date"] != nil
+                || FileManager.default.fileExists(
+                    atPath: appURL.appendingPathComponent("Contents/CodeSignature/CodeTicket").path
+                )
+        )
+        let hasMASReceipt = FileManager.default.fileExists(
+            atPath: appURL.appendingPathComponent("Contents/_MASReceipt/receipt").path
+        )
+
+        let verificationStatus: AppVerificationStatus
+        if isAppleOS {
+            verificationStatus = .appleSystem
+        } else if isAppStore || hasMASReceipt {
+            verificationStatus = .appStore
+        } else if isDeveloperID && (hasStapledTicket || (hasHardenedRuntime && hasTimestamp)) {
+            verificationStatus = .notarized
+        } else {
+            verificationStatus = .developerSigned
+        }
+
         let identity = CodeSigningIdentity(
             teamIdentifier: team,
             signingIdentifier: signedID,
             isAppleSigned: isAppleSigned
         )
-        return (identity, groups)
+        return AppSigningDetails(
+            identity: identity,
+            applicationGroups: groups,
+            developerName: developerName,
+            verificationStatus: verificationStatus
+        )
+    }
+
+    /// Extracts cryptographically verified signing identity and `com.apple.security.application-groups`
+    /// entitlements from an `.app` bundle passing `anchor apple generic` (rejects unsigned, ad-hoc, and
+    /// arbitrary self-signed certificates).
+    public static func extractSigningMetadata(
+        at appURL: URL
+    ) -> (identity: CodeSigningIdentity?, applicationGroups: [String]) {
+        let details = extractDetailedSigningMetadata(at: appURL)
+        return (details.identity, details.applicationGroups)
+    }
+
+    private static func extractDeveloperName(from signingDict: [String: Any], isAppleOS: Bool) -> String? {
+        if isAppleOS {
+            return "Apple Inc."
+        }
+        guard let certs = signingDict[kSecCodeInfoCertificates as String] as? [SecCertificate],
+              let leaf = certs.first,
+              let rawSummary = SecCertificateCopySubjectSummary(leaf) as String? else {
+            return nil
+        }
+        let rawSummaryTrimmed = rawSummary.trimmingCharacters(in: .whitespacesAndNewlines)
+        if rawSummaryTrimmed == "Apple Mac OS Application Signing"
+            || rawSummaryTrimmed == "Apple Mac OS Application Signing (Mac App Store)" {
+            return nil
+        }
+        var cleaned = rawSummaryTrimmed
+        let prefixes = [
+            "Developer ID Application: ",
+            "Developer ID Installer: ",
+            "3rd Party Mac Developer Application: ",
+            "Apple Distribution: ",
+            "Apple Development: ",
+            "Mac Developer: ",
+        ]
+        for prefix in prefixes where cleaned.hasPrefix(prefix) {
+            cleaned = String(cleaned.dropFirst(prefix.count))
+            break
+        }
+        // Strip trailing ` (TEAMID)` suffix such as `Docker Inc (9BNSXJN65R)`.
+        if cleaned.hasSuffix(")"),
+           let openIdx = cleaned.lastIndex(of: "("),
+           openIdx > cleaned.startIndex {
+            let teamToken = cleaned[cleaned.index(after: openIdx)..<cleaned.index(before: cleaned.endIndex)]
+            if teamToken.count == 10, teamToken.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber) }) {
+                cleaned = String(cleaned[..<openIdx]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return cleaned.isEmpty ? nil : cleaned
+    }
+
+    private static func fallbackDeveloperName(from info: [String: Any], isApple: Bool) -> String? {
+        if isApple { return "Apple Inc." }
+        if let copyright = (info["NSHumanReadableCopyright"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !copyright.isEmpty {
+            var cleaned = copyright
+            // Clean leading "Copyright © 2024 " boilerplate for concise display
+            if let range = cleaned.range(
+                of: #"^(?:copyright\s*)?(?:©|\(c\))?\s*(?:\d{4}(?:\s*[-–—]\s*\d{4})?\s*)?(?:by\s+)?"#,
+                options: [.regularExpression, .caseInsensitive]
+            ) {
+                let stripped = String(cleaned[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !stripped.isEmpty {
+                    cleaned = stripped
+                }
+            }
+            if let dotRange = cleaned.range(of: "All rights reserved", options: .caseInsensitive) {
+                cleaned = String(cleaned[..<dotRange.lowerBound])
+                    .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ".,;·-")))
+            }
+            if !cleaned.isEmpty, cleaned.count <= 64 {
+                return cleaned
+            }
+        }
+        return nil
+    }
+
+    private static func extractArchitectures(from bundle: Bundle?) -> [String] {
+        guard let rawArchs = bundle?.executableArchitectures else { return [] }
+        var out: [String] = []
+        for num in rawArchs {
+            switch num.intValue {
+            case NSBundleExecutableArchitectureARM64:
+                if !out.contains("arm64") { out.append("arm64") }
+            case NSBundleExecutableArchitectureX86_64:
+                if !out.contains("x86_64") { out.append("x86_64") }
+            default:
+                break
+            }
+        }
+        return out
+    }
+
+    /// Scans verified embedded `.app` sub-bundles (e.g. `Docker Desktop.app`, `DockerHelper.app`)
+    /// strictly requiring the same cryptographically verified `teamIdentifier` as the parent `.app`,
+    /// preventing unsigned or spoofed bundles from injecting unrelated bundle IDs or names.
+    public static func extractVerifiedEmbeddedBundles(
+        at appURL: URL,
+        parentTeamID: String?,
+        parentBundleID: String
+    ) -> (bundleIDs: [String], appNames: [String]) {
+        guard !isSymbolicLink(at: appURL),
+              let team = parentTeamID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !team.isEmpty else {
+            return ([], [])
+        }
+        let lowerTeam = team.lowercased()
+        let lowerParentBID = parentBundleID.lowercased()
+        let fm = FileManager.default
+        let searchRelDirs = [
+            "Contents/MacOS",
+            "Contents/Library/LoginItems",
+            "Contents/Library/SecretsEngine",
+            "Contents/Helpers",
+        ]
+
+        var bundleIDs: [String] = []
+        var appNames: [String] = []
+        var seenIDs = Set<String>([lowerParentBID])
+        var seenNames = Set<String>()
+
+        for rel in searchRelDirs {
+            let dirURL = appURL.appendingPathComponent(rel)
+            guard !isSymbolicLink(at: dirURL),
+                  let items = try? fm.contentsOfDirectory(
+                    at: dirURL,
+                    includingPropertiesForKeys: [.isSymbolicLinkKey],
+                    options: [.skipsHiddenFiles]
+                  ) else {
+                continue
+            }
+            for child in items where child.pathExtension.lowercased() == "app" {
+                guard !isSymbolicLink(at: child) else { continue }
+                guard let childTeam = extractTeamIdentifier(at: child)?.lowercased(),
+                      childTeam == lowerTeam else {
+                    continue
+                }
+                let childBundle = Bundle(url: child)
+                let childInfo = childBundle?.infoDictionary ?? [:]
+                if let bid = (childInfo["CFBundleIdentifier"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                   !bid.isEmpty {
+                    let lowerBID = bid.lowercased()
+                    if !lowerBID.hasPrefix("com.apple."), lowerBID != "com.apple",
+                       seenIDs.insert(lowerBID).inserted {
+                        bundleIDs.append(bid)
+                    }
+                }
+                let rawStem = child.deletingPathExtension().lastPathComponent
+                let candidateNames = [
+                    childInfo["CFBundleDisplayName"] as? String,
+                    childInfo["CFBundleName"] as? String,
+                    rawStem,
+                ].compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                for name in candidateNames where !name.isEmpty {
+                    let lower = name.lowercased()
+                    if seenNames.insert(lower).inserted {
+                        appNames.append(name)
+                    }
+                }
+            }
+        }
+        return (bundleIDs, appNames)
+    }
+
+    /// Reads privileged helper tool labels declared via `SMPrivilegedExecutables` in `Info.plist`,
+    /// restricted to apps carrying a verified `anchor apple generic` Team Identifier.
+    public static func extractPrivilegedHelperLabels(
+        from info: [String: Any],
+        teamID: String?
+    ) -> [String] {
+        guard let team = teamID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !team.isEmpty,
+              let dict = info["SMPrivilegedExecutables"] as? [String: Any] else {
+            return []
+        }
+        var labels: [String] = []
+        var seen = Set<String>()
+        for key in dict.keys {
+            let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+            let lower = trimmed.lowercased()
+            guard !lower.isEmpty,
+                  !lower.hasPrefix("com.apple."),
+                  lower != "com.apple",
+                  ServiceFileMatcher.isMatchableBundleID(lower, allowApple: false),
+                  seen.insert(lower).inserted else {
+                continue
+            }
+            labels.append(trimmed)
+        }
+        return labels
+    }
+
+    /// Lazy Gatekeeper assessment via `spctl --assess --type execute --verbose=4` for a single
+    /// selected application bundle (keeps full-list scanning fast while showing authentic Notarized status).
+    public static func assessGatekeeperStatus(at appURL: URL) -> AppVerificationStatus? {
+        guard !isSymbolicLink(at: appURL) else { return nil }
+        let res = ProcessRunner.run(
+            executable: "/usr/sbin/spctl",
+            arguments: ["--assess", "--type", "execute", "--verbose=4", appURL.path]
+        )
+        let combined = (res.stdout + "\n" + res.stderr).lowercased()
+        if combined.contains("source=notarized developer id") {
+            return .notarized
+        }
+        if combined.contains("source=mac app store") {
+            return .appStore
+        }
+        if combined.contains("source=apple system") {
+            return .appleSystem
+        }
+        if res.succeeded && combined.contains("accepted") {
+            return .developerSigned
+        }
+        return nil
     }
 
     /// Reads the verified code-signing Team Identifier via Security framework (no subprocess overhead).

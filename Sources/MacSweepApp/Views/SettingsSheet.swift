@@ -171,11 +171,19 @@ struct SettingsSheet: View {
                 Text(l10n.appManagementTip)
                     .font(.system(size: 12))
                     .foregroundStyle(palette.secondaryText)
-                Button(l10n.t("打开「应用管理」设置", "Open App Management Settings")) {
-                    state.openSystemSettings(PermissionChecker.appManagementSettingsURL)
+                HStack {
+                    Button(l10n.t("打开「应用管理」设置", "Open App Management Settings")) {
+                        state.openSystemSettings(PermissionChecker.appManagementSettingsURL)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Button(l10n.t("在 Finder 中定位 MacSweep.app", "Reveal MacSweep.app in Finder")) {
+                        state.revealSelfAppInFinder()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
             }
 
             settingCard(title: l10n.t("自动化 → Finder 权限", "Automation → Finder")) {

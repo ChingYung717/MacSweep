@@ -225,11 +225,74 @@ public struct ServiceFileMatcher: Sendable {
     ) -> [ServiceFile] {
         let lowerBundleID = app.bundleID.lowercased()
         let hasValidBundleID = Self.isMatchableBundleID(lowerBundleID, allowApple: app.isAppleAppStoreApp)
+        let lowerTeamID = app.teamIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let hasVerifiedTeamID = (lowerTeamID?.isEmpty == false)
         let appBundlePath = app.url.standardizedFileURL.path
         let nameCandidates = Self.nameCandidates(for: app).filter { !ambiguousNames.contains($0) }
         let lowerOtherGroups = Set(otherInstalledAppGroups.map {
             $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         })
+        let lowerInstalledIDs = Set(allInstalledBundleIDs.map { $0.lowercased() })
+        let verifiedEmbeddedIDs: [String] = hasVerifiedTeamID
+            ? app.embeddedBundleIDs
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+                .filter { bid in
+                    bid != lowerBundleID
+                        && Self.isMatchableBundleID(bid, allowApple: false)
+                        && !lowerInstalledIDs.contains(bid)
+                        && !safetyGuard.matchesProtectedBundleID(bid)
+                }
+            : []
+        let verifiedHelperLabels: Set<String> = hasVerifiedTeamID
+            ? Set(app.privilegedHelperLabels.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
+            : []
+        let uniqueRepeatedVendorPrefix: String? = {
+            guard hasVerifiedTeamID, hasValidBundleID else { return nil }
+            let parts = lowerBundleID.split(separator: ".", omittingEmptySubsequences: false)
+            guard parts.count == 3, parts[1] == parts[2], parts[1].count >= 4 else { return nil }
+            let vendor = String(parts[1])
+            guard vendor != "apple", !SafetyGuard.sharedVendorFolderNames.contains(vendor) else { return nil }
+            let prefix2 = "\(parts[0]).\(parts[1])"
+            let claimedByOther = lowerInstalledIDs.contains { other in
+                other != lowerBundleID && (other == prefix2 || other.hasPrefix(prefix2 + "."))
+            }
+            return claimedByOther ? nil : prefix2
+        }()
+
+        // Pre-pass: verify any LaunchDaemon/LaunchAgent plists referencing this app via
+        // Rule 1, AssociatedBundleIdentifiers, or SMPrivilegedExecutables so their referenced
+        // `/Library/PrivilegedHelperTools/<name>` binaries are also discovered cleanly.
+        var helperBinaryTeamCache: [String: String?] = [:]
+        func binaryMatchesVerifiedTeam(_ path: String) -> Bool {
+            guard let expectedTeam = lowerTeamID, !expectedTeam.isEmpty else { return false }
+            let key = Self.normalizedPathKey(path)
+            if let cached = helperBinaryTeamCache[key] {
+                return cached == expectedTeam
+            }
+            let actual = AppScanner.extractTeamIdentifier(at: URL(fileURLWithPath: path))?.lowercased()
+            helperBinaryTeamCache[key] = actual
+            return actual == expectedTeam
+        }
+
+        let ownAndEmbeddedIDs = Set(([hasValidBundleID ? lowerBundleID : nil].compactMap { $0 }) + verifiedEmbeddedIDs)
+        var verifiedAssociatedHelperPaths = Set<String>()
+        var unverifiedAssociatedHelperPaths = Set<String>()
+        if hasVerifiedTeamID && (!ownAndEmbeddedIDs.isEmpty || !verifiedHelperLabels.isEmpty) {
+            for entry in index.entries where entry.isRemovable && (entry.category == .launchDaemons || entry.category == .launchAgents) {
+                let lowerAssoc = Set(entry.associatedBundleIDs.map { $0.lowercased() })
+                let lowerLabel = entry.launchLabel?.lowercased()
+                let matchesAssoc = !lowerAssoc.isDisjoint(with: ownAndEmbeddedIDs)
+                let matchesHelper = lowerLabel.map { verifiedHelperLabels.contains($0) } ?? false
+                guard matchesAssoc || matchesHelper else { continue }
+                for prog in entry.launchProgramPaths where prog.hasPrefix("/Library/PrivilegedHelperTools/") {
+                    if binaryMatchesVerifiedTeam(prog) {
+                        verifiedAssociatedHelperPaths.insert(Self.normalizedPathKey(prog))
+                    } else if matchesAssoc {
+                        unverifiedAssociatedHelperPaths.insert(Self.normalizedPathKey(prog))
+                    }
+                }
+            }
+        }
 
         var matched: [ServiceFile] = []
         var seenPaths = Set<String>()
@@ -269,9 +332,17 @@ public struct ServiceFileMatcher: Sendable {
             if let match = matchReason(
                 entry: entry,
                 bundleID: hasValidBundleID ? lowerBundleID : nil,
+                embeddedBundleIDs: verifiedEmbeddedIDs,
+                uniqueRepeatedVendorPrefix: uniqueRepeatedVendorPrefix,
+                privilegedHelperLabels: verifiedHelperLabels,
+                verifiedAssociatedHelperPaths: verifiedAssociatedHelperPaths,
+                unverifiedAssociatedHelperPaths: unverifiedAssociatedHelperPaths,
+                binaryMatchesVerifiedTeam: binaryMatchesVerifiedTeam,
                 allowApple: app.isAppleAppStoreApp,
                 appBundlePath: appBundlePath,
-                teamID: app.teamIdentifier?.lowercased(),
+                appRawNameLower: app.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                appLocalizedNameLower: app.localizedName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                teamID: lowerTeamID,
                 applicationGroups: app.applicationGroups,
                 nameCandidates: nameCandidates,
                 allInstalledBundleIDs: allInstalledBundleIDs,
@@ -569,17 +640,40 @@ public struct ServiceFileMatcher: Sendable {
     private func matchReason(
         entry: LibraryEntry,
         bundleID: String?,
+        embeddedBundleIDs: [String] = [],
+        uniqueRepeatedVendorPrefix: String? = nil,
+        privilegedHelperLabels: Set<String> = [],
+        verifiedAssociatedHelperPaths: Set<String> = [],
+        unverifiedAssociatedHelperPaths: Set<String> = [],
+        binaryMatchesVerifiedTeam: (String) -> Bool = { _ in false },
         allowApple: Bool,
         appBundlePath: String,
+        appRawNameLower: String = "",
+        appLocalizedNameLower: String = "",
         teamID: String?,
         applicationGroups: [String],
         nameCandidates: [String],
         allInstalledBundleIDs: Set<String>,
         otherInstalledAppGroups: Set<String>
     ) -> (reason: String, defaultSelected: Bool)? {
+        // 0. Home dot-folders (e.g. `~/.docker`) are strictly restricted to exact non-ambiguous app name matches.
+        if entry.isHomeDotEntry {
+            guard entry.normalizedName.hasPrefix(".") else { return nil }
+            let dotBody = String(entry.normalizedName.dropFirst())
+            guard dotBody.count >= 5, !LibraryIndex.protectedHomeDotNames.contains(dotBody) else { return nil }
+            let exactSignedNameMatch = (teamID?.isEmpty == false)
+                && (appRawNameLower == dotBody || appLocalizedNameLower == dotBody)
+                && !SafetyGuard.sharedVendorFolderNames.contains(dotBody)
+            guard nameCandidates.contains(dotBody) || exactSignedNameMatch else { return nil }
+            return ("Home config folder match", true)
+        }
+
+        let normAppBundle = Self.normalizedPathKey(appBundlePath)
+        let lowerStem = entry.stem.lowercased()
+        let lowerFull = entry.normalizedName
+
         // 1. LaunchAgent / LaunchDaemon referencing a binary inside this .app bundle (highest precision!)
         if !entry.launchProgramPaths.isEmpty {
-            let normAppBundle = Self.normalizedPathKey(appBundlePath)
             for prog in entry.launchProgramPaths {
                 let normProg = Self.normalizedPathKey(prog)
                 if normProg == normAppBundle || normProg.hasPrefix(normAppBundle + "/") {
@@ -588,14 +682,52 @@ public struct ServiceFileMatcher: Sendable {
             }
         }
 
-        let lowerStem = entry.stem.lowercased()
-        let lowerFull = entry.normalizedName
+        // 1b. LaunchDaemon / LaunchAgent declaring AssociatedBundleIdentifiers matching this app,
+        //     or PrivilegedHelperTools declared in SMPrivilegedExecutables / referenced by a verified daemon.
+        let ownAndEmbeddedIDs = Set(([bundleID].compactMap { $0 }) + embeddedBundleIDs)
+        if (entry.category == .launchDaemons || entry.category == .launchAgents),
+           !entry.associatedBundleIDs.isEmpty,
+           !ownAndEmbeddedIDs.isEmpty {
+            let lowerAssoc = Set(entry.associatedBundleIDs.map { $0.lowercased() })
+            if !lowerAssoc.isDisjoint(with: ownAndEmbeddedIDs) {
+                let verifiedBinary = entry.launchProgramPaths.contains { prog in
+                    let np = Self.normalizedPathKey(prog)
+                    return np == normAppBundle || np.hasPrefix(normAppBundle + "/") || binaryMatchesVerifiedTeam(prog)
+                }
+                if verifiedBinary {
+                    return ("Launch plist associated with app", true)
+                } else if !entry.isSystemScope || (teamID?.isEmpty == false) {
+                    return ("Launch plist associated with bundle ID", false)
+                }
+            }
+        }
+
+        if entry.category == .launchDaemons {
+            let entryPathNorm = Self.normalizedPathKey(entry.url.path)
+            if verifiedAssociatedHelperPaths.contains(entryPathNorm) {
+                return ("Privileged helper tool match", true)
+            }
+            if unverifiedAssociatedHelperPaths.contains(entryPathNorm) {
+                return ("Associated privileged helper tool", false)
+            }
+            let candidateLabel = entry.launchLabel?.lowercased() ?? lowerStem
+            if !privilegedHelperLabels.isEmpty && privilegedHelperLabels.contains(candidateLabel) {
+                let isHelperBinary = entry.url.path.contains("/PrivilegedHelperTools/")
+                let verified = isHelperBinary
+                    ? binaryMatchesVerifiedTeam(entry.url.path)
+                    : entry.launchProgramPaths.contains { binaryMatchesVerifiedTeam($0) }
+                if verified {
+                    return ("Privileged helper tool match", true)
+                }
+            }
+        }
 
         // 2. Bundle ID exact & boundary-prefix matches (excluding entries owned by a longer installed bundle ID).
         //    2-segment IDs only exact-match (plus ByHost UUID) so vendor prefixes like `com.docker` cannot
         //    claim 3-segment sibling products or root LaunchDaemons.
         //    LaunchDaemons/LaunchAgents matched without Rule 1 binary ownership default to unselected (`false`).
-        if let bid = bundleID {
+        let candidateBundleIDs = ([bundleID].compactMap { $0 }) + embeddedBundleIDs
+        for bid in candidateBundleIDs {
             let allowPrefix = Self.allowsPrefixMatching(forBundleID: bid)
             let isLaunchEntry = (entry.category == .launchDaemons || entry.category == .launchAgents)
 
@@ -655,6 +787,21 @@ public struct ServiceFileMatcher: Sendable {
             }
         }
 
+        // 2b. Unique repeated-token 2-segment prefix (e.g. `com.docker.docker` -> `com.docker.install`)
+        //     restricted to non-launchd, non-group-container entries when signed with a verified TeamID
+        //     and no other installed app shares that 2-segment prefix.
+        if let prefix2 = uniqueRepeatedVendorPrefix,
+           entry.category != .launchAgents,
+           entry.category != .launchDaemons,
+           entry.category != .groupContainers {
+            let stripped = InstalledAppInventory.stripContainerPrefixes(lowerStem)
+            if (stripped == prefix2 || stripped.hasPrefix(prefix2 + ".")),
+               let primaryBID = bundleID,
+               !Self.isClaimedByLongerInstalledBundleID(stripped, ownBundleID: primaryBID, allInstalledBundleIDs: allInstalledBundleIDs) {
+                return ("Vendor bundle prefix match", true)
+            }
+        }
+
         // 3. Name matching (strictly bounded, length >= 4, never matches LaunchAgents/Daemons, Group Containers,
         //    system/TCC ignore names, reverse-DNS names, or entries belonging to installed/protected bundle IDs).
         if entry.category == .launchAgents || entry.category == .launchDaemons || entry.category == .groupContainers {
@@ -711,6 +858,9 @@ public struct ServiceFileMatcher: Sendable {
         var rawNames: [String] = [app.name]
         if app.localizedName != app.name {
             rawNames.append(app.localizedName)
+        }
+        if app.teamIdentifier?.isEmpty == false {
+            rawNames.append(contentsOf: app.embeddedAppNames)
         }
         if let exec = app.executableName {
             let execTrimmed = exec.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -814,10 +964,28 @@ public struct ServiceFileMatcher: Sendable {
                 }
             }
             if !hasTeamPrefix {
-                // Non-TeamID `group.*`/`groups.*` containers must ALSO match the app's own bundle ID so an
-                // arbitrary Apple Development signer (`com.evil.spoof`) cannot claim unrelated third-party
-                // `group.*` containers via self-declared entitlements.
-                guard matchesBundleIdentifier(candidate: strippedEntry, bundleID: lowerBID, allowPrefix: allowPrefix) else {
+                // Non-TeamID `group.*`/`groups.*` containers must ALSO match the app's own bundle ID
+                // (or its verified 2-segment non-shared parent root such as `group.com.docker` for
+                // `com.docker.docker`) so an arbitrary Apple Development signer (`com.evil.spoof`)
+                // cannot claim unrelated third-party `group.*` containers via self-declared entitlements.
+                let exactOrChildMatch = matchesBundleIdentifier(
+                    candidate: strippedEntry,
+                    bundleID: lowerBID,
+                    allowPrefix: allowPrefix
+                )
+                let verifiedParentGroupMatch: Bool = {
+                    guard let teamID, !teamID.isEmpty else { return false }
+                    let parts = strippedEntry.split(separator: ".", omittingEmptySubsequences: false)
+                    guard parts.count >= 2, parts.allSatisfy({ !$0.isEmpty }) else { return false }
+                    if parts.count == 2 {
+                        let vendor = String(parts[1])
+                        guard vendor != "apple", !SafetyGuard.sharedVendorFolderNames.contains(vendor) else {
+                            return false
+                        }
+                    }
+                    return lowerBID.hasPrefix(strippedEntry + ".")
+                }()
+                guard exactOrChildMatch || verifiedParentGroupMatch else {
                     return false
                 }
             }

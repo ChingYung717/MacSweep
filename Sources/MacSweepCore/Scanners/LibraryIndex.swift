@@ -11,6 +11,8 @@ public struct LibraryEntry: Hashable, Sendable {
     public let parentVendorName: String?
     public let launchLabel: String?
     public let launchProgramPaths: [String]
+    public let associatedBundleIDs: [String]
+    public let isHomeDotEntry: Bool
     public let requiresAdmin: Bool
     /// Result of `SafetyGuard.validateForRemoval` computed ONCE at index time, so per-app matching
     /// stays a pure in-memory pass (previously ~450k filesystem-touching validations ≈ 26 s).
@@ -26,6 +28,8 @@ public struct LibraryEntry: Hashable, Sendable {
         parentVendorName: String? = nil,
         launchLabel: String? = nil,
         launchProgramPaths: [String] = [],
+        associatedBundleIDs: [String] = [],
+        isHomeDotEntry: Bool = false,
         requiresAdmin: Bool = false,
         isRemovable: Bool = true,
         expectedCanonicalParent: String? = nil
@@ -40,6 +44,8 @@ public struct LibraryEntry: Hashable, Sendable {
         self.parentVendorName = parentVendorName
         self.launchLabel = launchLabel
         self.launchProgramPaths = launchProgramPaths
+        self.associatedBundleIDs = associatedBundleIDs
+        self.isHomeDotEntry = isHomeDotEntry
         self.requiresAdmin = requiresAdmin
         self.isRemovable = isRemovable
         self.expectedCanonicalParent = expectedCanonicalParent
@@ -209,11 +215,13 @@ public struct LibraryIndex: Sendable {
 
                 var launchLabel: String?
                 var launchPrograms: [String] = []
+                var associatedIDs: [String] = []
                 if (category == .launchAgents || category == .launchDaemons),
                    child.pathExtension.lowercased() == "plist" {
                     let parsed = Self.parseLaunchPlistMetadata(at: child)
                     launchLabel = parsed.label
                     launchPrograms = parsed.programs
+                    associatedIDs = parsed.associatedBundleIDs
                 }
 
                 let admin = safetyGuard.requiresAdmin(for: child)
@@ -223,6 +231,7 @@ public struct LibraryIndex: Sendable {
                     isSystemScope: isSystemScope,
                     launchLabel: launchLabel,
                     launchProgramPaths: launchPrograms,
+                    associatedBundleIDs: associatedIDs,
                     requiresAdmin: admin,
                     isRemovable: safetyGuard.validateForRemoval(child).isAllowed,
                     expectedCanonicalParent: dirCanonicalParent
@@ -237,6 +246,46 @@ public struct LibraryIndex: Sendable {
             scanDirectory(base: systemLibraryURL, relPath: rel, category: cat, expandVendors: expand, isSystemScope: true)
         }
 
+        // Index safe app-specific home dot-folders (e.g. `~/.docker`) for installed app detail matching only.
+        // Strictly excludes symlinks, shell/credential/developer tool dotfiles, and any path rejected by SafetyGuard.
+        let homeURL = userLibraryURL.deletingLastPathComponent()
+        if let homeItems = try? fm.contentsOfDirectory(
+            at: homeURL,
+            includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
+            options: []
+        ) {
+            let homeCanonicalParent = PrivilegedExecutor.canonicalParentPath(for: homeURL.standardizedFileURL.path)
+            for child in homeItems {
+                let name = child.lastPathComponent
+                guard name.hasPrefix("."), name.count >= 6 else { continue }
+                let lower = name.lowercased()
+                let dotBody = String(lower.dropFirst())
+                guard !Self.protectedHomeDotNames.contains(dotBody),
+                      !dotBody.hasPrefix("zsh"),
+                      !dotBody.hasPrefix("bash"),
+                      !dotBody.hasPrefix("git"),
+                      !dotBody.hasPrefix("vim"),
+                      !dotBody.hasPrefix("ssh"),
+                      !dotBody.hasPrefix("apple") else {
+                    continue
+                }
+                guard !safetyGuard.isSymbolicLink(child) else { continue }
+                let isDir = (try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+                guard isDir else { continue }
+                guard safetyGuard.validateForRemoval(child).isAllowed else { continue }
+                let admin = safetyGuard.requiresAdmin(for: child)
+                collected.append(LibraryEntry(
+                    url: child,
+                    category: .applicationSupport,
+                    isSystemScope: false,
+                    isHomeDotEntry: true,
+                    requiresAdmin: admin,
+                    isRemovable: true,
+                    expectedCanonicalParent: homeCanonicalParent
+                ))
+            }
+        }
+
         return LibraryIndex(
             entries: collected,
             userLibraryURL: userLibraryURL,
@@ -244,11 +293,28 @@ public struct LibraryIndex: Sendable {
         )
     }
 
-    public static func parseLaunchPlistMetadata(at url: URL) -> (label: String?, programs: [String]) {
+    /// Shell, credential, package-manager, and general developer dot-folders under `~` that must
+    /// never be associated with or removed alongside an app bundle.
+    public static let protectedHomeDotNames: Set<String> = [
+        "ssh", "gnupg", "gpg", "config", "local", "cache", "trash", "cups",
+        "aws", "azure", "gcloud", "kube", "helm", "terraform", "ansible",
+        "npm", "pnpm", "yarn", "bun", "nvm", "fnm", "volta", "deno",
+        "cargo", "rustup", "go", "pyenv", "conda", "miniconda", "anaconda",
+        "pip", "poetry", "rye", "uv", "rbenv", "rvm", "gem", "bundle",
+        "gradle", "m2", "maven", "sbt", "ivy2", "sdkman", "jenv", "composer",
+        "nvim", "emacs", "tmux", "profile", "zprofile", "zshrc", "bashrc",
+        "gemini", "claude", "codex", "cursor", "vscode", "vscode-insiders",
+        "android", "flutter", "pub-cache", "cocoapods", "swiftpm", "mint",
+        "ds_store", "cfusertextencoding", "localized", "subversion", "netrc",
+    ]
+
+    public static func parseLaunchPlistMetadata(
+        at url: URL
+    ) -> (label: String?, programs: [String], associatedBundleIDs: [String]) {
         guard let data = SafeFileReader.readBoundedRegularFile(at: url),
               let raw = try? PropertyListSerialization.propertyList(from: data, format: nil),
               let dict = raw as? [String: Any] else {
-            return (nil, [])
+            return (nil, [], [])
         }
         let label = dict["Label"] as? String
         var paths: [String] = []
@@ -262,6 +328,20 @@ public struct LibraryIndex: Sendable {
                 }
             }
         }
-        return (label, paths)
+        var associated: [String] = []
+        if let list = dict["AssociatedBundleIdentifiers"] as? [String] {
+            for item in list {
+                let trimmed = item.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty && !associated.contains(trimmed) {
+                    associated.append(trimmed)
+                }
+            }
+        } else if let single = dict["AssociatedBundleIdentifiers"] as? String {
+            let trimmed = single.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                associated.append(trimmed)
+            }
+        }
+        return (label, paths, associated)
     }
 }

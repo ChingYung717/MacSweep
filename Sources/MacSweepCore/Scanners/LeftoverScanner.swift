@@ -329,7 +329,7 @@ public struct LeftoverScanner: Sendable {
         var groupedFiles: [String: (displayName: String, bundleID: String?, confidence: LeftoverConfidence, files: [ServiceFile])] = [:]
 
         for entry in index.entries {
-            guard entry.isRemovable else { continue }
+            guard entry.isRemovable, !entry.isHomeDotEntry else { continue }
 
             let stem = InstalledAppInventory.stripUUIDSuffix(entry.stem)
             let strippedID = InstalledAppInventory.stripContainerPrefixes(stem.lowercased())

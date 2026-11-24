@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public enum ServiceFileCategory: String, CaseIterable, Codable, Sendable, Hashable {
@@ -41,6 +42,10 @@ public struct ServiceFile: Identifiable, Hashable, Sendable {
     public let url: URL
     public let category: ServiceFileCategory
     public var size: Int64?
+    public var fileCount: Int?
+    public var folderCount: Int?
+    public let isDirectory: Bool
+    public let isSymbolicLink: Bool
     public var isSelected: Bool
     public let requiresAdmin: Bool
     public let requiresReboot: Bool
@@ -54,6 +59,10 @@ public struct ServiceFile: Identifiable, Hashable, Sendable {
         url: URL,
         category: ServiceFileCategory,
         size: Int64? = nil,
+        fileCount: Int? = nil,
+        folderCount: Int? = nil,
+        isDirectory: Bool? = nil,
+        isSymbolicLink: Bool? = nil,
         isSelected: Bool = true,
         requiresAdmin: Bool = false,
         requiresReboot: Bool = false,
@@ -66,6 +75,22 @@ public struct ServiceFile: Identifiable, Hashable, Sendable {
         self.url = url
         self.category = category
         self.size = size
+        self.fileCount = fileCount
+        self.folderCount = folderCount
+        if let isDirectory, let isSymbolicLink {
+            self.isDirectory = isDirectory
+            self.isSymbolicLink = isSymbolicLink
+        } else {
+            var st = stat()
+            if lstat(url.path, &st) == 0 {
+                let mode = st.st_mode & S_IFMT
+                self.isSymbolicLink = isSymbolicLink ?? (mode == S_IFLNK)
+                self.isDirectory = isDirectory ?? (mode == S_IFDIR)
+            } else {
+                self.isSymbolicLink = isSymbolicLink ?? false
+                self.isDirectory = isDirectory ?? false
+            }
+        }
         self.isSelected = isSelected
         self.requiresAdmin = requiresAdmin
         self.requiresReboot = requiresReboot

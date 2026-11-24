@@ -96,6 +96,7 @@ final class AppState: ObservableObject {
     @Published var preferences: SweepPreferences
     @Published var cleanupHistory: [CleanupRecord] = []
     @Published var hasFullDiskAccess: Bool = false
+    @Published var isExpertMode: Bool = true
 
     // Shared Core Engines
     private let prefsStore = PreferencesStore()
@@ -195,6 +196,14 @@ final class AppState: ObservableObject {
 
     func revealInFinder(_ url: URL) {
         NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    func revealSelfAppInFinder() {
+        let bundleURL = Bundle.main.bundleURL
+        let targetURL = bundleURL.pathExtension.lowercased() == "app"
+            ? bundleURL
+            : (Bundle.main.executableURL ?? bundleURL)
+        NSWorkspace.shared.activateFileViewerSelecting([targetURL])
     }
 
     func clearHistory() {
@@ -319,7 +328,7 @@ final class AppState: ObservableObject {
                         urlsToSize.append(sf.url)
                     }
                 }
-                let sizedMap = await sizerRef.sizes(of: urlsToSize, maxConcurrency: 6)
+                let sizedMap = await sizerRef.measurements(of: urlsToSize, maxConcurrency: 6)
                 if Task.isCancelled { return }
 
                 await MainActor.run { [weak self] in
@@ -327,11 +336,19 @@ final class AppState: ObservableObject {
                     for app in slice {
                         guard let idx = self.apps.firstIndex(where: { $0.id == app.id }) else { continue }
                         let bundleKey = self.apps[idx].url.standardizedFileURL.path
-                        self.apps[idx].bundleSize = sizedMap[bundleKey] ?? 0
+                        if let bundleMeas = sizedMap[bundleKey] {
+                            self.apps[idx].bundleSize = bundleMeas.bytes
+                            self.apps[idx].bundleFileCount = bundleMeas.fileCount
+                            self.apps[idx].bundleFolderCount = bundleMeas.folderCount
+                        } else {
+                            self.apps[idx].bundleSize = 0
+                        }
                         for sfIdx in self.apps[idx].serviceFiles.indices {
                             let sfKey = self.apps[idx].serviceFiles[sfIdx].url.standardizedFileURL.path
-                            if let sz = sizedMap[sfKey] {
-                                self.apps[idx].serviceFiles[sfIdx].size = sz
+                            if let meas = sizedMap[sfKey] {
+                                self.apps[idx].serviceFiles[sfIdx].size = meas.bytes
+                                self.apps[idx].serviceFiles[sfIdx].fileCount = meas.fileCount
+                                self.apps[idx].serviceFiles[sfIdx].folderCount = meas.folderCount
                             }
                         }
                     }
@@ -389,14 +406,27 @@ final class AppState: ObservableObject {
             // Keep only entries still present on disk so deleted files can never resurrect.
             let liveFiles = result.files.filter { RemovalEngine.entryExists($0.url) }
             let allURLs = [targetApp.url] + liveFiles.map(\.url)
-            let sizeMap = await sizerRef.sizes(of: allURLs, maxConcurrency: 6)
+            let measMap = await sizerRef.measurements(of: allURLs, maxConcurrency: 6)
 
             var sizedFiles = liveFiles
             for i in sizedFiles.indices {
-                sizedFiles[i].size = sizeMap[sizedFiles[i].url.standardizedFileURL.path] ?? 0
+                let key = sizedFiles[i].url.standardizedFileURL.path
+                if let meas = measMap[key] {
+                    sizedFiles[i].size = meas.bytes
+                    sizedFiles[i].fileCount = meas.fileCount
+                    sizedFiles[i].folderCount = meas.folderCount
+                } else {
+                    sizedFiles[i].size = 0
+                }
                 if shared { sizedFiles[i].isSelected = false }
             }
-            let bundleSize = sizeMap[targetApp.url.standardizedFileURL.path] ?? targetApp.bundleSize ?? 0
+            let bundleMeas = measMap[targetApp.url.standardizedFileURL.path]
+            let bundleSize = bundleMeas?.bytes ?? targetApp.bundleSize ?? 0
+            let bundleFileCount = bundleMeas?.fileCount ?? targetApp.bundleFileCount
+            let bundleFolderCount = bundleMeas?.folderCount ?? targetApp.bundleFolderCount
+            let assessedStatus = targetApp.hasAssessedNotarization
+                ? nil
+                : AppScanner.assessGatekeeperStatus(at: targetApp.url)
             let pkgIDs = shared ? [] : result.matchedPackageIDs
             let safeMatchIDs = AppScanner.safeProcessMatchBundleID(for: targetApp).map { [$0] } ?? []
             let isRunningNow = !AppScanner.runningProcesses(
@@ -420,6 +450,12 @@ final class AppState: ObservableObject {
                     }
                 }
                 self.apps[liveIdx].bundleSize = bundleSize
+                self.apps[liveIdx].bundleFileCount = bundleFileCount
+                self.apps[liveIdx].bundleFolderCount = bundleFolderCount
+                if let assessedStatus {
+                    self.apps[liveIdx].verificationStatus = assessedStatus
+                }
+                self.apps[liveIdx].hasAssessedNotarization = true
                 self.apps[liveIdx].serviceFiles = merged
                 self.apps[liveIdx].matchedPackageIDs = pkgIDs
                 self.apps[liveIdx].hasEnrichedPackages = true
@@ -514,9 +550,19 @@ final class AppState: ObservableObject {
             )
 
             let urls = [inspected.url] + matched.files.map(\.url)
-            let sizes = await sizerRef.sizes(of: urls, maxConcurrency: 6)
+            let measMap = await sizerRef.measurements(of: urls, maxConcurrency: 6)
 
-            inspected.bundleSize = sizes[inspected.url.standardizedFileURL.path] ?? 0
+            if let bundleMeas = measMap[inspected.url.standardizedFileURL.path] {
+                inspected.bundleSize = bundleMeas.bytes
+                inspected.bundleFileCount = bundleMeas.fileCount
+                inspected.bundleFolderCount = bundleMeas.folderCount
+            } else {
+                inspected.bundleSize = 0
+            }
+            if let assessedStatus = AppScanner.assessGatekeeperStatus(at: inspected.url) {
+                inspected.verificationStatus = assessedStatus
+            }
+            inspected.hasAssessedNotarization = true
             inspected.sharesBundleIDWithOtherApp = shared
             inspected.hasEnrichedPackages = true
             let safeMatchIDs = AppScanner.safeProcessMatchBundleID(for: inspected).map { [$0] } ?? []
@@ -526,7 +572,13 @@ final class AppState: ObservableObject {
             ).isEmpty
             inspected.serviceFiles = matched.files.map { sf in
                 var copy = sf
-                copy.size = sizes[sf.url.standardizedFileURL.path] ?? 0
+                if let meas = measMap[sf.url.standardizedFileURL.path] {
+                    copy.size = meas.bytes
+                    copy.fileCount = meas.fileCount
+                    copy.folderCount = meas.folderCount
+                } else {
+                    copy.size = 0
+                }
                 if shared { copy.isSelected = false }
                 return copy
             }

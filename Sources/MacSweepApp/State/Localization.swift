@@ -127,12 +127,60 @@ struct L10n {
     var rebootBadge: String { t("需重启生效", "Reboot Required") }
     var noServiceFiles: String { t("未发现额外的服务文件", "No additional service files found") }
     var pkgReceiptsNote: String { t("同时清理安装包回执", "Will also forget installer receipts") }
+    var expertMode: String { t("专家模式", "Expert Mode") }
+    var appFilesAndFoldersLabel: String { t("应用程序文件和文件夹", "Application Files and Folders") }
+    var developerLabel: String { t("开发人员", "Developer") }
+    var appVerificationLabel: String { t("App 验证", "App Verification") }
+    var unknownDeveloper: String { t("未知开发者", "Unknown Developer") }
+    var moreInfo: String { t("更多信息", "More Info") }
+    var hideInfo: String { t("收起信息", "Less Info") }
+    var architectureLabel: String { t("架构", "Architecture") }
+    var teamIDLabel: String { t("团队 ID", "Team ID") }
+    var minSystemLabel: String { t("最低系统版本", "Minimum macOS") }
+    var lastUsedLabel: String { t("上次使用", "Last Used") }
+    var modifiedLabel: String { t("修改日期", "Modified") }
+    var installPathLabel: String { t("安装路径", "Location") }
+    var versionLabel: String { t("版本", "Version") }
+
+    func verificationStatusTitle(_ status: AppVerificationStatus) -> String {
+        switch status {
+        case .appleSystem: return t("Apple 系统签名", "Apple System")
+        case .appStore: return t("App Store 已验证", "Mac App Store")
+        case .notarized: return t("已公证", "Notarized")
+        case .developerSigned: return t("已签名", "Signed")
+        case .adHocOrUnsigned: return t("未签名 / 临时签名", "Unsigned / Ad-hoc")
+        }
+    }
+
+    func itemCountLabel(_ count: Int) -> String {
+        isChinese ? "\(count) 个项目" : "\(count) items"
+    }
+
+    func filesAndFoldersSummary(files: Int, folders: Int) -> String {
+        if isChinese {
+            if folders > 0 && files > 0 {
+                return "\(files) 个文件和 \(folders) 个文件夹"
+            } else if folders > 0 {
+                return "\(folders) 个文件夹"
+            } else {
+                return "\(files) 个文件"
+            }
+        } else {
+            if folders > 0 && files > 0 {
+                return "\(files) files and \(folders) folders"
+            } else if folders > 0 {
+                return "\(folders) folders"
+            } else {
+                return "\(files) files"
+            }
+        }
+    }
 
     // Permissions
     var fdaGranted: String { t("完全磁盘访问已授权", "Full Disk Access Granted") }
     var fdaMissing: String { t("未授予完全磁盘访问权限", "Full Disk Access Not Granted") }
     var fdaBannerText: String { t("授予「完全磁盘访问」后可完整扫描受保护容器与浏览器扩展", "Grant Full Disk Access to scan protected containers and browser extensions") }
-    var appManagementTip: String { t("若卸载应用提示无权限，请在「系统设置 → 隐私与安全性 → 应用管理」中允许 MacSweep", "If uninstalling an app fails with permission denied, allow MacSweep in Privacy & Security → App Management") }
+    var appManagementTip: String { t("若卸载应用提示无权限，请在「系统设置 → 隐私与安全性 → App 管理」中允许 MacSweep。若列表尚未显示 MacSweep，可点击左下角「+」手动添加，或将 Finder 中的 MacSweep.app 直接拖入列表。", "If uninstalling an app fails with permission denied, allow MacSweep in Privacy & Security → App Management. If MacSweep is not listed yet, click '+' at the bottom-left or drag MacSweep.app from Finder into the list.") }
 
     // Confirmation Sheet
     var confirmUninstallTitle: String { t("确认移除所选项目", "Confirm Removal") }

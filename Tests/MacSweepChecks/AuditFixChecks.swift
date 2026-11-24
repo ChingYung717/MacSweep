@@ -2145,4 +2145,120 @@ func runAuditFixChecks(_ runner: CheckRunner) {
                                    "External 0300 parent mode must remain 0300 (must NOT be widened to 0700)")
         }
     }
+
+    runner.run("App Detail Enrichment: signed parent group, embedded app & vendor prefix matching, home dot-folder safety, and DirectorySizer item counts") {
+        let sandbox = try runner.makeTempSandbox(prefix: "detail-enrich")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let fm = FileManager.default
+        let userLib = sandbox.appendingPathComponent("Library")
+        let sysLib = sandbox.appendingPathComponent("SysLibrary")
+        let appSupport = userLib.appendingPathComponent("Application Support")
+        let caches = userLib.appendingPathComponent("Caches")
+        let prefs = userLib.appendingPathComponent("Preferences")
+        let groupsDir = userLib.appendingPathComponent("Group Containers")
+        let launchAgents = userLib.appendingPathComponent("LaunchAgents")
+
+        for d in [appSupport, caches, prefs, groupsDir, launchAgents, sysLib] {
+            try fm.createDirectory(at: d, withIntermediateDirectories: true)
+        }
+
+        // Mock Docker-style artifacts
+        let desktopSupport = appSupport.appendingPathComponent("Docker Desktop")
+        let installSupport = appSupport.appendingPathComponent("com.docker.install")
+        let desktopCache = caches.appendingPathComponent("Docker Desktop")
+        let electronPref = prefs.appendingPathComponent("com.electron.dockerdesktop.plist")
+        let dockerGroup = groupsDir.appendingPathComponent("group.com.docker")
+        let dotDocker = sandbox.appendingPathComponent(".docker")
+        let dotSSH = sandbox.appendingPathComponent(".ssh")
+        let dotConfig = sandbox.appendingPathComponent(".config")
+        let assocPlist = launchAgents.appendingPathComponent("com.docker.useragent.plist")
+
+        for d in [desktopSupport, installSupport, desktopCache, dockerGroup, dotDocker, dotSSH, dotConfig] {
+            try fm.createDirectory(at: d, withIntermediateDirectories: true)
+        }
+        try Data("cfg".utf8).write(to: dotDocker.appendingPathComponent("config.json"))
+        try Data("key".utf8).write(to: dotSSH.appendingPathComponent("id_ed25519"))
+        try Data("pref".utf8).write(to: electronPref)
+        let assocXML = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict>
+            <key>AssociatedBundleIdentifiers</key><array><string>com.docker.docker</string></array>
+            <key>Label</key><string>com.docker.useragent</string>
+            <key>Program</key><string>/Applications/Docker.app/Contents/MacOS/Docker</string>
+        </dict></plist>
+        """
+        try Data(assocXML.utf8).write(to: assocPlist)
+
+        let sg = SafetyGuard(homeDirectory: sandbox)
+        let index = LibraryIndex.build(userLibraryURL: userLib, systemLibraryURL: sysLib, safetyGuard: sg)
+
+        // Protected dotfiles (.ssh, .config) MUST NEVER enter LibraryIndex; .docker enters as isHomeDotEntry
+        try runner.expect(!index.entries.contains { $0.url.lastPathComponent == ".ssh" || $0.url.lastPathComponent == ".config" },
+                          "Protected dotfiles (.ssh/.config) must never be indexed")
+        try runner.expect(index.entries.contains { $0.url.lastPathComponent == ".docker" && $0.isHomeDotEntry },
+                          "Non-protected app dot-folder (.docker) should be indexed as home dot entry")
+
+        // LeftoverScanner must skip home dot entries so ~/.docker is never flagged as an orphan leftover
+        let leftovers = LeftoverScanner(safetyGuard: sg).scan(
+            index: index,
+            inventory: InstalledAppInventory(bundleIDs: [], baseBundlePrefixes: [], appNames: [], compactAppNames: [])
+        )
+        try runner.expect(!leftovers.flatMap(\.files).contains { $0.url.lastPathComponent == ".docker" },
+                          "Home dot-folders must never appear in Leftovers scan")
+
+        // Signed Docker-style app matches group.com.docker, Docker Desktop, com.electron.dockerdesktop, com.docker.install, .docker, and AssociatedBundleIdentifiers plist
+        let signedDocker = AppItem(
+            url: URL(fileURLWithPath: "/Applications/Docker.app"),
+            name: "Docker",
+            localizedName: "Docker",
+            bundleID: "com.docker.docker",
+            version: "4.96.0",
+            teamIdentifier: "9BNSXJN65R",
+            developerName: "Docker Inc",
+            verificationStatus: .notarized,
+            architectures: ["arm64"],
+            applicationGroups: ["group.com.docker"],
+            embeddedBundleIDs: ["com.electron.dockerdesktop"],
+            embeddedAppNames: ["Docker Desktop"]
+        )
+        let matcher = ServiceFileMatcher(safetyGuard: sg)
+        let matched = matcher.matchInMemory(app: signedDocker, index: index, allInstalledBundleIDs: ["com.docker.docker"])
+        let matchedNames = Set(matched.map { $0.url.lastPathComponent })
+        try runner.expect(matchedNames.contains("group.com.docker"), "Signed Docker declaring group.com.docker must match its Group Container")
+        try runner.expect(matchedNames.contains("Docker Desktop"), "Verified embedded app name 'Docker Desktop' must match support/cache folders")
+        try runner.expect(matchedNames.contains("com.electron.dockerdesktop.plist"), "Verified embedded bundleID must match preferences")
+        try runner.expect(matchedNames.contains("com.docker.install"), "Unique repeated-token vendor prefix com.docker.* must match com.docker.install")
+        try runner.expect(matchedNames.contains(".docker"), "Exact non-ambiguous app name must match ~/.docker")
+        try runner.expect(matchedNames.contains("com.docker.useragent.plist"), "AssociatedBundleIdentifiers plist must match")
+
+        // Unsigned app with spoofed embeddedBundleIDs / embeddedAppNames / group.com.docker MUST NOT match those items
+        let unsignedSpoof = AppItem(
+            url: sandbox.appendingPathComponent("Fake.app"),
+            name: "Fake",
+            localizedName: "Fake",
+            bundleID: "com.evil.fake",
+            version: "1.0",
+            teamIdentifier: nil,
+            applicationGroups: ["group.com.docker"],
+            embeddedBundleIDs: ["com.electron.dockerdesktop"],
+            embeddedAppNames: ["Docker Desktop"]
+        )
+        let spoofMatched = matcher.matchInMemory(app: unsignedSpoof, index: index, allInstalledBundleIDs: ["com.docker.docker", "com.evil.fake"])
+        try runner.expect(spoofMatched.isEmpty, "Unsigned spoofed app must match zero Docker files, got: \(spoofMatched.map(\.displayName))")
+
+        // DirectorySizer counts files and subfolders accurately
+        let countDir = sandbox.appendingPathComponent("count-probe")
+        let subA = countDir.appendingPathComponent("subA")
+        let subB = subA.appendingPathComponent("subB")
+        try fm.createDirectory(at: subB, withIntermediateDirectories: true)
+        try Data("1234".utf8).write(to: countDir.appendingPathComponent("f1.txt"))
+        try Data("5678".utf8).write(to: subA.appendingPathComponent("f2.txt"))
+        try Data("90".utf8).write(to: subB.appendingPathComponent("f3.txt"))
+        let meas = DirectorySizer.measureSizeSync(of: countDir)
+        try runner.expectEqual(meas.fileCount, 3, "DirectorySizer must report exact fileCount")
+        try runner.expectEqual(meas.folderCount, 2, "DirectorySizer must report exact folderCount")
+        try runner.expect(!meas.isTruncated)
+    }
 }

@@ -1,12 +1,22 @@
 #!/bin/bash
 # Build and bundle MacSweep.app cleanly using SwiftPM, with auto-versioning,
 # code signing (Apple Development / Developer ID / ad-hoc), optional notarization,
-# and standalone zip packaging.
-# Usage: ./make_app.sh [output_dir]
+# standalone zip packaging, and optional --install to /Applications (removing the
+# duplicate dist/MacSweep.app bundle so Spotlight only shows one MacSweep.app).
+# Usage: ./make_app.sh [--install] [output_dir]
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-OUT="${1:-$HERE/dist}"
+INSTALL_TO_APPLICATIONS=0
+OUT=""
+for arg in "$@"; do
+    if [ "$arg" = "--install" ]; then
+        INSTALL_TO_APPLICATIONS=1
+    elif [ -z "$OUT" ]; then
+        OUT="$arg"
+    fi
+done
+OUT="${OUT:-$HERE/dist}"
 APP="$OUT/MacSweep.app"
 NAME="MacSweepApp"
 DISPLAY_NAME="MacSweep"
@@ -178,7 +188,25 @@ if [ -n "$NOTARY_PROFILE" ]; then
 fi
 mv -f "$ZIP_TMP" "$ZIP_OUT"
 
-echo "==> Done"
-du -sh "$APP" "$ZIP_OUT"
-file "$APP/Contents/MacOS/$NAME"
-echo "$APP"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+if [ "$INSTALL_TO_APPLICATIONS" -eq 1 ]; then
+    INSTALL_APP="/Applications/${DISPLAY_NAME}.app"
+    echo "==> Installing to $INSTALL_APP"
+    rm -rf "$INSTALL_APP"
+    ditto "$APP" "$INSTALL_APP"
+    codesign --verify --deep --strict --verbose=1 "$INSTALL_APP"
+    if [ -x "$LSREGISTER" ]; then
+        "$LSREGISTER" -u "$APP" >/dev/null 2>&1 || true
+        "$LSREGISTER" -f "$INSTALL_APP" >/dev/null 2>&1 || true
+    fi
+    rm -rf "$APP"
+    echo "==> Done (installed to $INSTALL_APP; removed duplicate $APP)"
+    du -sh "$INSTALL_APP" "$ZIP_OUT"
+    file "$INSTALL_APP/Contents/MacOS/$NAME"
+    echo "$INSTALL_APP"
+else
+    echo "==> Done"
+    du -sh "$APP" "$ZIP_OUT"
+    file "$APP/Contents/MacOS/$NAME"
+    echo "$APP"
+fi

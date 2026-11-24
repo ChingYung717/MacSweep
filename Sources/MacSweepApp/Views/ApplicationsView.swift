@@ -9,6 +9,7 @@ struct ApplicationsView: View {
     @StateObject private var collapsedBucketsBox = LocalState<Set<AppSizeBucket>>([])
     @StateObject private var collapsedCategoriesBox = LocalState<Set<ServiceFileCategory>>([])
     @StateObject private var dropOverDetailBox = LocalState(false)
+    @StateObject private var showMoreInfoBox = LocalState(false)
 
     private var l10n: L10n { state.l10n }
 
@@ -338,208 +339,178 @@ struct ApplicationsView: View {
         let selectedCount = selectedServiceFiles.count + (!isReset && state.includeAppBundleInRemoval && app.canUninstall ? 1 : 0)
         let selectedBytes = selectedServiceFiles.reduce(Int64(0)) { $0 + ($1.size ?? 0) }
             + (!isReset && state.includeAppBundleInRemoval && app.canUninstall ? (app.bundleSize ?? 0) : 0)
+        let grouped = groupedServiceFiles(app.serviceFiles)
 
         return VStack(spacing: 0) {
-            // App Detail Header Card
-            VStack(alignment: .leading, spacing: 14) {
-                HStack(alignment: .top, spacing: 14) {
-                    AppIconView(path: app.url.path, size: 54)
+            // Top Utility Bar (Expert Mode + Uninstall/Reset Mode + Quick Actions)
+            HStack(spacing: 12) {
+                Toggle(isOn: $state.isExpertMode) {
+                    Text(l10n.expertMode)
+                        .font(.system(size: 12.5, weight: .medium))
+                        .foregroundStyle(palette.primaryText)
+                }
+                .toggleStyle(.switch)
+                .controlSize(.small)
 
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 8) {
-                            Text(app.localizedName)
-                                .font(.system(size: 18, weight: .bold))
-                                .foregroundStyle(palette.primaryText)
-
-                            if !app.version.isEmpty {
-                                Text("v\(app.version)")
-                                    .font(.system(size: 11.5, weight: .medium))
-                                    .foregroundStyle(palette.secondaryText)
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(Capsule().fill(palette.cardBackground))
-                            }
-
-                            if app.isRunning {
-                                HStack(spacing: 4) {
-                                    Circle().fill(palette.success).frame(width: 6, height: 6)
-                                    Text(l10n.runningBadge)
-                                }
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(palette.success)
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 2)
-                                .background(Capsule().fill(palette.success.opacity(0.16)))
-                            }
-
-                            if app.isSystemProtected {
-                                Label(l10n.systemProtectedBadge, systemImage: "lock.shield.fill")
-                                    .font(.system(size: 11, weight: .semibold))
-                                    .foregroundStyle(palette.warning)
-                                    .padding(.horizontal, 7)
-                                    .padding(.vertical, 2)
-                                    .background(Capsule().fill(palette.warning.opacity(0.16)))
-                            }
-                        }
-
-                        Text(app.bundleID)
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundStyle(palette.secondaryText)
-                            .textSelection(.enabled)
-
-                        HStack(spacing: 12) {
-                            Button {
-                                state.revealInFinder(app.url)
-                            } label: {
-                                Label(app.url.path, systemImage: "folder")
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(palette.tertiaryText)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                            }
-                            .buttonStyle(.plain)
-
-                            Spacer()
-
-                            if let total = app.totalSize {
-                                Text(ByteFormatter.format(total))
-                                    .font(.system(size: 14, weight: .bold, design: .rounded))
-                                    .foregroundStyle(palette.primaryText)
-                            }
-                        }
+                if app.canUninstall {
+                    Picker("", selection: Binding(
+                        get: { state.appActionMode },
+                        set: { state.setAppActionMode($0) }
+                    )) {
+                        Text(l10n.uninstallMode).tag(AppActionMode.uninstall)
+                        Text(l10n.resetMode).tag(AppActionMode.reset)
                     }
+                    .pickerStyle(.segmented)
+                    .frame(width: 204)
                 }
 
-                // Mode Switch + Utility Controls
-                HStack(spacing: 10) {
-                    if app.canUninstall {
-                        Picker("", selection: Binding(
-                            get: { state.appActionMode },
-                            set: { state.setAppActionMode($0) }
-                        )) {
-                            Text(l10n.uninstallMode).tag(AppActionMode.uninstall)
-                            Text(l10n.resetMode).tag(AppActionMode.reset)
-                        }
-                        .pickerStyle(.segmented)
-                        .frame(width: 220)
-                    }
+                Spacer()
 
-                    Spacer()
-
-                    if app.isRunning {
-                        Button {
-                            Task { await state.quitApp(app) }
-                        } label: {
-                            Label(l10n.quitApp, systemImage: "xmark.circle")
-                                .font(.system(size: 12, weight: .medium))
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                    }
-
-                    if !app.isSystemProtected {
-                        Button {
-                            state.toggleProtection(for: app)
-                        } label: {
-                            Label(
-                                app.isProtected ? l10n.unprotectApp : l10n.protectApp,
-                                systemImage: app.isProtected ? "lock.open" : "lock"
-                            )
+                if app.isRunning {
+                    Button {
+                        Task { await state.quitApp(app) }
+                    } label: {
+                        Label(l10n.quitApp, systemImage: "xmark.circle")
                             .font(.system(size: 12, weight: .medium))
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
                     }
-
-                    if state.droppedApp != nil {
-                        Button {
-                            state.droppedApp = nil
-                        } label: {
-                            Image(systemName: "xmark")
-                                .font(.system(size: 11, weight: .bold))
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                 }
 
-                if app.sharesBundleIDWithOtherApp {
-                    HStack(spacing: 6) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(palette.warning)
-                        Text(l10n.t(
-                            "另一个已安装的应用使用相同的 Bundle ID（\(app.bundleID)），服务文件为两者共享，默认不勾选。",
-                            "Another installed app uses the same bundle ID (\(app.bundleID)); service files are shared and unchecked by default."
-                        ))
-                        .font(.system(size: 11.5))
-                        .foregroundStyle(palette.secondaryText)
+                if !app.isSystemProtected {
+                    Button {
+                        state.toggleProtection(for: app)
+                    } label: {
+                        Label(
+                            app.isProtected ? l10n.unprotectApp : l10n.protectApp,
+                            systemImage: app.isProtected ? "lock.open" : "lock"
+                        )
+                        .font(.system(size: 12, weight: .medium))
                     }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                 }
 
-                if app.isAppleAppStoreApp {
-                    HStack(spacing: 6) {
-                        Image(systemName: "info.circle.fill")
-                            .foregroundStyle(palette.warning)
-                        Text(l10n.appleStoreWarning)
-                            .font(.system(size: 11.5))
-                            .foregroundStyle(palette.secondaryText)
+                if state.droppedApp != nil {
+                    Button {
+                        state.droppedApp = nil
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 11, weight: .bold))
                     }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                 }
             }
-            .padding(18)
-            .background(palette.cardBackground.opacity(0.45))
+            .padding(.horizontal, 18)
+            .padding(.vertical, 10)
+            .background(palette.sidebarBackground.opacity(0.35))
             .overlay(alignment: .bottom) {
                 Rectangle().fill(palette.border).frame(height: 1)
             }
 
-            // Categorized File Tree
+            // Detailed Scrollable Body (App Summary Info Card + Categorized Tree / Overview)
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 10) {
-                    // Main Application Bundle Row
-                    if !isReset {
-                        let appFile = ServiceFile(
-                            url: app.url,
-                            category: .application,
-                            size: app.bundleSize,
-                            isSelected: state.includeAppBundleInRemoval && app.canUninstall,
-                            requiresAdmin: app.requiresAdmin,
-                            matchReason: app.bundleID
-                        )
-                        categorySection(
-                            appID: app.id,
-                            category: .application,
-                            files: [appFile],
-                            isMainAppSection: true,
-                            disabled: !app.canUninstall
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    appInfoSummaryCard(app: app)
+
+                    if app.sharesBundleIDWithOtherApp {
+                        HStack(spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(palette.warning)
+                            Text(l10n.t(
+                                "另一个已安装的应用使用相同的 Bundle ID（\(app.bundleID)），服务文件为两者共享，默认不勾选。",
+                                "Another installed app uses the same bundle ID (\(app.bundleID)); service files are shared and unchecked by default."
+                            ))
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(palette.secondaryText)
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .fill(palette.warning.opacity(0.10))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                        .strokeBorder(palette.warning.opacity(0.30), lineWidth: 1)
+                                )
                         )
                     }
 
-                    // Associated Service Files grouped by category
-                    let grouped = groupedServiceFiles(app.serviceFiles)
-                    if grouped.isEmpty {
-                        HStack {
-                            Spacer()
-                            VStack(spacing: 8) {
-                                Image(systemName: "checkmark.circle")
-                                    .font(.system(size: 26))
-                                    .foregroundStyle(palette.tertiaryText)
-                                Text(l10n.noServiceFiles)
-                                    .font(.system(size: 13))
-                                    .foregroundStyle(palette.secondaryText)
-                            }
-                            .padding(.vertical, 36)
-                            Spacer()
+                    if app.isAppleAppStoreApp {
+                        HStack(spacing: 8) {
+                            Image(systemName: "info.circle.fill")
+                                .foregroundStyle(palette.accent)
+                            Text(l10n.appleStoreWarning)
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(palette.secondaryText)
                         }
-                    } else {
-                        ForEach(grouped, id: \.category) { group in
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                .fill(palette.cardBackground.opacity(0.45))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                        .strokeBorder(palette.border, lineWidth: 1)
+                                )
+                        )
+                    }
+
+                    if state.isExpertMode {
+                        // Main Application Bundle Row
+                        if !isReset {
+                            let appFile = ServiceFile(
+                                url: app.url,
+                                category: .application,
+                                size: app.bundleSize,
+                                fileCount: app.bundleFileCount,
+                                folderCount: app.bundleFolderCount,
+                                isDirectory: true,
+                                isSymbolicLink: false,
+                                isSelected: state.includeAppBundleInRemoval && app.canUninstall,
+                                requiresAdmin: app.requiresAdmin,
+                                matchReason: app.bundleID
+                            )
                             categorySection(
                                 appID: app.id,
-                                category: group.category,
-                                files: group.files,
-                                isMainAppSection: false,
+                                appVersion: app.version,
+                                category: .application,
+                                files: [appFile],
+                                isMainAppSection: true,
                                 disabled: !app.canUninstall
                             )
                         }
+
+                        // Associated Service Files grouped by category
+                        if grouped.isEmpty {
+                            HStack {
+                                Spacer()
+                                VStack(spacing: 8) {
+                                    Image(systemName: "checkmark.circle")
+                                        .font(.system(size: 26))
+                                        .foregroundStyle(palette.tertiaryText)
+                                    Text(l10n.noServiceFiles)
+                                        .font(.system(size: 13))
+                                        .foregroundStyle(palette.secondaryText)
+                                }
+                                .padding(.vertical, 36)
+                                Spacer()
+                            }
+                        } else {
+                            ForEach(grouped, id: \.category) { group in
+                                categorySection(
+                                    appID: app.id,
+                                    appVersion: nil,
+                                    category: group.category,
+                                    files: group.files,
+                                    isMainAppSection: false,
+                                    disabled: !app.canUninstall
+                                )
+                            }
+                        }
+                    } else {
+                        simpleModeSummaryView(app: app, isReset: isReset, grouped: grouped)
                     }
 
                     // Matched pkgutil receipts note
@@ -572,6 +543,312 @@ struct ApplicationsView: View {
                 disabled: !app.canUninstall || selectedCount == 0 || state.isPerformingRemoval
             ) {
                 state.prepareRemovalForCurrentApps()
+            }
+        }
+    }
+
+    private func appInfoSummaryCard(app: AppItem) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            // Card Header: Icon + Title + Badges + Total Size
+            HStack(alignment: .center, spacing: 12) {
+                AppIconView(path: app.url.path, size: 38)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 7) {
+                        Text(SafeFileReader.sanitizeForDisplay(app.localizedName))
+                            .font(.system(size: 17, weight: .bold))
+                            .foregroundStyle(palette.primaryText)
+                            .lineLimit(1)
+
+                        if !app.version.isEmpty {
+                            Text("v\(app.version)")
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundStyle(palette.secondaryText)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Capsule().fill(palette.cardBackground))
+                        }
+
+                        if app.isRunning {
+                            HStack(spacing: 4) {
+                                Circle().fill(palette.success).frame(width: 6, height: 6)
+                                Text(l10n.runningBadge)
+                            }
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(palette.success)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 2)
+                            .background(Capsule().fill(palette.success.opacity(0.16)))
+                        }
+
+                        if app.isSystemProtected {
+                            Label(l10n.systemProtectedBadge, systemImage: "lock.shield.fill")
+                                .font(.system(size: 10.5, weight: .semibold))
+                                .foregroundStyle(palette.warning)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2)
+                                .background(Capsule().fill(palette.warning.opacity(0.16)))
+                        }
+                    }
+                }
+
+                Spacer()
+
+                if let total = app.totalSize {
+                    Text(ByteFormatter.format(total))
+                        .font(.system(size: 17, weight: .bold, design: .rounded))
+                        .foregroundStyle(palette.primaryText)
+                        .monospacedDigit()
+                } else {
+                    ProgressView().controlSize(.small)
+                }
+            }
+
+            Divider().overlay(palette.border.opacity(0.75))
+
+            // Primary Metadata Table (App Cleaner & Uninstaller style)
+            VStack(spacing: 7) {
+                HStack {
+                    Text(l10n.appFilesAndFoldersLabel)
+                        .font(.system(size: 12))
+                        .foregroundStyle(palette.secondaryText)
+                    Spacer()
+                    Text(l10n.itemCountLabel(app.totalAssociatedItemCount))
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(palette.accent)
+                        .help(l10n.filesAndFoldersSummary(
+                            files: app.associatedFileCount,
+                            folders: app.associatedFolderCount
+                        ))
+                }
+
+                HStack {
+                    Text(l10n.developerLabel)
+                        .font(.system(size: 12))
+                        .foregroundStyle(palette.secondaryText)
+                    Spacer()
+                    Text(SafeFileReader.sanitizeForDisplay(app.developerName ?? l10n.unknownDeveloper))
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(palette.primaryText)
+                        .lineLimit(1)
+                }
+
+                HStack {
+                    Text(l10n.appVerificationLabel)
+                        .font(.system(size: 12))
+                        .foregroundStyle(palette.secondaryText)
+                    Spacer()
+                    verificationBadge(app.verificationStatus)
+                }
+            }
+
+            // Collapsible "More Info" section
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    showMoreInfoBox.value.toggle()
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: showMoreInfoBox.value ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                    Text(showMoreInfoBox.value ? l10n.hideInfo : l10n.moreInfo)
+                        .font(.system(size: 12, weight: .medium))
+                }
+                .foregroundStyle(palette.secondaryText)
+                .padding(.top, 2)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if showMoreInfoBox.value {
+                Divider().overlay(palette.border.opacity(0.6))
+                VStack(spacing: 6) {
+                    metadataDetailRow(label: "Bundle ID", value: app.bundleID, monospaced: true)
+                    if !app.version.isEmpty {
+                        metadataDetailRow(label: l10n.versionLabel, value: "v\(app.version)")
+                    }
+                    if let arch = app.architectureSummary {
+                        metadataDetailRow(label: l10n.architectureLabel, value: arch)
+                    }
+                    if let team = app.teamIdentifier, !team.isEmpty {
+                        metadataDetailRow(label: l10n.teamIDLabel, value: team, monospaced: true)
+                    }
+                    if let minOS = app.minimumSystemVersion, !minOS.isEmpty {
+                        metadataDetailRow(label: l10n.minSystemLabel, value: "macOS \(minOS)+")
+                    }
+                    if let lastUsed = app.lastUsedDate {
+                        metadataDetailRow(label: l10n.lastUsedLabel, value: l10n.formatDate(lastUsed))
+                    }
+                    if let modified = app.modifiedDate {
+                        metadataDetailRow(label: l10n.modifiedLabel, value: l10n.formatDate(modified))
+                    }
+                    HStack(alignment: .top, spacing: 10) {
+                        Text(l10n.installPathLabel)
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(palette.tertiaryText)
+                        Spacer()
+                        Button {
+                            state.revealInFinder(app.url)
+                        } label: {
+                            HStack(spacing: 4) {
+                                Text(SafeFileReader.sanitizeForDisplay(app.url.path))
+                                    .font(.system(size: 11.5, design: .monospaced))
+                                    .foregroundStyle(palette.accent)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Image(systemName: "arrow.up.forward.square")
+                                    .font(.system(size: 10.5))
+                                    .foregroundStyle(palette.accent)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .help(l10n.revealInFinder)
+                    }
+                }
+                .padding(.top, 2)
+            }
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(palette.cardBackground.opacity(0.62))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(palette.border, lineWidth: 1)
+                )
+        )
+    }
+
+    private func metadataDetailRow(label: String, value: String, monospaced: Bool = false) -> some View {
+        HStack(spacing: 10) {
+            Text(label)
+                .font(.system(size: 11.5))
+                .foregroundStyle(palette.tertiaryText)
+            Spacer()
+            Text(SafeFileReader.sanitizeForDisplay(value))
+                .font(monospaced ? .system(size: 11.5, design: .monospaced) : .system(size: 11.5))
+                .foregroundStyle(palette.secondaryText)
+                .textSelection(.enabled)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+
+    @ViewBuilder
+    private func verificationBadge(_ status: AppVerificationStatus) -> some View {
+        let (icon, color): (String, Color) = {
+            switch status {
+            case .notarized: return ("checkmark.seal.fill", palette.success)
+            case .appStore: return ("checkmark.seal.fill", palette.accent)
+            case .appleSystem: return ("apple.logo", palette.accent)
+            case .developerSigned: return ("checkmark.shield.fill", palette.primaryText)
+            case .adHocOrUnsigned: return ("exclamationmark.triangle.fill", palette.warning)
+            }
+        }()
+        HStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.system(size: 11))
+                .foregroundStyle(color)
+            Text(l10n.verificationStatusTitle(status))
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(status == .adHocOrUnsigned ? palette.warning : palette.primaryText)
+        }
+    }
+
+    private func simpleModeSummaryView(
+        app: AppItem,
+        isReset: Bool,
+        grouped: [(category: ServiceFileCategory, files: [ServiceFile])]
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if !isReset {
+                HStack(spacing: 10) {
+                    SweepCheckbox(
+                        isChecked: state.includeAppBundleInRemoval && app.canUninstall,
+                        isDisabled: !app.canUninstall,
+                        palette: palette
+                    ) {
+                        state.includeAppBundleInRemoval.toggle()
+                    }
+                    AppIconView(path: app.url.path, size: 24)
+                    VStack(alignment: .leading, spacing: 1.5) {
+                        Text(l10n.categoryTitle(.application))
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(palette.primaryText)
+                        Text(app.url.lastPathComponent)
+                            .font(.system(size: 11))
+                            .foregroundStyle(palette.tertiaryText)
+                    }
+                    Spacer()
+                    Text(ByteFormatter.format(app.bundleSize ?? 0))
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                        .foregroundStyle(palette.secondaryText)
+                        .monospacedDigit()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(palette.cardBackground.opacity(0.55))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .strokeBorder(palette.border, lineWidth: 1)
+                        )
+                )
+            }
+
+            ForEach(grouped, id: \.category) { group in
+                let allSelected = group.files.allSatisfy(\.isSelected)
+                let catBytes = group.files.reduce(Int64(0)) { $0 + ($1.size ?? 0) }
+                let (catFiles, catFolders) = categoryFileFolderCounts(group.files)
+                HStack(spacing: 10) {
+                    SweepCheckbox(
+                        isChecked: allSelected,
+                        isDisabled: !app.canUninstall,
+                        palette: palette
+                    ) {
+                        state.toggleServiceCategory(appID: app.id, category: group.category, selected: !allSelected)
+                    }
+                    VStack(alignment: .leading, spacing: 1.5) {
+                        Text(l10n.categoryTitle(group.category))
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(palette.primaryText)
+                        Text(l10n.filesAndFoldersSummary(files: catFiles, folders: catFolders))
+                            .font(.system(size: 11))
+                            .foregroundStyle(palette.tertiaryText)
+                    }
+                    Spacer()
+                    Text(ByteFormatter.format(catBytes))
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                        .foregroundStyle(palette.secondaryText)
+                        .monospacedDigit()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(palette.cardBackground.opacity(0.55))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .strokeBorder(palette.border, lineWidth: 1)
+                        )
+                )
+            }
+
+            if !grouped.isEmpty {
+                Button {
+                    state.isExpertMode = true
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "list.bullet.indent")
+                            .font(.system(size: 11))
+                        Text(l10n.t("切换到「专家模式」查看和展开每个关联文件", "Switch to Expert Mode to inspect individual files and folders"))
+                            .font(.system(size: 11.5))
+                    }
+                    .foregroundStyle(palette.accent)
+                    .padding(.top, 4)
+                }
+                .buttonStyle(.plain)
             }
         }
     }
@@ -658,6 +935,7 @@ struct ApplicationsView: View {
 
     private func categorySection(
         appID: String,
+        appVersion: String? = nil,
         category: ServiceFileCategory,
         files: [ServiceFile],
         isMainAppSection: Bool,
@@ -666,23 +944,10 @@ struct ApplicationsView: View {
         let isCollapsed = collapsedCategoriesBox.value.contains(category)
         let allSelected = !files.isEmpty && files.allSatisfy(\.isSelected)
         let categoryBytes = files.reduce(Int64(0)) { $0 + ($1.size ?? 0) }
+        let (catFiles, catFolders) = categoryFileFolderCounts(files)
 
         return VStack(spacing: 4) {
             HStack(spacing: 8) {
-                Button {
-                    if isCollapsed {
-                        collapsedCategoriesBox.value.remove(category)
-                    } else {
-                        collapsedCategoriesBox.value.insert(category)
-                    }
-                } label: {
-                    Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
-                        .font(.system(size: 10.5, weight: .semibold))
-                        .foregroundStyle(palette.secondaryText)
-                        .frame(width: 14)
-                }
-                .buttonStyle(.plain)
-
                 SweepCheckbox(isChecked: allSelected, isDisabled: disabled, palette: palette) {
                     if isMainAppSection {
                         state.includeAppBundleInRemoval.toggle()
@@ -691,15 +956,39 @@ struct ApplicationsView: View {
                     }
                 }
 
-                Text(l10n.categoryTitle(category))
-                    .font(.system(size: 12.5, weight: .semibold))
-                    .foregroundStyle(palette.primaryText)
+                Button {
+                    if isCollapsed {
+                        collapsedCategoriesBox.value.remove(category)
+                    } else {
+                        collapsedCategoriesBox.value.insert(category)
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(palette.secondaryText)
+                            .frame(width: 14)
 
-                Text("(\(files.count))")
-                    .font(.system(size: 11.5))
-                    .foregroundStyle(palette.tertiaryText)
+                        Text(l10n.categoryTitle(category))
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(palette.primaryText)
+
+                        Text("(\(files.count))")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(palette.tertiaryText)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
 
                 Spacer()
+
+                if !isMainAppSection {
+                    Text(l10n.filesAndFoldersSummary(files: catFiles, folders: catFolders))
+                        .font(.system(size: 11))
+                        .foregroundStyle(palette.tertiaryText)
+                        .lineLimit(1)
+                }
 
                 Text(ByteFormatter.format(categoryBytes))
                     .font(.system(size: 12, weight: .medium, design: .rounded))
@@ -725,6 +1014,9 @@ struct ApplicationsView: View {
                             isDisabled: disabled,
                             palette: palette,
                             l10n: l10n,
+                            versionBadge: (isMainAppSection && (appVersion?.isEmpty == false)) ? "v\(appVersion!)" : nil,
+                            allowExpandDirectory: !isMainAppSection,
+                            showParentOnly: true,
                             onToggle: {
                                 if isMainAppSection {
                                     state.includeAppBundleInRemoval.toggle()
@@ -734,13 +1026,32 @@ struct ApplicationsView: View {
                             },
                             onReveal: {
                                 state.revealInFinder(file.url)
+                            },
+                            onRevealURL: { targetURL in
+                                state.revealInFinder(targetURL)
                             }
                         )
                     }
                 }
-                .padding(.leading, 18)
+                .padding(.leading, 10)
             }
         }
+    }
+
+    private func categoryFileFolderCounts(_ files: [ServiceFile]) -> (files: Int, folders: Int) {
+        var totalFiles = 0
+        var totalFolders = 0
+        for sf in files {
+            if let fc = sf.fileCount, let dc = sf.folderCount {
+                totalFiles += fc
+                totalFolders += dc + (sf.isDirectory ? 1 : 0)
+            } else if sf.isDirectory {
+                totalFolders += 1
+            } else {
+                totalFiles += 1
+            }
+        }
+        return (totalFiles, totalFolders)
     }
 
     private func bottomActionBar(

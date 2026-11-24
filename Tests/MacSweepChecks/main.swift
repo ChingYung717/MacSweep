@@ -20,7 +20,7 @@ if CommandLine.arguments.contains("--live-audit") {
     let allIDs = Set(apps.map { $0.bundleID.lowercased() }.filter { !$0.hasPrefix("unknown.") })
     let allPaths = Set(apps.map { $0.url.standardizedFileURL.path })
     let groupOwners = ServiceFileMatcher.applicationGroupOwners(across: apps)
-    for probeName in ["AweSun", "Google Drive", "印象笔记", "aDrive", "Microsoft Word"] {
+    for probeName in ["Docker", "AweSun", "Google Drive", "印象笔记", "aDrive", "Microsoft Word"] {
         if let app = apps.first(where: { $0.name == probeName || $0.localizedName == probeName }) {
             let otherGroups = ServiceFileMatcher.otherInstalledApplicationGroups(for: app, groupOwners: groupOwners)
             let res = matcher.matchWithPackages(
@@ -45,7 +45,12 @@ if CommandLine.arguments.contains("--live-audit") {
                     || $0.hasPrefix("/Applications/Google Docs")
                     || (probeName == "Microsoft Word" && sharedOfficeSuffixes.contains(URL(fileURLWithPath: $0).lastPathComponent))
             }
-            print("  - \(app.localizedName) [\(app.bundleID)]: \(res.files.count) files, pkgs=\(res.matchedPackageIDs.count), badSharedHits=\(badPaths)")
+            print("  - \(app.localizedName) [\(app.bundleID)]: \(res.files.count) files, pkgs=\(res.matchedPackageIDs.count), dev=\(app.developerName ?? "nil"), verify=\(app.verificationStatus.rawValue), badSharedHits=\(badPaths)")
+            if probeName == "Docker" {
+                for f in res.files {
+                    print("      * [\(f.category.rawValue)] \(f.url.path) (selected=\(f.isSelected), reason=\(f.matchReason))")
+                }
+            }
         }
     }
 
