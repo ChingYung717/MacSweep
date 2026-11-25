@@ -53,6 +53,9 @@ public struct StartupScanner: Sendable {
         scope: StartupScope,
         disabledOverrides: [String: Bool]
     ) -> [StartupItem] {
+        guard safetyGuard.isContainedDirectory(dirURL) else {
+            return []
+        }
         let fm = FileManager.default
         guard let children = try? fm.contentsOfDirectory(
             at: dirURL,
@@ -64,6 +67,7 @@ public struct StartupScanner: Sendable {
 
         var items: [StartupItem] = []
         for url in children where url.pathExtension.lowercased() == "plist" {
+            guard !safetyGuard.isSymbolicLink(url) else { continue }
             guard let item = parseLaunchPlist(at: url, scope: scope, disabledOverrides: disabledOverrides) else {
                 continue
             }
@@ -159,8 +163,10 @@ public struct StartupScanner: Sendable {
 
             // 1. Contents/Library/LoginItems/*.app
             let loginItemsDir = appURL.appendingPathComponent("Contents/Library/LoginItems")
-            if let helpers = try? fm.contentsOfDirectory(at: loginItemsDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+            if safetyGuard.isContainedCanonicalSubpath(relativePath: "Contents/Library/LoginItems", under: appURL),
+               let helpers = try? fm.contentsOfDirectory(at: loginItemsDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
                 for helper in helpers where helper.pathExtension.lowercased() == "app" {
+                    guard !safetyGuard.isSymbolicLink(helper) else { continue }
                     let helperBundle = Bundle(url: helper)
                     let helperID = helperBundle?.bundleIdentifier ?? helper.deletingPathExtension().lastPathComponent
                     let item = StartupItem(
@@ -190,8 +196,10 @@ public struct StartupScanner: Sendable {
 
             // 2. Contents/Library/LaunchAgents/*.plist (modern SMAppService embedded agents)
             let embeddedAgentsDir = appURL.appendingPathComponent("Contents/Library/LaunchAgents")
-            if let plists = try? fm.contentsOfDirectory(at: embeddedAgentsDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+            if safetyGuard.isContainedCanonicalSubpath(relativePath: "Contents/Library/LaunchAgents", under: appURL),
+               let plists = try? fm.contentsOfDirectory(at: embeddedAgentsDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
                 for plistURL in plists where plistURL.pathExtension.lowercased() == "plist" {
+                    guard !safetyGuard.isSymbolicLink(plistURL) else { continue }
                     let meta = LibraryIndex.parseLaunchPlistMetadata(at: plistURL)
                     let label = meta.label ?? plistURL.deletingPathExtension().lastPathComponent
                     let lowerEmbedded = label.lowercased()
@@ -232,19 +240,21 @@ public struct StartupScanner: Sendable {
             }
             for child in children {
                 if child.pathExtension.lowercased() == "app" {
-                    inspectEmbedded(in: child)
+                    if !safetyGuard.isSymbolicLink(child) {
+                        inspectEmbedded(in: child)
+                    }
                     continue
                 }
                 if depth == 0 {
                     let vals = try? child.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey, .isSymbolicLinkKey])
-                    if vals?.isDirectory == true, vals?.isPackage != true, vals?.isSymbolicLink != true {
+                    if vals?.isDirectory == true, vals?.isPackage != true, vals?.isSymbolicLink != true, !safetyGuard.isSymbolicLink(child) {
                         walkApps(in: child, depth: 1)
                     }
                 }
             }
         }
 
-        for root in appSearchRoots {
+        for root in appSearchRoots where safetyGuard.isContainedDirectory(root) {
             walkApps(in: root, depth: 0)
         }
         return items

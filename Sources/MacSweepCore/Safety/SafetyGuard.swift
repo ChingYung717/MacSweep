@@ -38,32 +38,77 @@ public struct SafetyGuard: Sendable {
         let stdHome = homeDirectory.standardizedFileURL.path
         let resHome = homeDirectory.resolvingSymlinksInPath().standardizedFileURL.path
         let realHome = Self.posixRealpath(stdHome)
-        let homeVariants = Array(Set([stdHome, resHome, realHome].compactMap { $0 }))
+        let canonHome = Self.canonicalPathResolvingDeepestAncestor(for: homeDirectory)
+        let homeVariants = Array(Set([
+            stdHome,
+            resHome,
+            realHome,
+            canonHome,
+            Self.applyMacOSPrivatePrefix(stdHome),
+            Self.applyMacOSPrivatePrefix(resHome),
+        ].compactMap { $0 }))
 
-        func makeSelfDataPaths(for homePath: String) -> [String] {
+        let selfDataRelativePaths = [
+            "Library/Application Support/MacSweep",
+            "Library/Preferences/local.macsweep.plist",
+            "Library/Caches/local.macsweep",
+            "Library/Saved Application State/local.macsweep.savedState",
+            "Library/HTTPStorages/local.macsweep",
+            "Library/WebKit/local.macsweep",
+        ]
+
+        func makePrimarySelfDataPaths(for homePath: String) -> [String] {
             let homeURL = URL(fileURLWithPath: homePath)
-            return [
-                homeURL.appendingPathComponent("Library/Application Support/MacSweep").standardizedFileURL.path,
-                homeURL.appendingPathComponent("Library/Preferences/local.macsweep.plist").standardizedFileURL.path,
-                homeURL.appendingPathComponent("Library/Caches/local.macsweep").standardizedFileURL.path,
-                homeURL.appendingPathComponent("Library/Saved Application State/local.macsweep.savedState").standardizedFileURL.path,
-                homeURL.appendingPathComponent("Library/HTTPStorages/local.macsweep").standardizedFileURL.path,
-                homeURL.appendingPathComponent("Library/WebKit/local.macsweep").standardizedFileURL.path,
-            ]
+            return selfDataRelativePaths.map {
+                homeURL.appendingPathComponent($0).standardizedFileURL.path
+            }
         }
 
-        let primaryDataPaths = makeSelfDataPaths(for: stdHome)
-        let allDataPaths = Array(Set(homeVariants.flatMap(makeSelfDataPaths(for:))))
+        func makeAllSelfDataPaths(for homePath: String) -> [String] {
+            let trimmedHome = homePath == "/"
+                ? ""
+                : (homePath.hasSuffix("/") ? String(homePath.dropLast()) : homePath)
+            var paths: [String] = []
+            for rel in selfDataRelativePaths {
+                let rawJoined = "\(trimmedHome)/\(rel)"
+                let rawURL = URL(fileURLWithPath: rawJoined)
+                let std = rawURL.standardizedFileURL.path
+                let res = rawURL.resolvingSymlinksInPath().standardizedFileURL.path
+                paths.append(rawJoined)
+                paths.append(Self.applyMacOSPrivatePrefix(rawJoined))
+                paths.append(std)
+                paths.append(Self.applyMacOSPrivatePrefix(std))
+                paths.append(res)
+                paths.append(Self.applyMacOSPrivatePrefix(res))
+                if let real = Self.posixRealpath(std) {
+                    paths.append(real)
+                } else {
+                    paths.append(Self.canonicalPathResolvingDeepestAncestor(for: rawURL))
+                }
+            }
+            return paths
+        }
+
+        let primaryDataPaths = makePrimarySelfDataPaths(for: stdHome)
+        let allDataPaths = Array(Set(homeVariants.flatMap(makeAllSelfDataPaths(for:))))
 
         self.homeDirectoryPath = stdHome
-        if let rawSelf = selfBundlePath {
+        if let rawSelf = selfBundlePath, !rawSelf.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let url = URL(fileURLWithPath: rawSelf)
             let stdSelf = url.standardizedFileURL.path
             let resSelf = url.resolvingSymlinksInPath().standardizedFileURL.path
             let realSelf = Self.posixRealpath(stdSelf)
+            let canonSelf = Self.canonicalPathResolvingDeepestAncestor(for: url)
             self.selfBundlePath = stdSelf
             self.selfResolvedBundlePath = resSelf
-            self.selfBundlePathsLower = Array(Set([stdSelf, resSelf, realSelf].compactMap { $0 }.map(Self.normalizedForCompare)))
+            self.selfBundlePathsLower = Array(Set([
+                stdSelf,
+                resSelf,
+                realSelf,
+                canonSelf,
+                Self.applyMacOSPrivatePrefix(stdSelf),
+                Self.applyMacOSPrivatePrefix(resSelf),
+            ].compactMap { $0 }.map(Self.normalizedForCompare)))
         } else {
             self.selfBundlePath = nil
             self.selfResolvedBundlePath = nil
@@ -75,14 +120,30 @@ public struct SafetyGuard: Sendable {
         var allProtectedStd = Set<String>()
         var allProtectedLower = Set<String>()
         for rawProtected in protectedPaths {
+            guard !rawProtected.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !rawProtected.contains("\0") else {
+                continue
+            }
             let url = URL(fileURLWithPath: rawProtected)
             let std = url.standardizedFileURL.path
             let res = url.resolvingSymlinksInPath().standardizedFileURL.path
+            let canon = Self.canonicalPathResolvingDeepestAncestor(for: url)
             allProtectedStd.insert(std)
-            allProtectedLower.insert(Self.normalizedForCompare(std))
-            allProtectedLower.insert(Self.normalizedForCompare(res))
+            var variants = [
+                std,
+                res,
+                canon,
+                Self.applyMacOSPrivatePrefix(std),
+                Self.applyMacOSPrivatePrefix(res),
+            ]
             if let real = Self.posixRealpath(std) {
-                allProtectedLower.insert(Self.normalizedForCompare(real))
+                variants.append(real)
+            }
+            for variant in variants {
+                let norm = Self.normalizedForCompare(variant)
+                if !norm.isEmpty {
+                    allProtectedLower.insert(norm)
+                }
             }
         }
         self.protectedPaths = allProtectedStd
@@ -164,6 +225,11 @@ public struct SafetyGuard: Sendable {
         candidate == target || candidate.hasPrefix(target + "/") || target.hasPrefix(candidate + "/")
     }
 
+    private static func isSameOrDescendant(_ candidate: String, of target: String) -> Bool {
+        if target == "/" { return true }
+        return candidate == target || candidate.hasPrefix(target + "/")
+    }
+
     /// Resolves `path` via POSIX `realpath(3)` (preserves `/private` on macOS, unlike Foundation's
     /// `resolvingSymlinksInPath`). Returns `nil` if the path or an ancestor cannot be resolved.
     internal static func posixRealpath(_ path: String) -> String? {
@@ -173,6 +239,41 @@ public struct SafetyGuard: Sendable {
             return String(cString: resolved)
         }
         return nil
+    }
+
+    internal static func applyMacOSPrivatePrefix(_ path: String) -> String {
+        for prefix in ["/var", "/tmp", "/etc"] {
+            if path == prefix || path.hasPrefix(prefix + "/") {
+                return "/private" + path
+            }
+        }
+        return path
+    }
+
+    /// Resolves `url` via POSIX `realpath(3)` when it exists, or resolves its deepest existing ancestor
+    /// and re-appends trailing non-existent components (normalizing `/var`, `/tmp`, `/etc` -> `/private/...`).
+    public static func canonicalPathResolvingDeepestAncestor(for url: URL) -> String {
+        let stdURL = url.standardizedFileURL
+        let stdPath = stdURL.path
+        if let resolved = posixRealpath(stdPath) {
+            return resolved
+        }
+        var current = stdURL
+        var trailing: [String] = []
+        while current.path != "/" {
+            let parent = current.deletingLastPathComponent()
+            if parent.path == current.path { break }
+            trailing.append(current.lastPathComponent)
+            current = parent
+            if let resolved = posixRealpath(current.path) {
+                var base = URL(fileURLWithPath: resolved)
+                for comp in trailing.reversed() {
+                    base.appendPathComponent(comp)
+                }
+                return applyMacOSPrivatePrefix(base.standardizedFileURL.path)
+            }
+        }
+        return applyMacOSPrivatePrefix(stdURL.resolvingSymlinksInPath().standardizedFileURL.path)
     }
 
     private static func candidatePaths(for url: URL) -> [(raw: String, normalized: String)] {
@@ -185,24 +286,21 @@ public struct SafetyGuard: Sendable {
         if seen.insert(normResolved).inserted {
             results.append((resolvedPath, normResolved))
         }
+        let prefixedResolved = applyMacOSPrivatePrefix(resolvedPath)
+        let normPrefixedResolved = normalizedForCompare(prefixedResolved)
+        if seen.insert(normPrefixedResolved).inserted {
+            results.append((prefixedResolved, normPrefixedResolved))
+        }
         if let realPath = posixRealpath(rawPath) {
             let normReal = normalizedForCompare(realPath)
             if seen.insert(normReal).inserted {
                 results.append((realPath, normReal))
             }
         } else {
-            // Also resolve existing parent via realpath(3) so non-existent leaves under `/var/db/...`
-            // still see their `/private/var/db/...` canonical path.
-            let stdURL = url.standardizedFileURL
-            let parentPath = stdURL.deletingLastPathComponent().path
-            if let realParent = posixRealpath(parentPath) {
-                let combined = URL(fileURLWithPath: realParent)
-                    .appendingPathComponent(stdURL.lastPathComponent)
-                    .standardizedFileURL.path
-                let normCombined = normalizedForCompare(combined)
-                if seen.insert(normCombined).inserted {
-                    results.append((combined, normCombined))
-                }
+            let ancestorResolved = canonicalPathResolvingDeepestAncestor(for: url)
+            let normAncestor = normalizedForCompare(ancestorResolved)
+            if seen.insert(normAncestor).inserted {
+                results.append((ancestorResolved, normAncestor))
             }
         }
         return results
@@ -590,6 +688,17 @@ public struct SafetyGuard: Sendable {
         return (st.st_flags & mask) != 0
     }
 
+    /// Checks POSIX `lstat` flags for directory-traversal-blocking kernel/SIP flags
+    /// (`SF_RESTRICTED`, `SF_IMMUTABLE`) without treating `SF_NOUNLINK` (`sunlnk`) as un-scannable.
+    /// macOS sets `SF_NOUNLINK` on `/`, `/Applications`, `/Library`, and `/Users` to prevent
+    /// unlinking those roots, while read-only directory traversal inside them is valid.
+    public func isSIPRestrictedForTraversal(_ url: URL) -> Bool {
+        var st = stat()
+        guard lstat(url.path, &st) == 0 else { return false }
+        let mask = UInt32(SF_RESTRICTED) | UInt32(SF_IMMUTABLE)
+        return (st.st_flags & mask) != 0
+    }
+
     /// Checks POSIX `lstat` flags for user-set immutability (`UF_IMMUTABLE` / `chflags uchg`)
     /// without following symlinks.
     public func isUserImmutable(_ url: URL) -> Bool {
@@ -731,19 +840,25 @@ public struct SafetyGuard: Sendable {
     /// (used for filtering pkgutil, leftovers, and final removal validation).
     public func isCriticalSharedDirectory(_ path: String) -> Bool {
         let url = URL(fileURLWithPath: path)
-        let std = url.standardizedFileURL.path
-        if criticalExactPathsLower.contains(Self.normalizedForCompare(std)) {
-            return true
-        }
-        if let real = Self.posixRealpath(std),
-           criticalExactPathsLower.contains(Self.normalizedForCompare(real)) {
-            return true
-        }
-        let last = url.lastPathComponent.precomposedStringWithCanonicalMapping.lowercased()
-        let parent = url.deletingLastPathComponent().lastPathComponent.precomposedStringWithCanonicalMapping.lowercased()
-        if ["application support", "caches", "preferences", "logs"].contains(parent),
-           (Self.sharedVendorFolderNames.contains(last) || last == "apple") {
-            return true
+        for (_, normCandidate) in Self.candidatePaths(for: url) {
+            if criticalExactPathsLower.contains(normCandidate) {
+                return true
+            }
+            for category in ["application support", "caches", "preferences", "logs"] {
+                if let child = firstChild(under: "/library/\(category)/", in: normCandidate),
+                   normCandidate == "/library/\(category)/\(child)",
+                   (Self.sharedVendorFolderNames.contains(child) || child == "apple") {
+                    return true
+                }
+                for homePrefix in homePrefixesLower {
+                    let libPrefix = homePrefix == "/" ? "/library" : "\(homePrefix)/library"
+                    if let child = firstChild(under: "\(libPrefix)/\(category)/", in: normCandidate),
+                       normCandidate == "\(libPrefix)/\(category)/\(child)",
+                       (Self.sharedVendorFolderNames.contains(child) || child == "apple") {
+                        return true
+                    }
+                }
+            }
         }
         return false
     }
@@ -751,12 +866,13 @@ public struct SafetyGuard: Sendable {
     /// Validates raw standardized path, Foundation symlink-resolved path, AND POSIX `realpath(3)` before any deletion.
     /// Note: Deletion itself always targets the raw URL (never following symlinks).
     public func validateForRemoval(_ url: URL) -> RemovalValidationResult {
+        if !Self.isValidURLPath(url) {
+            return .blocked(reason: "Cannot remove root or invalid filesystem path")
+        }
         let rawPath = url.standardizedFileURL.path
         let resolvedPath = url.resolvingSymlinksInPath().standardizedFileURL.path
 
-        if !url.isFileURL || rawPath.isEmpty || rawPath == "/"
-            || rawPath.contains("\0") || resolvedPath.contains("\0")
-            || url.absoluteString.lowercased().contains("%00") {
+        if rawPath == "/" || resolvedPath.contains("\0") {
             return .blocked(reason: "Cannot remove root or invalid filesystem path")
         }
 
@@ -824,6 +940,15 @@ public struct SafetyGuard: Sendable {
         return String(remainder)
     }
 
+    private static func isRemovableAppleAppStorePreferenceName(_ child: String) -> Bool {
+        // Mac App Store Apple productivity suite (Pages / Numbers / Keynote) can be reset/uninstalled.
+        child.hasPrefix("com.apple.iwork.")
+    }
+
+    private static func isProtectedAppleIdentifier(_ child: String) -> Bool {
+        child == "apple" || child == "com.apple" || child.hasPrefix("com.apple.")
+    }
+
     private func protectedSensitiveLibraryOrPhotosReason(candidate: String, normalizedPath: String) -> String? {
         // Protect any Photos Library bundle (*.photoslibrary) and all of its contents anywhere on disk.
         let comps = URL(fileURLWithPath: normalizedPath).pathComponents
@@ -836,11 +961,38 @@ public struct SafetyGuard: Sendable {
            (sysAppSuppChild == "com.apple" || sysAppSuppChild.hasPrefix("com.apple.")) {
             return "Protected Apple system support data: \(candidate)"
         }
+        // System `/Library/Caches/` (`apple`, `com.apple`, `com.apple.*`, Apple group containers)
+        if let sysCacheChild = firstChild(under: "/library/caches/", in: normalizedPath),
+           Self.isProtectedAppleIdentifier(sysCacheChild) || Self.isAppleGroupContainerName(sysCacheChild) {
+            return "Protected Apple system cache path: \(candidate)"
+        }
+        // System `/Library/Preferences/` (`apple`, `com.apple`, `com.apple.*`, `.globalpreferences*`)
+        if let sysPrefChild = firstChild(under: "/library/preferences/", in: normalizedPath) {
+            if Self.isProtectedAppleIdentifier(sysPrefChild)
+                || sysPrefChild == ".globalpreferences"
+                || sysPrefChild.hasPrefix(".globalpreferences.") {
+                return "Protected Apple system preferences: \(candidate)"
+            }
+            if sysPrefChild == "byhost",
+               let byHostChild = firstChild(under: "/library/preferences/byhost/", in: normalizedPath),
+               Self.isProtectedAppleIdentifier(byHostChild) {
+                return "Protected Apple system preferences: \(candidate)"
+            }
+        }
+        // System `/Library/Saved Application State/com.apple.*`
+        if let sysSavedStateChild = firstChild(under: "/library/saved application state/", in: normalizedPath),
+           Self.isProtectedAppleIdentifier(sysSavedStateChild) {
+            return "Protected Apple system saved state: \(candidate)"
+        }
 
         for homePrefix in homePrefixesLower {
             if let appSuppChild = firstChild(under: "\(homePrefix)/library/application support/", in: normalizedPath),
                (appSuppChild == "com.apple" || appSuppChild.hasPrefix("com.apple.")) {
                 return "Protected Apple application support data: \(candidate)"
+            }
+            if let cacheChild = firstChild(under: "\(homePrefix)/library/caches/", in: normalizedPath),
+               Self.isProtectedAppleIdentifier(cacheChild) || Self.isAppleGroupContainerName(cacheChild) {
+                return "Protected Apple cache path: \(candidate)"
             }
             if let containerChild = firstChild(under: "\(homePrefix)/library/containers/", in: normalizedPath),
                (containerChild == "com.apple" || containerChild.hasPrefix("com.apple.")) {
@@ -855,6 +1007,31 @@ public struct SafetyGuard: Sendable {
                 || cookieChild == "com.apple" || cookieChild.hasPrefix("com.apple.")) {
                 return "Protected Apple cookies data: \(candidate)"
             }
+            if let prefChild = firstChild(under: "\(homePrefix)/library/preferences/", in: normalizedPath) {
+                if (Self.isProtectedAppleIdentifier(prefChild) && !Self.isRemovableAppleAppStorePreferenceName(prefChild))
+                    || prefChild == ".globalpreferences"
+                    || prefChild.hasPrefix(".globalpreferences.") {
+                    return "Protected Apple preferences: \(candidate)"
+                }
+                if prefChild == "byhost",
+                   let byHostChild = firstChild(under: "\(homePrefix)/library/preferences/byhost/", in: normalizedPath),
+                   Self.isProtectedAppleIdentifier(byHostChild),
+                   !Self.isRemovableAppleAppStorePreferenceName(byHostChild) {
+                    return "Protected Apple preferences: \(candidate)"
+                }
+            }
+            if let savedStateChild = firstChild(under: "\(homePrefix)/library/saved application state/", in: normalizedPath),
+               Self.isProtectedAppleIdentifier(savedStateChild) {
+                return "Protected Apple saved application state: \(candidate)"
+            }
+            if let httpStorageChild = firstChild(under: "\(homePrefix)/library/httpstorages/", in: normalizedPath),
+               Self.isProtectedAppleIdentifier(httpStorageChild) {
+                return "Protected Apple HTTP storage: \(candidate)"
+            }
+            if let webKitChild = firstChild(under: "\(homePrefix)/library/webkit/", in: normalizedPath),
+               Self.isProtectedAppleIdentifier(webKitChild) {
+                return "Protected Apple WebKit data: \(candidate)"
+            }
         }
         return nil
     }
@@ -868,11 +1045,23 @@ public struct SafetyGuard: Sendable {
         guard isInLibraryOrLaunch else { return false }
 
         // Check leaf name, stripped stem/UUID, and (for nested files inside a protected container) ancestor
-        // components directly under `/Library/...`.
+        // components starting after the outermost `/Library/<category>/` (so nested `.../Data/Library/...`
+        // cannot reset the scan window past the container's bundle ID).
         let components = candidateURL.pathComponents
         let startIndex: Int
-        if let libIdx = components.lastIndex(where: { $0.precomposedStringWithCanonicalMapping.lowercased() == "library" }),
-           libIdx + 2 < components.count {
+        if let outerLibIdx = components.indices.first(where: { idx in
+            idx + 2 < components.count
+                && components[idx].precomposedStringWithCanonicalMapping.lowercased() == "library"
+                && Self.protectedBundleEnforcedParents.contains(
+                    components[idx + 1].precomposedStringWithCanonicalMapping.lowercased()
+                )
+        }) {
+            startIndex = outerLibIdx + 2
+        } else if Self.protectedBundleEnforcedParents.contains(parentName) {
+            startIndex = max(0, components.count - 1)
+        } else if let libIdx = components.firstIndex(where: {
+            $0.precomposedStringWithCanonicalMapping.lowercased() == "library"
+        }), libIdx + 2 < components.count {
             startIndex = libIdx + 2
         } else {
             startIndex = max(0, components.count - 1)
@@ -897,19 +1086,32 @@ public struct SafetyGuard: Sendable {
     }
 
     private func matchesProtectedAppBundle(at url: URL) -> Bool {
-        guard !protectedBundleIDs.isEmpty,
-              url.pathExtension.lowercased() == "app",
-              !isSymbolicLink(url) else {
+        guard !protectedBundleIDs.isEmpty else {
             return false
         }
-        let infoURL = url.appendingPathComponent("Contents/Info.plist")
-        guard let data = SafeFileReader.readBoundedRegularFile(at: infoURL),
-              let raw = try? PropertyListSerialization.propertyList(from: data, format: nil),
-              let dict = raw as? [String: Any],
-              let bid = dict["CFBundleIdentifier"] as? String else {
-            return false
+        var checkedBundlePaths = Set<String>()
+        for (rawCandidate, _) in Self.candidatePaths(for: url) {
+            var current = URL(fileURLWithPath: rawCandidate)
+            while current.path != "/" {
+                if current.pathExtension.lowercased() == "app" {
+                    let normKey = Self.normalizedForCompare(current.path)
+                    if checkedBundlePaths.insert(normKey).inserted, !isSymbolicLink(current) {
+                        let infoURL = current.appendingPathComponent("Contents/Info.plist")
+                        if let data = SafeFileReader.readBoundedRegularFile(at: infoURL),
+                           let raw = try? PropertyListSerialization.propertyList(from: data, format: nil),
+                           let dict = raw as? [String: Any],
+                           let bid = dict["CFBundleIdentifier"] as? String,
+                           matchesProtectedBundleID(bid) {
+                            return true
+                        }
+                    }
+                }
+                let parent = current.deletingLastPathComponent()
+                if parent.path == current.path { break }
+                current = parent
+            }
         }
-        return matchesProtectedBundleID(bid)
+        return false
     }
 
     /// True if a Library entry name/identifier should never be flagged as an orphaned leftover.
@@ -958,5 +1160,438 @@ public struct SafetyGuard: Sendable {
             return true
         }
         return false
+    }
+
+    // MARK: - File Manager & Cache Subpath Safety Boundaries (M1+)
+
+    internal static func hasDotDotPathComponent(_ url: URL) -> Bool {
+        if url.pathComponents.contains("..") {
+            return true
+        }
+        return url.path.split(separator: "/").contains("..")
+    }
+
+    private static func isValidURLPath(_ url: URL) -> Bool {
+        guard url.isFileURL else { return false }
+        let raw = url.path
+        if raw.isEmpty
+            || raw.contains("\0")
+            || url.absoluteString.lowercased().contains("%00")
+            || hasDotDotPathComponent(url) {
+            return false
+        }
+        let std = url.standardizedFileURL.path
+        if std.isEmpty || std.contains("\0") {
+            return false
+        }
+        return true
+    }
+
+    private func isValidLeafName(_ url: URL) -> Bool {
+        let rawLast = url.lastPathComponent
+        let stdLast = url.standardizedFileURL.lastPathComponent
+        for name in [rawLast, stdLast] {
+            if name.isEmpty || name == "." || name == ".." || name.contains("/") || name.contains("\0") {
+                return false
+            }
+        }
+        return true
+    }
+
+    private func hasRestrictedOrImmutableResolvedAncestor(for url: URL) -> Bool {
+        var current = url.standardizedFileURL.deletingLastPathComponent()
+        let ancestorSIPMask = UInt32(SF_RESTRICTED) | UInt32(SF_IMMUTABLE)
+        while true {
+            var lst = stat()
+            if lstat(current.path, &lst) == 0 {
+                if pointsToSystemVolume(current) {
+                    return true
+                }
+                if let resolved = Self.posixRealpath(current.path) {
+                    var st = stat()
+                    if stat(resolved, &st) == 0, (st.st_flags & ancestorSIPMask) != 0 {
+                        return true
+                    }
+                }
+            }
+            if current.path == "/" || current.standardizedFileURL.path == "/" {
+                break
+            }
+            let parent = current.deletingLastPathComponent().standardizedFileURL
+            if parent.path == current.path { break }
+            current = parent
+        }
+        return false
+    }
+
+    private func validateDestinationCommon(_ destination: URL) -> FileMutationValidationResult {
+        guard Self.isValidURLPath(destination), isValidLeafName(destination) else {
+            return .blocked(reason: "Invalid destination filesystem path")
+        }
+        let rawPath = destination.standardizedFileURL.path
+        let resolvedPath = destination.resolvingSymlinksInPath().standardizedFileURL.path
+
+        if rawPath == "/" || resolvedPath.contains("\0") {
+            return .blocked(reason: "Invalid destination filesystem path")
+        }
+
+        var dstStat = stat()
+        if lstat(rawPath, &dstStat) == 0 {
+            if isSIPRestricted(destination) {
+                return .blocked(reason: "Destination is protected by macOS System Integrity Protection (SIP)")
+            }
+            if pointsToSystemVolume(destination) {
+                return .blocked(reason: "Destination symlink points to protected macOS system volume")
+            }
+        }
+
+        if hasRestrictedOrImmutableResolvedAncestor(for: destination) {
+            return .blocked(reason: "Destination parent directory is protected by macOS System Integrity Protection (SIP)")
+        }
+
+        let candidates = Self.candidatePaths(for: destination)
+
+        for selfPath in selfBundlePathsLower where selfPath.hasSuffix(".app") {
+            for entry in candidates where Self.pathsOverlap(entry.normalized, with: selfPath) {
+                return .blocked(reason: "Cannot modify inside MacSweep application bundle")
+            }
+        }
+
+        for normData in selfDataPathsLower {
+            for entry in candidates where Self.pathsOverlap(entry.normalized, with: normData) {
+                return .blocked(reason: "Cannot modify inside MacSweep application data")
+            }
+        }
+
+        for (candidate, normCandidate) in candidates {
+            if criticalExactPathsLower.contains(normCandidate) {
+                return .blocked(reason: "Critical system or user directory: \(candidate)")
+            }
+            if isCriticalSharedDirectory(candidate) {
+                return .blocked(reason: "Critical shared vendor directory: \(candidate)")
+            }
+            for barePrefix in immutableBarePrefixesLower {
+                if Self.pathsOverlap(normCandidate, with: barePrefix) {
+                    return .blocked(reason: "Protected macOS system or credential path: \(candidate)")
+                }
+            }
+            if let reason = protectedSensitiveLibraryOrPhotosReason(candidate: candidate, normalizedPath: normCandidate) {
+                return .blocked(reason: reason)
+            }
+            for protected in protectedPathsLower {
+                if Self.pathsOverlap(normCandidate, with: protected) {
+                    return .blocked(reason: "Protected by user skip list")
+                }
+            }
+            if !protectedBundleIDs.isEmpty && matchesProtectedBundleInLibraryPath(candidate, normalizedPath: normCandidate, url: destination) {
+                return .blocked(reason: "Protected by user bundle ID skip list")
+            }
+        }
+
+        if matchesProtectedAppBundle(at: destination) {
+            return .blocked(reason: "Protected by user bundle ID skip list")
+        }
+
+        return .allowed
+    }
+
+    public func validateForMoveOrRename(
+        source: URL,
+        destination: URL,
+        expectedSourceCanonicalParent: String? = nil
+    ) -> FileMutationValidationResult {
+        if !Self.isValidURLPath(source) || !isValidLeafName(source) {
+            return .blocked(reason: "Invalid source filesystem path")
+        }
+        if !Self.isValidURLPath(destination) || !isValidLeafName(destination) {
+            return .blocked(reason: "Invalid destination filesystem path")
+        }
+
+        if case let .blocked(reason) = validateForRemoval(source) {
+            return .blocked(reason: reason)
+        }
+
+        let srcStdURL = source.standardizedFileURL
+        let dstStdURL = destination.standardizedFileURL
+
+        if let expectedSourceCanonicalParent {
+            let liveParent = Self.canonicalPathResolvingDeepestAncestor(for: srcStdURL.deletingLastPathComponent())
+            if liveParent != expectedSourceCanonicalParent {
+                return .blocked(reason: "Source parent directory changed since scan (TOCTOU blocked)")
+            }
+        }
+
+        if case let .blocked(reason) = validateDestinationCommon(destination) {
+            return .blocked(reason: reason)
+        }
+
+        if srcStdURL.path == dstStdURL.path {
+            return .blocked(reason: "Source and destination paths are identical")
+        }
+
+        var srcStat = stat()
+        var dstStat = stat()
+        let srcExists = lstat(srcStdURL.path, &srcStat) == 0
+        let dstExists = lstat(dstStdURL.path, &dstStat) == 0
+        let srcIsDir = srcExists && ((srcStat.st_mode & S_IFMT) == S_IFDIR)
+
+        let srcCandidates = Self.candidatePaths(for: srcStdURL)
+        let dstCandidates = Self.candidatePaths(for: dstStdURL)
+
+        if srcIsDir || !srcExists {
+            for s in srcCandidates {
+                for d in dstCandidates where d.normalized.hasPrefix(s.normalized + "/") {
+                    return .blocked(reason: "Cannot move a directory into itself")
+                }
+            }
+        }
+
+        let srcParentCanonical = Self.canonicalPathResolvingDeepestAncestor(for: srcStdURL.deletingLastPathComponent())
+        let dstParentCanonical = Self.canonicalPathResolvingDeepestAncestor(for: dstStdURL.deletingLastPathComponent())
+        let isCaseOnlyRename = srcParentCanonical == dstParentCanonical
+            && Self.normalizedForCompare(srcStdURL.lastPathComponent) == Self.normalizedForCompare(dstStdURL.lastPathComponent)
+            && srcStdURL.lastPathComponent != dstStdURL.lastPathComponent
+
+        if dstExists {
+            if isCaseOnlyRename,
+               srcExists,
+               srcStat.st_dev == dstStat.st_dev,
+               srcStat.st_ino == dstStat.st_ino,
+               ((srcStat.st_mode & S_IFMT) != S_IFREG || srcStat.st_nlink == 1) {
+                return .allowed
+            }
+            return .blocked(reason: "Destination already exists: \(dstStdURL.lastPathComponent)")
+        }
+
+        if !isCaseOnlyRename {
+            for s in srcCandidates {
+                for d in dstCandidates where d.normalized == s.normalized {
+                    return .blocked(reason: "Source and destination refer to the same path")
+                }
+            }
+        }
+
+        return .allowed
+    }
+
+    public func validateDirectoryCreation(at destination: URL) -> FileMutationValidationResult {
+        if !Self.isValidURLPath(destination) || !isValidLeafName(destination) {
+            return .blocked(reason: "Invalid directory name or path")
+        }
+
+        var st = stat()
+        if lstat(destination.standardizedFileURL.path, &st) == 0 {
+            return .blocked(reason: "An item already exists at destination: \(destination.lastPathComponent)")
+        }
+
+        return validateDestinationCommon(destination)
+    }
+
+    public func validateCacheSubpath(_ url: URL) -> RemovalValidationResult {
+        if !Self.isValidURLPath(url) || !isValidLeafName(url) {
+            return .blocked(reason: "Invalid cache subpath")
+        }
+        if case let .blocked(reason) = validateForRemoval(url) {
+            return .blocked(reason: reason)
+        }
+
+        let candidates = Self.candidatePaths(for: url)
+        for (_, normCandidate) in candidates {
+            let matchingHome = homePrefixesLower
+                .filter { normCandidate.hasPrefix("\($0)/library/caches/") }
+                .max(by: { $0.count < $1.count })
+            guard let homePrefix = matchingHome else {
+                return .blocked(reason: "Cache subpath must reside inside ~/Library/Caches (symlink escape blocked)")
+            }
+
+            let remainder = String(normCandidate.dropFirst("\(homePrefix)/library/caches/".count))
+            let components = remainder.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+            guard let first = components.first else {
+                return .blocked(reason: "Cannot target ~/Library/Caches root directory")
+            }
+            if first == "apple" {
+                return .blocked(reason: "Protected Apple cache directory")
+            }
+            if first == "com.apple" || first.hasPrefix("com.apple.") || Self.isAppleGroupContainerName(first) {
+                return .blocked(reason: "Protected Apple cache item: \(first)")
+            }
+            if Self.sharedVendorFolderNames.contains(first) && components.count < 2 {
+                return .blocked(reason: "Critical shared vendor cache root: \(first)")
+            }
+        }
+
+        return .allowed
+    }
+
+    /// Returns `true` when directory traversal (such as Large Files or Duplicate Files scanning)
+    /// should prune descent into `url` because it overlaps SIP/system paths, sensitive user
+    /// directories (`Keychains`, `Safari`, `.ssh`, `.gnupg`, `*.photoslibrary`, Apple containers),
+    /// MacSweep itself, or user-configured `protectedPaths` / `protectedBundleIDs`.
+    /// Unlike `validateForRemoval(_:)`, this intentionally does NOT prune exact critical roots
+    /// (`~`, `~/Documents`, `~/Downloads`, `/Applications`) so scans rooted at `~` can descend.
+    public func shouldPruneDirectoryScan(at url: URL) -> Bool {
+        guard Self.isValidURLPath(url) else { return true }
+        let rawPath = url.standardizedFileURL.path
+        let resolvedPath = url.resolvingSymlinksInPath().standardizedFileURL.path
+        if rawPath == "/" || resolvedPath.contains("\0") {
+            return true
+        }
+
+        let candidates = Self.candidatePaths(for: url)
+
+        for selfPath in selfBundlePathsLower where selfPath.hasSuffix(".app") {
+            for entry in candidates where Self.isSameOrDescendant(entry.normalized, of: selfPath) {
+                return true
+            }
+        }
+
+        for normData in selfDataPathsLower {
+            for entry in candidates where Self.isSameOrDescendant(entry.normalized, of: normData) {
+                return true
+            }
+        }
+
+        if isSIPRestrictedForTraversal(url) || pointsToSystemVolume(url) {
+            return true
+        }
+
+        for (candidate, normCandidate) in candidates {
+            for barePrefix in immutableBarePrefixesLower {
+                if Self.isSameOrDescendant(normCandidate, of: barePrefix) {
+                    return true
+                }
+            }
+            if protectedSensitiveLibraryOrPhotosReason(candidate: candidate, normalizedPath: normCandidate) != nil {
+                return true
+            }
+            for protected in protectedPathsLower {
+                if Self.isSameOrDescendant(normCandidate, of: protected) {
+                    return true
+                }
+            }
+            if !protectedBundleIDs.isEmpty && matchesProtectedBundleInLibraryPath(candidate, normalizedPath: normCandidate, url: url) {
+                return true
+            }
+        }
+
+        if matchesProtectedAppBundle(at: url) {
+            return true
+        }
+
+        return false
+    }
+
+    /// Verifies component-by-component from `baseRoot` down through `relativePath` that neither
+    /// `baseRoot` nor any intermediate/leaf component is a symbolic link or `SF_DATALESS` item,
+    /// and that each component's canonical POSIX path matches the expected lexical subpath under `baseRoot`.
+    public func isContainedCanonicalSubpath(
+        relativePath: String,
+        under baseRoot: URL,
+        allowRegularFileLeaf: Bool = false
+    ) -> Bool {
+        guard Self.isValidURLPath(baseRoot), !relativePath.contains("\0") else {
+            return false
+        }
+        let rawParts = relativePath.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        if rawParts.contains(".") || rawParts.contains("..") {
+            return false
+        }
+
+        let stdBase = baseRoot.standardizedFileURL
+        var baseStat = stat()
+        guard Darwin.lstat(stdBase.path, &baseStat) == 0,
+              (baseStat.st_mode & S_IFMT) == S_IFDIR,
+              (baseStat.st_flags & UInt32(SF_DATALESS)) == 0,
+              let baseReal = Self.posixRealpath(stdBase.path) else {
+            return false
+        }
+
+        let components = rawParts.filter { !$0.isEmpty }
+        var currentURL = stdBase
+        var expectedCanonicalPath = (baseReal.count > 1 && baseReal.hasSuffix("/"))
+            ? String(baseReal.dropLast())
+            : baseReal
+
+        for (idx, comp) in components.enumerated() {
+            currentURL = currentURL.appendingPathComponent(comp).standardizedFileURL
+            expectedCanonicalPath = expectedCanonicalPath == "/"
+                ? "/\(comp)"
+                : "\(expectedCanonicalPath)/\(comp)"
+
+            var st = stat()
+            guard Darwin.lstat(currentURL.path, &st) == 0 else { return false }
+            let mode = st.st_mode & S_IFMT
+            let isLast = (idx == components.count - 1)
+            if mode == S_IFLNK || (st.st_flags & UInt32(SF_DATALESS)) != 0 {
+                return false
+            }
+            if isLast {
+                if mode != S_IFDIR && !(allowRegularFileLeaf && mode == S_IFREG) {
+                    return false
+                }
+            } else if mode != S_IFDIR {
+                return false
+            }
+
+            let resolved = Self.canonicalPathResolvingDeepestAncestor(for: currentURL)
+            if Self.normalizedForCompare(resolved) != Self.normalizedForCompare(expectedCanonicalPath) {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Verifies that `dirURL` is an existing non-symlink, non-dataless directory with no intermediate
+    /// symlink escapes from its trusted root (`homeDirectory`, `trustedRoots`, or `/Library`), or
+    /// that its canonical POSIX path matches its macOS-normalized lexical path when outside those roots.
+    public func isContainedDirectory(_ dirURL: URL, trustedRoots: [URL] = []) -> Bool {
+        guard Self.isValidURLPath(dirURL) else { return false }
+        let stdDir = dirURL.standardizedFileURL
+        var st = stat()
+        guard Darwin.lstat(stdDir.path, &st) == 0,
+              (st.st_mode & S_IFMT) == S_IFDIR,
+              (st.st_flags & UInt32(SF_DATALESS)) == 0 else {
+            return false
+        }
+
+        let prefixedDir = Self.applyMacOSPrivatePrefix(stdDir.path)
+        let normDir = Self.normalizedForCompare(prefixedDir)
+
+        var candidateRoots = [URL(fileURLWithPath: homeDirectoryPath)]
+        candidateRoots.append(contentsOf: trustedRoots)
+        candidateRoots.append(URL(fileURLWithPath: "/Library"))
+
+        // Prefer the longest matching trusted root so nested roots are checked cleanly.
+        var matchedRoot: (root: URL, relPath: String)?
+        var bestLen = -1
+        for root in candidateRoots {
+            let stdRoot = root.standardizedFileURL
+            let prefixedRoot = Self.applyMacOSPrivatePrefix(stdRoot.path)
+            let normRoot = Self.normalizedForCompare(prefixedRoot)
+            if normDir == normRoot {
+                if normRoot.count > bestLen {
+                    bestLen = normRoot.count
+                    matchedRoot = (stdRoot, "")
+                }
+            } else if normRoot == "/" {
+                if normRoot.count > bestLen {
+                    bestLen = normRoot.count
+                    matchedRoot = (stdRoot, String(prefixedDir.dropFirst()))
+                }
+            } else if normDir.hasPrefix(normRoot + "/"), prefixedDir.count > prefixedRoot.count + 1 {
+                if normRoot.count > bestLen {
+                    bestLen = normRoot.count
+                    let rel = String(prefixedDir.dropFirst(prefixedRoot.count + 1))
+                    matchedRoot = (stdRoot, rel)
+                }
+            }
+        }
+
+        if let matched = matchedRoot {
+            return isContainedCanonicalSubpath(relativePath: matched.relPath, under: matched.root)
+        }
+
+        guard let real = Self.posixRealpath(stdDir.path) else { return false }
+        return Self.normalizedForCompare(real) == normDir
     }
 }

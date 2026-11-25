@@ -123,4 +123,58 @@ func runExtensionChecks(_ runner: CheckRunner) {
         try runner.expectEqual(ql?.category, .quickLook)
         try runner.expectEqual(ql?.requiresReboot, false)
     }
+
+    runner.run("ExtensionScanner rejects intermediate symlinks in ~/Library, ~/Library/Audio, Google, and Firefox paths") {
+        let sandbox = try runner.makeTempSandbox(prefix: "ext-symlink-escape")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let fm = FileManager.default
+        let lib = sandbox.appendingPathComponent("Library")
+        let appSupport = lib.appendingPathComponent("Application Support")
+        let docs = sandbox.appendingPathComponent("Documents")
+        let myAudio = docs.appendingPathComponent("MyAudio")
+        let myChrome = docs.appendingPathComponent("MyChrome")
+        let myFirefox = docs.appendingPathComponent("MyFirefox")
+
+        try fm.createDirectory(at: appSupport, withIntermediateDirectories: true)
+        try fm.createDirectory(at: myAudio.appendingPathComponent("Plug-Ins/HAL/Custom.driver"), withIntermediateDirectories: true)
+        let chromeVer = myChrome.appendingPathComponent("Chrome/Default/Extensions/abcdefghijklmnop/1.0_0")
+        try fm.createDirectory(at: chromeVer, withIntermediateDirectories: true)
+        try Data("{\"name\":\"MyExt\",\"version\":\"1.0\"}".utf8)
+            .write(to: chromeVer.appendingPathComponent("manifest.json"))
+
+        let ffProf = myFirefox.appendingPathComponent("Profiles/default-release")
+        try fm.createDirectory(at: ffProf.appendingPathComponent("extensions"), withIntermediateDirectories: true)
+        let xpiURL = ffProf.appendingPathComponent("extensions/ext@example.org.xpi")
+        try Data("zip".utf8).write(to: xpiURL)
+        let ffJSON = """
+        {"addons":[{"id":"ext@example.org","location":"app-profile","type":"extension","version":"1.0","active":true,"path":"\(xpiURL.path)","defaultLocale":{"name":"DocExt"}}]}
+        """
+        try Data(ffJSON.utf8).write(to: ffProf.appendingPathComponent("extensions.json"))
+
+        try fm.createSymbolicLink(at: lib.appendingPathComponent("Audio"), withDestinationURL: myAudio)
+        try fm.createSymbolicLink(at: appSupport.appendingPathComponent("Google"), withDestinationURL: myChrome)
+        try fm.createSymbolicLink(at: appSupport.appendingPathComponent("Firefox"), withDestinationURL: myFirefox)
+
+        let scanner = ExtensionScanner(
+            homeDirectory: sandbox,
+            systemLibraryURL: sandbox.appendingPathComponent("NonExistentSysLib"),
+            safetyGuard: SafetyGuard(homeDirectory: sandbox)
+        )
+        let scanAllResult = scanner.scanAll(includePluginkit: false)
+        try runner.expectEqual(scanAllResult.items.count, 0, "Intermediate symlinks in Audio/Google/Firefox must yield 0 items in scanAll")
+
+        let directChrome = scanner.scanChromiumUserData(
+            at: appSupport.appendingPathComponent("Google/Chrome"),
+            category: .browserChrome,
+            browserBundleID: "com.google.Chrome"
+        )
+        try runner.expectEqual(directChrome.count, 0, "Direct scanChromiumUserData with intermediate Google symlink must yield 0 items")
+
+        let directFirefox = scanner.scanFirefoxBase(at: appSupport.appendingPathComponent("Firefox"))
+        try runner.expectEqual(directFirefox.count, 0, "Direct scanFirefoxBase with intermediate Firefox symlink must yield 0 items")
+
+        let sysPlugins = scanner.scanSystemPluginDirectories()
+        try runner.expectEqual(sysPlugins.count, 0, "scanSystemPluginDirectories with intermediate Audio symlink must yield 0 items")
+    }
 }

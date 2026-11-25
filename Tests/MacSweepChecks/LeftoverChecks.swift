@@ -95,4 +95,58 @@ func runLeftoverChecks(_ runner: CheckRunner) {
         try runner.expectEqual(mystery?.isChecked, false, "Medium confidence group MUST be unchecked by default")
         try runner.expectEqual(mystery?.files.first?.isSelected, false, "Medium confidence file MUST be unselected by default")
     }
+
+    runner.run("LibraryIndex and LeftoverScanner reject intermediate symlinks escaping into ~/Documents") {
+        let sandbox = try runner.makeTempSandbox(prefix: "leftover-symlink-escape")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let fm = FileManager.default
+        // Case 1: ~/Library itself is a symlink to ~/Documents/FakeLib
+        let homeA = sandbox.appendingPathComponent("HomeA")
+        let docsLib = homeA.appendingPathComponent("Documents/FakeLib")
+        try fm.createDirectory(at: docsLib.appendingPathComponent("Caches/com.old.important"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: docsLib.appendingPathComponent("LaunchAgents"), withIntermediateDirectories: true)
+        try Data("victim".utf8).write(to: docsLib.appendingPathComponent("Caches/com.old.important/data.bin"))
+        let deadLA: [String: Any] = ["Label": "com.user.config", "Program": "/nonexistent/Helper"]
+        try PropertyListSerialization.data(fromPropertyList: deadLA, format: .xml, options: 0)
+            .write(to: docsLib.appendingPathComponent("LaunchAgents/com.user.config.plist"))
+        try fm.createSymbolicLink(at: homeA.appendingPathComponent("Library"), withDestinationURL: docsLib)
+
+        let sgA = SafetyGuard(homeDirectory: homeA)
+        let idxA = LibraryIndex.build(
+            userLibraryURL: homeA.appendingPathComponent("Library"),
+            systemLibraryURL: homeA.appendingPathComponent("SysLib"),
+            safetyGuard: sgA
+        )
+        try runner.expectEqual(idxA.entries.count, 0, "Symlinked ~/Library must yield 0 LibraryIndex entries")
+        let leftA = LeftoverScanner(safetyGuard: sgA).scan(
+            index: idxA,
+            inventory: InstalledAppInventory.build(searchRoots: [], libraryIndex: idxA)
+        )
+        try runner.expectEqual(leftA.count, 0, "Symlinked ~/Library must yield 0 leftover groups")
+
+        // Case 2: ~/Library is real, but ~/Library/Caches and ~/Library/Application Support/Google are symlinks into ~/Documents
+        let homeB = sandbox.appendingPathComponent("HomeB")
+        let libB = homeB.appendingPathComponent("Library")
+        let docsCaches = homeB.appendingPathComponent("Documents/FakeCaches")
+        let docsGoogle = homeB.appendingPathComponent("Documents/FakeGoogle")
+        try fm.createDirectory(at: libB.appendingPathComponent("Application Support"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: docsCaches.appendingPathComponent("com.old.secret"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: docsGoogle.appendingPathComponent("SecretProject"), withIntermediateDirectories: true)
+        try fm.createSymbolicLink(at: libB.appendingPathComponent("Caches"), withDestinationURL: docsCaches)
+        try fm.createSymbolicLink(at: libB.appendingPathComponent("Application Support/Google"), withDestinationURL: docsGoogle)
+
+        let sgB = SafetyGuard(homeDirectory: homeB)
+        let idxB = LibraryIndex.build(
+            userLibraryURL: libB,
+            systemLibraryURL: homeB.appendingPathComponent("SysLib"),
+            safetyGuard: sgB
+        )
+        try runner.expectEqual(idxB.entries.count, 0, "Symlinked ~/Library/Caches and ~/Library/Application Support/Google must yield 0 entries")
+        let leftB = LeftoverScanner(safetyGuard: sgB).scan(
+            index: idxB,
+            inventory: InstalledAppInventory.build(searchRoots: [], libraryIndex: idxB)
+        )
+        try runner.expectEqual(leftB.count, 0, "Intermediate Library symlinks must yield 0 leftover groups")
+    }
 }

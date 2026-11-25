@@ -25,7 +25,7 @@ struct ConfirmationSheet: View {
         self.l10n = l10n
         self.onCancel = onCancel
         self.onConfirm = onConfirm
-        self._selectedModeBox = StateObject(wrappedValue: LocalState(defaultMode))
+        self._selectedModeBox = StateObject(wrappedValue: LocalState(confirmation.forcePermanentMode ? .permanent : defaultMode))
     }
 
     private var selectedMode: RemovalMode { selectedModeBox.value }
@@ -55,7 +55,7 @@ struct ConfirmationSheet: View {
                         .foregroundStyle(selectedMode == .permanent ? palette.danger : palette.accent)
                 }
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(confirmation.isReset ? l10n.confirmResetTitle : l10n.confirmUninstallTitle)
+                    Text(l10n.confirmRemovalTitle(for: confirmation.sourceTab, isReset: confirmation.isReset))
                         .font(.system(size: 16, weight: .semibold))
                         .foregroundStyle(palette.primaryText)
                     Text(verbatim: "\(SafeFileReader.sanitizeForDisplay(confirmation.title)) · \(l10n.selectedSummary(count: confirmation.targets.count, bytes: totalBytes))")
@@ -110,14 +110,38 @@ struct ConfirmationSheet: View {
                 )
             }
 
+            if confirmation.forcePermanentMode {
+                warningBox(
+                    icon: "trash.slash.fill",
+                    color: palette.danger,
+                    text: l10n.junkTrashPermanentNote
+                )
+            } else if confirmation.hasTrashItems {
+                warningBox(
+                    icon: "exclamationmark.triangle.fill",
+                    color: palette.warning,
+                    text: l10n.junkMixedTrashWarning
+                )
+            }
+
             // Removal Mode Picker
             VStack(alignment: .leading, spacing: 8) {
-                Picker("", selection: $selectedModeBox.value) {
-                    Text(l10n.moveToTrashOption).tag(RemovalMode.trash)
-                    Text(l10n.permanentDeleteOption).tag(RemovalMode.permanent)
+                if confirmation.forcePermanentMode {
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(palette.danger)
+                        Text(l10n.permanentDeleteOption)
+                            .font(.system(size: 12.5, weight: .medium))
+                            .foregroundStyle(palette.primaryText)
+                    }
+                } else {
+                    Picker("", selection: $selectedModeBox.value) {
+                        Text(l10n.moveToTrashOption).tag(RemovalMode.trash)
+                        Text(l10n.permanentDeleteOption).tag(RemovalMode.permanent)
+                    }
+                    .pickerStyle(.radioGroup)
+                    .labelsHidden()
                 }
-                .pickerStyle(.radioGroup)
-                .labelsHidden()
             }
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -198,6 +222,16 @@ struct ConfirmationSheet: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(palette.danger)
+                } else if confirmation.hasTrashItems {
+                    Button {
+                        onConfirm(.trash)
+                    } label: {
+                        Text(l10n.t("移至废纸篓并清空废纸篓项", "Move to Trash & Empty Trash Items"))
+                            .fontWeight(.semibold)
+                            .padding(.horizontal, 12)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(palette.accent)
                 } else {
                     Button {
                         onConfirm(.trash)

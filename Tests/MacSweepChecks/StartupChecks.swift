@@ -127,4 +127,39 @@ func runStartupChecks(_ runner: CheckRunner) {
         do { _ = try StartupController.buildToggleShellCommand(item: loginItem, enable: false) } catch { rejected = true }
         try runner.expect(rejected, "app login items must not be toggled via launchctl")
     }
+
+    runner.run("StartupScanner rejects intermediate symlinks in ~/Library, LaunchAgents, and system directories") {
+        let sandbox = try runner.makeTempSandbox(prefix: "startup-symlink-escape")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let fm = FileManager.default
+        let docs = sandbox.appendingPathComponent("Documents")
+        let fakeLib = docs.appendingPathComponent("FakeLib")
+        let fakeSys = docs.appendingPathComponent("FakeSysLib")
+        try fm.createDirectory(at: fakeLib.appendingPathComponent("LaunchAgents"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: fakeSys.appendingPathComponent("LaunchAgents"), withIntermediateDirectories: true)
+
+        let plistData = try PropertyListSerialization.data(
+            fromPropertyList: ["Label": "com.user.config", "Program": "/bin/echo"],
+            format: .xml,
+            options: 0
+        )
+        try plistData.write(to: fakeLib.appendingPathComponent("LaunchAgents/com.user.config.plist"))
+        try plistData.write(to: fakeSys.appendingPathComponent("LaunchAgents/com.sys.config.plist"))
+
+        // Intermediate symlink ~/Library -> ~/Documents/FakeLib and external symlink FakeSysMount -> ~/Documents/FakeSysLib
+        try fm.createSymbolicLink(at: sandbox.appendingPathComponent("Library"), withDestinationURL: fakeLib)
+        let fakeSysMount = sandbox.appendingPathComponent("FakeSysMount")
+        try fm.createSymbolicLink(at: fakeSysMount, withDestinationURL: fakeSys)
+
+        let scanner = StartupScanner(
+            userLaunchAgentsURL: sandbox.appendingPathComponent("Library/LaunchAgents"),
+            systemLaunchAgentsURL: fakeSysMount.appendingPathComponent("LaunchAgents"),
+            systemLaunchDaemonsURL: sandbox.appendingPathComponent("NonExistentLD"),
+            appSearchRoots: [],
+            safetyGuard: SafetyGuard(homeDirectory: sandbox)
+        )
+        let items = scanner.scanAll(userDisabledMap: [:], systemDisabledMap: [:])
+        try runner.expectEqual(items.count, 0, "Intermediate symlink in ~/Library or system LaunchAgents must yield 0 startup items")
+    }
 }

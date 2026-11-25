@@ -87,6 +87,34 @@ if CommandLine.arguments.contains("--live-audit") {
     for (cat, count) in byCat.sorted(by: { $0.key.rawValue < $1.key.rawValue }) {
         print("  - \(cat.rawValue): \(count)")
     }
+
+    let memSnap = MemoryReleaseService().captureSnapshot()
+    print("MemorySnapshot: total=\(memSnap.totalBytes), active=\(memSnap.activeBytes), wired=\(memSnap.wiredBytes), compressed=\(memSnap.compressedBytes), cached=\(memSnap.cachedFilesBytes), free=\(memSnap.freeBytes), swap=\(memSnap.swapUsedBytes)/\(memSnap.swapTotalBytes), pressure=\(memSnap.pressureLevel.rawValue)")
+
+    let junkSem = DispatchSemaphore(value: 0)
+    let junkBox = { () -> [JunkCategoryItem] in
+        final class Box: @unchecked Sendable {
+            var items: [JunkCategoryItem] = []
+        }
+        let b = Box()
+        Task.detached {
+            b.items = (try? await JunkCacheScanner(safetyGuard: sg).scan()) ?? []
+            junkSem.signal()
+        }
+        junkSem.wait()
+        return b.items
+    }()
+    let junkPaths = junkBox.flatMap(\.entries).map { $0.url.standardizedFileURL.path }
+    let badJunkVendorHits = junkPaths.filter {
+        let lower = $0.lowercased()
+        return lower.hasSuffix("/library/caches")
+            || lower.contains("/library/caches/com.apple.")
+            || lower.hasSuffix("/library/caches/apple")
+            || lower.hasSuffix("/library/caches/google")
+            || lower.hasSuffix("/library/caches/microsoft")
+            || lower.hasSuffix("/library/caches/adobe")
+    }
+    print("JunkCacheScanner: \(junkBox.count) categories, \(junkPaths.count) entries, badVendorOrAppleHits=\(badJunkVendorHits)")
     exit(0)
 }
 
@@ -99,4 +127,9 @@ runLeftoverChecks(runner)
 runExtensionChecks(runner)
 runReviewRegressionChecks(runner)
 runAuditFixChecks(runner)
+runFileOpsSafetyChecks(runner)
+runFileManagerChecks(runner)
+runJunkAndResourceChecks(runner)
+runDemoModeChecks(runner)
+runAppRuntimeChecks(runner)
 runner.summaryAndExit()

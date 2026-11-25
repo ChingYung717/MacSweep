@@ -5,7 +5,6 @@ struct StartupProgramsView: View {
     @ObservedObject var state: AppState
     let palette: AppPalette
 
-    @StateObject private var selectedIDBox = LocalState<String?>(nil)
     @StateObject private var filterBox = LocalState<StartupFilter>(.all)
     @StateObject private var collapsedScopesBox = LocalState<Set<StartupScope>>([])
     @StateObject private var plistPreviewBox = LocalState<(id: String?, text: String?)>((nil, nil))
@@ -35,7 +34,7 @@ struct StartupProgramsView: View {
     }
 
     private var selectedItem: StartupItem? {
-        guard let id = selectedIDBox.value else { return nil }
+        guard let id = state.selectedStartupID else { return nil }
         return state.startupItems.first(where: { $0.id == id })
     }
 
@@ -208,7 +207,7 @@ struct StartupProgramsView: View {
     }
 
     private func startupRow(_ item: StartupItem) -> some View {
-        let isSelected = selectedIDBox.value == item.id
+        let isSelected = state.selectedStartupID == item.id
         let isToggling = state.togglingStartupIDs.contains(item.id)
         return HStack(spacing: 10) {
             if let appPath = item.associatedAppPath, item.associatedAppExists {
@@ -279,7 +278,7 @@ struct StartupProgramsView: View {
         )
         .contentShape(Rectangle())
         .onTapGesture {
-            selectedIDBox.value = item.id
+            state.selectedStartupID = item.id
         }
     }
 
@@ -391,9 +390,17 @@ struct StartupProgramsView: View {
                             }
                         }
 
+                        let resolvedPlistPreview: String? = {
+                            if state.isDemoMode {
+                                return state.demoPlistPreview(for: item)
+                            }
+                            if plistPreviewBox.value.id == item.id {
+                                return plistPreviewBox.value.text
+                            }
+                            return nil
+                        }()
                         if item.plistURL.pathExtension.lowercased() == "plist",
-                           plistPreviewBox.value.id == item.id,
-                           let preview = plistPreviewBox.value.text {
+                           let preview = resolvedPlistPreview {
                             infoCard(title: "Plist XML") {
                                 ScrollView(.horizontal) {
                                     Text(preview)
@@ -412,6 +419,10 @@ struct StartupProgramsView: View {
                     let targetID = item.id
                     guard targetURL.pathExtension.lowercased() == "plist" else {
                         plistPreviewBox.value = (targetID, nil)
+                        return
+                    }
+                    if state.isDemoMode {
+                        plistPreviewBox.value = (targetID, state.demoPlistPreview(for: item))
                         return
                     }
                     let text = await Task.detached(priority: .utility) {

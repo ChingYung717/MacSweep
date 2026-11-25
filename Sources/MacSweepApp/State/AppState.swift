@@ -12,95 +12,327 @@ final class LocalState<Value>: ObservableObject {
     }
 }
 
-enum MainTab: String, CaseIterable, Identifiable {
+public enum SettingsSheetTab: String, CaseIterable, Identifiable {
+    case general
+    case permissions
+    case protection
+    case history
+    public var id: String { rawValue }
+}
+
+public struct DemoLaunchOptions: Sendable, Equatable {
+    public var isDemoMode: Bool
+    public var initialTab: MainTab?
+    public var languageOverride: AppLanguage?
+    public var themeOverride: ThemeMode?
+    public var exportScreenshotsPath: String?
+    public var parseError: String?
+
+    public init(
+        isDemoMode: Bool = false,
+        initialTab: MainTab? = nil,
+        languageOverride: AppLanguage? = nil,
+        themeOverride: ThemeMode? = nil,
+        exportScreenshotsPath: String? = nil,
+        parseError: String? = nil
+    ) {
+        self.isDemoMode = isDemoMode
+        self.initialTab = initialTab
+        self.languageOverride = languageOverride
+        self.themeOverride = themeOverride
+        self.exportScreenshotsPath = exportScreenshotsPath
+        self.parseError = parseError
+    }
+
+    public static func fromProcessInfo(
+        arguments: [String] = CommandLine.arguments,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> DemoLaunchOptions {
+        var isDemoMode = (environment["MACSWEEP_DEMO_MODE"] == "1")
+        var initialTab: MainTab?
+        var languageOverride: AppLanguage?
+        var themeOverride: ThemeMode?
+        var exportPath: String?
+        var parseError: String?
+
+        var i = 1
+        while i < arguments.count {
+            let arg = arguments[i]
+            if arg == "--demo-mode" {
+                isDemoMode = true
+            } else if arg == "--export-screenshots" {
+                if i + 1 >= arguments.count || arguments[i + 1].isEmpty || arguments[i + 1].hasPrefix("--") {
+                    parseError = "Missing value for --export-screenshots"
+                    break
+                }
+                exportPath = arguments[i + 1]
+                i += 1
+            } else if arg.hasPrefix("--export-screenshots=") {
+                let val = String(arg.dropFirst("--export-screenshots=".count))
+                if val.isEmpty {
+                    parseError = "Missing value for --export-screenshots"
+                    break
+                }
+                exportPath = val
+            } else if arg == "--demo-tab" {
+                if i + 1 < arguments.count, !arguments[i + 1].hasPrefix("--") {
+                    initialTab = parseTab(arguments[i + 1])
+                    if initialTab == nil && parseError == nil {
+                        parseError = "Unknown --demo-tab value '\(arguments[i + 1])'"
+                    }
+                    i += 1
+                } else if parseError == nil {
+                    parseError = "Missing value for --demo-tab"
+                }
+            } else if arg.hasPrefix("--demo-tab=") {
+                let val = String(arg.dropFirst("--demo-tab=".count))
+                initialTab = parseTab(val)
+                if initialTab == nil && parseError == nil {
+                    parseError = "Unknown --demo-tab value '\(val)'"
+                }
+            } else if arg == "--demo-lang" {
+                if i + 1 < arguments.count, !arguments[i + 1].hasPrefix("--") {
+                    languageOverride = parseLang(arguments[i + 1])
+                    if languageOverride == nil {
+                        fputs("Warning: unknown --demo-lang value '\(arguments[i + 1])'\n", stderr)
+                    }
+                    i += 1
+                } else {
+                    fputs("Warning: missing value for --demo-lang\n", stderr)
+                }
+            } else if arg.hasPrefix("--demo-lang=") {
+                let val = String(arg.dropFirst("--demo-lang=".count))
+                languageOverride = parseLang(val)
+                if languageOverride == nil {
+                    fputs("Warning: unknown --demo-lang value '\(val)'\n", stderr)
+                }
+            } else if arg == "--demo-theme" {
+                if i + 1 < arguments.count, !arguments[i + 1].hasPrefix("--") {
+                    themeOverride = parseTheme(arguments[i + 1])
+                    if themeOverride == nil {
+                        fputs("Warning: unknown --demo-theme value '\(arguments[i + 1])'\n", stderr)
+                    }
+                    i += 1
+                } else {
+                    fputs("Warning: missing value for --demo-theme\n", stderr)
+                }
+            } else if arg.hasPrefix("--demo-theme=") {
+                let val = String(arg.dropFirst("--demo-theme=".count))
+                themeOverride = parseTheme(val)
+                if themeOverride == nil {
+                    fputs("Warning: unknown --demo-theme value '\(val)'\n", stderr)
+                }
+            }
+            i += 1
+        }
+
+        if exportPath != nil && !isDemoMode && parseError == nil {
+            parseError = "--export-screenshots requires --demo-mode or MACSWEEP_DEMO_MODE=1"
+        }
+
+        return DemoLaunchOptions(
+            isDemoMode: isDemoMode,
+            initialTab: initialTab,
+            languageOverride: languageOverride,
+            themeOverride: themeOverride,
+            exportScreenshotsPath: exportPath,
+            parseError: parseError
+        )
+    }
+
+    private static func parseTab(_ raw: String) -> MainTab? {
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "applications", "apps": return .applications
+        case "startup": return .startup
+        case "extensions": return .extensions
+        case "leftovers": return .leftovers
+        case "filemanager", "file-manager", "files": return .fileManager
+        case "junkcleaner", "junk-cleaner", "junk": return .junkCleaner
+        case "resourcerelease", "resource-release", "resources": return .resourceRelease
+        default: return nil
+        }
+    }
+
+    private static func parseLang(_ raw: String) -> AppLanguage? {
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "en", "english": return .en
+        case "zh", "zh-hans", "zh_hans", "zh-cn", "zhhans": return .zhHans
+        case "system": return .system
+        default: return nil
+        }
+    }
+
+    private static func parseTheme(_ raw: String) -> ThemeMode? {
+        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "deepocean", "deep-ocean", "dark": return .deepOcean
+        case "system", "light": return .system
+        default: return nil
+        }
+    }
+}
+
+public enum ProtectedPathAddResult: Equatable {
+    case added(String)
+    case invalid
+    case duplicate
+    case saveFailed
+}
+
+public enum MainTab: String, CaseIterable, Identifiable, Sendable {
     case applications
     case startup
     case extensions
     case leftovers
+    case fileManager
+    case junkCleaner
+    case resourceRelease
 
-    var id: String { rawValue }
+    public var id: String { rawValue }
 
-    var symbolName: String {
+    public var symbolName: String {
         switch self {
         case .applications: return "app.badge"
         case .startup: return "paperplane.fill"
         case .extensions: return "puzzlepiece.extension.fill"
         case .leftovers: return "doc.text.magnifyingglass"
+        case .fileManager: return "folder.fill"
+        case .junkCleaner: return "wand.and.stars"
+        case .resourceRelease: return "memorychip"
         }
     }
 }
 
-enum AppSortOrder: String, CaseIterable, Identifiable {
+public enum AppSortOrder: String, CaseIterable, Identifiable {
     case size
     case name
     case lastUsed
     case modified
 
-    var id: String { rawValue }
+    public var id: String { rawValue }
 }
 
-enum AppActionMode: String, CaseIterable, Identifiable {
+public enum AppActionMode: String, CaseIterable, Identifiable {
     case uninstall
     case reset
 
-    var id: String { rawValue }
+    public var id: String { rawValue }
 }
 
-struct PendingConfirmation: Identifiable {
-    let id = UUID()
-    let title: String
-    let isReset: Bool
-    let targets: [RemovalTarget]
-    let packageIDsToForget: [String]
-    let runningAppBundleIDs: [String]
-    let runningAppNames: [String]
-    let targetAppBundleIDs: [String]
-    let targetAppURLs: [URL]
-    let browserBundleIDsToRequireClosed: [String]
-    let hasAppleAppStoreApp: Bool
-    let hasChromiumExtension: Bool
-    let sourceTab: MainTab
-    let affectedAppIDs: [String]
-    let affectedStartupIDs: [String]
-    let affectedExtensionIDs: [String]
-    let affectedLeftoverIDs: [String]
+public struct PendingConfirmation: Identifiable {
+    public let id = UUID()
+    public let title: String
+    public let isReset: Bool
+    public let targets: [RemovalTarget]
+    public let packageIDsToForget: [String]
+    public let runningAppBundleIDs: [String]
+    public let runningAppNames: [String]
+    public let targetAppBundleIDs: [String]
+    public let targetAppURLs: [URL]
+    public let browserBundleIDsToRequireClosed: [String]
+    public let hasAppleAppStoreApp: Bool
+    public let hasChromiumExtension: Bool
+    public let sourceTab: MainTab
+    public let affectedAppIDs: [String]
+    public let affectedStartupIDs: [String]
+    public let affectedExtensionIDs: [String]
+    public let affectedLeftoverIDs: [String]
     /// Preference domains eligible for `cfprefsd` cache flush after a successful reset (only flushed if
     /// their preference `.plist` was actually removed).
-    var resetBundleIDs: [String] = []
+    public var resetBundleIDs: [String] = []
     /// Whether the reset target is a cryptographically verified Mac App Store Apple app (`defaults delete com.apple.*` allowed).
-    var resetAllowApple: Bool = false
+    public var resetAllowApple: Bool = false
     /// Whether any target carries the user-immutable (`chflags uchg`) lock flag and will be unlocked upon confirmation.
-    var hasUserLockedItems: Bool = false
+    public var hasUserLockedItems: Bool = false
+    /// Optional override for pre-selected removal mode in `ConfirmationSheet` (e.g. Trash vs Permanent from File Browser).
+    public var preferredRemovalModeOverride: RemovalMode? = nil
+    /// When `true` (e.g., all targets are already inside `~/.Trash`), `.trash` mode is disallowed and only `.permanent` is permitted.
+    public var forcePermanentMode: Bool = false
+    /// `true` whenever one or more targets already reside inside `~/.Trash` (those items must be permanently emptied even when other targets in the same batch move to Trash).
+    public var hasTrashItems: Bool = false
+
+    public init(
+        title: String,
+        isReset: Bool,
+        targets: [RemovalTarget],
+        packageIDsToForget: [String],
+        runningAppBundleIDs: [String],
+        runningAppNames: [String],
+        targetAppBundleIDs: [String],
+        targetAppURLs: [URL],
+        browserBundleIDsToRequireClosed: [String],
+        hasAppleAppStoreApp: Bool,
+        hasChromiumExtension: Bool,
+        sourceTab: MainTab,
+        affectedAppIDs: [String],
+        affectedStartupIDs: [String],
+        affectedExtensionIDs: [String],
+        affectedLeftoverIDs: [String],
+        resetBundleIDs: [String] = [],
+        resetAllowApple: Bool = false,
+        hasUserLockedItems: Bool = false,
+        preferredRemovalModeOverride: RemovalMode? = nil,
+        forcePermanentMode: Bool = false,
+        hasTrashItems: Bool = false
+    ) {
+        self.title = title
+        self.isReset = isReset
+        self.targets = targets
+        self.packageIDsToForget = packageIDsToForget
+        self.runningAppBundleIDs = runningAppBundleIDs
+        self.runningAppNames = runningAppNames
+        self.targetAppBundleIDs = targetAppBundleIDs
+        self.targetAppURLs = targetAppURLs
+        self.browserBundleIDsToRequireClosed = browserBundleIDsToRequireClosed
+        self.hasAppleAppStoreApp = hasAppleAppStoreApp
+        self.hasChromiumExtension = hasChromiumExtension
+        self.sourceTab = sourceTab
+        self.affectedAppIDs = affectedAppIDs
+        self.affectedStartupIDs = affectedStartupIDs
+        self.affectedExtensionIDs = affectedExtensionIDs
+        self.affectedLeftoverIDs = affectedLeftoverIDs
+        self.resetBundleIDs = resetBundleIDs
+        self.resetAllowApple = resetAllowApple
+        self.hasUserLockedItems = hasUserLockedItems
+        self.preferredRemovalModeOverride = preferredRemovalModeOverride
+        self.forcePermanentMode = forcePermanentMode
+        self.hasTrashItems = hasTrashItems
+    }
 }
 
-struct OperationBanner: Identifiable, Equatable {
-    let id = UUID()
-    let isError: Bool
-    let message: String
-    let showAppManagementLink: Bool
-    let showFDALink: Bool
+public struct OperationBanner: Identifiable, Equatable {
+    public let id = UUID()
+    public let isError: Bool
+    public let message: String
+    public let showAppManagementLink: Bool
+    public let showFDALink: Bool
     /// Apps that did not quit gracefully; the banner offers an explicit (user-confirmed) Force Quit.
-    var forceQuitBundleIDs: [String] = []
-    var forceQuitBundleURLs: [URL] = []
+    public var forceQuitBundleIDs: [String] = []
+    public var forceQuitBundleURLs: [URL] = []
 }
 
 @MainActor
-final class AppState: ObservableObject {
+public final class AppState: ObservableObject {
+    // Demo Mode
+    public let isDemoMode: Bool
+    private let demoCatalog: DemoFixtureCatalog?
+    private var demoRunningBundleIDs: Set<String> = []
+
     // Navigation & Sheets
-    @Published var activeTab: MainTab = .applications
-    @Published var showSettingsSheet: Bool = false
-    @Published var pendingConfirmation: PendingConfirmation?
-    @Published var banner: OperationBanner?
+    @Published public var activeTab: MainTab = .applications
+    @Published public var showSettingsSheet: Bool = false
+    @Published public var settingsTab: SettingsSheetTab = .general
+    @Published public var pendingConfirmation: PendingConfirmation?
+    @Published public var banner: OperationBanner?
 
     // Preferences & Permissions
-    @Published var preferences: SweepPreferences
-    @Published var cleanupHistory: [CleanupRecord] = []
-    @Published var hasFullDiskAccess: Bool = false
-    @Published var isExpertMode: Bool = true
+    @Published public var preferences: SweepPreferences
+    @Published public var cleanupHistory: [CleanupRecord] = []
+    @Published public var hasFullDiskAccess: Bool = false
+    @Published public var isExpertMode: Bool = true
 
     // Shared Core Engines
-    private let prefsStore = PreferencesStore()
-    private let historyStore = CleanupHistoryStore()
+    private let prefsStore: PreferencesStore?
+    private let historyStore: CleanupHistoryStore?
     let sizer = DirectorySizer()
     private var libraryIndex: LibraryIndex?
     private var cachedThirdPartyPackages: [String]?
@@ -124,81 +356,241 @@ final class AppState: ObservableObject {
     }
 
     private nonisolated static func normalizedPathKey(_ path: String) -> String {
-        URL(fileURLWithPath: path).standardizedFileURL.path.precomposedStringWithCanonicalMapping.lowercased()
+        let p = URL(fileURLWithPath: path).standardizedFileURL.path.precomposedStringWithCanonicalMapping.lowercased()
+        if p.count > 1 && p.hasSuffix("/") {
+            return String(p.dropLast())
+        }
+        return p
+    }
+
+    private nonisolated static func isSameOrDescendant(_ candidateNorm: String, ofNormalizedBase baseNorm: String) -> Bool {
+        if baseNorm == "/" { return true }
+        return candidateNorm == baseNorm || candidateNorm.hasPrefix(baseNorm + "/")
+    }
+
+    private nonisolated static func matchesAnyRemoved(_ path: String, removedNormalized: Set<String>) -> Bool {
+        let norm = normalizedPathKey(path)
+        return removedNormalized.contains(where: { isSameOrDescendant(norm, ofNormalizedBase: $0) })
     }
 
     // Tab 1: Applications
-    @Published var apps: [AppItem] = []
-    @Published var isScanningApps: Bool = false
-    @Published var isCalculatingSizes: Bool = false
-    @Published var appSearchText: String = ""
-    @Published var appSortOrder: AppSortOrder = .size
-    @Published var selectedAppID: String?
-    @Published var droppedApp: AppItem?
-    @Published var appActionMode: AppActionMode = .uninstall
-    @Published var includeAppBundleInRemoval: Bool = true
-    @Published var isPerformingRemoval: Bool = false
+    @Published public var apps: [AppItem] = []
+    @Published public var isScanningApps: Bool = false
+    @Published public var isCalculatingSizes: Bool = false
+    @Published public var appSearchText: String = ""
+    @Published public var appSortOrder: AppSortOrder = .size
+    @Published public var selectedAppID: String?
+    @Published public var droppedApp: AppItem?
+    @Published public var appActionMode: AppActionMode = .uninstall
+    @Published public var includeAppBundleInRemoval: Bool = true
+    @Published public var isPerformingRemoval: Bool = false
 
     // Tab 2: Startup
-    @Published var startupItems: [StartupItem] = []
-    @Published var isScanningStartup: Bool = false
-    @Published var startupSearchText: String = ""
-    @Published var togglingStartupIDs: Set<String> = []
+    @Published public var startupItems: [StartupItem] = []
+    @Published public var isScanningStartup: Bool = false
+    @Published public var startupSearchText: String = ""
+    @Published public var togglingStartupIDs: Set<String> = []
+    @Published public var selectedStartupID: String?
 
     // Tab 3: Extensions
-    @Published var extensionItems: [ExtensionItem] = []
-    @Published var isScanningExtensions: Bool = false
-    @Published var extensionsNeedFDAForBrowsers: Bool = false
-    @Published var blockedBrowserNames: [String] = []
-    @Published var extensionSearchText: String = ""
-    @Published var togglingExtensionIDs: Set<String> = []
+    @Published public var extensionItems: [ExtensionItem] = []
+    @Published public var isScanningExtensions: Bool = false
+    @Published public var extensionsNeedFDAForBrowsers: Bool = false
+    @Published public var blockedBrowserNames: [String] = []
+    @Published public var extensionSearchText: String = ""
+    @Published public var togglingExtensionIDs: Set<String> = []
+    @Published public var selectedExtensionID: String?
 
     // Tab 4: Leftovers
-    @Published var leftoverGroups: [LeftoverGroup] = []
-    @Published var isScanningLeftovers: Bool = false
-    @Published var leftoverSearchText: String = ""
+    @Published public var leftoverGroups: [LeftoverGroup] = []
+    @Published public var isScanningLeftovers: Bool = false
+    @Published public var leftoverSearchText: String = ""
+    @Published public var selectedLeftoverGroupID: String?
+
+    // Tab 5: File Manager
+    public let fileManagerStore = FileManagerStore()
+
+    // Tabs 6 & 7: Junk Cleaner & Resource Release
+    public let cleanupCenterStore = CleanupCenterStore()
 
     private var scanGeneration: Int = 0
     private var sizeTask: Task<Void, Never>?
 
-    var l10n: L10n {
+    public var l10n: L10n {
         L10n(language: preferences.language)
     }
 
-    var safetyGuard: SafetyGuard {
+    public var homeDirectoryURL: URL {
+        isDemoMode ? DemoFixtureCatalog.homeDirectoryURL : FileManager.default.homeDirectoryForCurrentUser
+    }
+
+    public var safetyGuard: SafetyGuard {
         SafetyGuard(
+            homeDirectory: homeDirectoryURL,
+            selfBundlePath: isDemoMode ? "/Applications/MacSweep.app" : Bundle.main.bundlePath,
             protectedPaths: preferences.protectedPaths,
             protectedBundleIDs: preferences.protectedBundleIDs
         )
     }
 
-    init() {
-        let loaded = prefsStore.load()
-        self.preferences = loaded
-        self.cleanupHistory = historyStore.load()
-        self.hasFullDiskAccess = PermissionChecker.checkFullDiskAccess().hasFullDiskAccess
+    public init(launchOptions: DemoLaunchOptions = .fromProcessInfo()) {
+        self.isDemoMode = launchOptions.isDemoMode
+        IconCache.shared.isDemoMode = launchOptions.isDemoMode
+
+        if launchOptions.isDemoMode {
+            self.prefsStore = nil
+            self.historyStore = nil
+            let catalog = DemoFixtureCatalog.default
+            self.demoCatalog = catalog
+            self.demoRunningBundleIDs = catalog.runningBundleIDs
+            var prefs = catalog.defaultPreferences
+            if let lang = launchOptions.languageOverride {
+                prefs.language = lang
+            }
+            if let theme = launchOptions.themeOverride {
+                prefs.themeMode = theme
+            }
+            self.preferences = prefs
+            self.cleanupHistory = catalog.cleanupHistory
+            self.hasFullDiskAccess = true
+            self.activeTab = launchOptions.initialTab ?? .applications
+            self.fileManagerStore.attach(to: self)
+            self.cleanupCenterStore.attach(to: self)
+            self.loadDemoData(from: catalog)
+        } else {
+            self.demoCatalog = nil
+            let ps = PreferencesStore()
+            let hs = CleanupHistoryStore()
+            self.prefsStore = ps
+            self.historyStore = hs
+            let loaded = ps.load()
+            self.preferences = loaded
+            self.cleanupHistory = hs.load()
+            self.hasFullDiskAccess = PermissionChecker.checkFullDiskAccess().hasFullDiskAccess
+            self.fileManagerStore.attach(to: self)
+            self.cleanupCenterStore.attach(to: self)
+            let realHome = FileManager.default.homeDirectoryForCurrentUser
+            self.fileManagerStore.configureInitialDirectory(realHome)
+            self.cleanupCenterStore.configureInitialDirectory(realHome)
+        }
+    }
+
+    private func loadDemoData(from catalog: DemoFixtureCatalog) {
+        apps = catalog.applications
+        selectedAppID = catalog.defaultSelectedAppID
+        isScanningApps = false
+        isCalculatingSizes = false
+        droppedApp = nil
+
+        startupItems = catalog.startupItems
+        selectedStartupID = catalog.defaultSelectedStartupID
+        isScanningStartup = false
+
+        extensionItems = catalog.extensionItems
+        selectedExtensionID = catalog.defaultSelectedExtensionID
+        extensionsNeedFDAForBrowsers = catalog.extensionScanResult.needsFullDiskAccessForBrowsers
+        blockedBrowserNames = catalog.extensionScanResult.blockedBrowserNames
+        isScanningExtensions = false
+
+        leftoverGroups = catalog.leftoverGroups
+        selectedLeftoverGroupID = catalog.defaultSelectedLeftoverGroupID
+        isScanningLeftovers = false
+
+        refreshAppProtectionFlags()
+        fileManagerStore.loadDemoCatalog(catalog)
+        cleanupCenterStore.loadDemoCatalog(catalog)
+    }
+
+    // MARK: - Demo Helpers
+
+    func demoPlistPreview(for item: StartupItem) -> String? {
+        demoCatalog?.plistPreview(for: item.plistURL)
+    }
+
+    func demoPathExists(_ path: String) -> Bool {
+        if let resolved = fileManagerStore.demoPathState(path) {
+            return resolved
+        }
+        return demoCatalog?.pathExists(path) ?? false
+    }
+
+    func demoDirectoryChildren(for url: URL) -> [(url: URL, name: String, isDirectory: Bool, isSymbolicLink: Bool, size: Int64?)] {
+        demoCatalog?.directoryChildren(for: url) ?? []
+    }
+
+    func isDemoBrowserRunning(bundleID: String) -> Bool {
+        demoRunningBundleIDs.contains(bundleID.lowercased())
+    }
+
+    func openDemoOrRealTrash() {
+        if isDemoMode {
+            banner = OperationBanner(
+                isError: false,
+                message: l10n.t("演示模式：已打开废纸篓（~/.Trash）", "Demo mode: Open Trash (/Users/alex/.Trash)"),
+                showAppManagementLink: false,
+                showFDALink: false
+            )
+            return
+        }
+        NSWorkspace.shared.open(homeDirectoryURL.appendingPathComponent(".Trash"))
     }
 
     // MARK: - Persistence & Permissions
 
-    func savePreferences() {
-        prefsStore.save(preferences)
+    @discardableResult
+    public func savePreferences() -> Bool {
+        if isDemoMode {
+            refreshAppProtectionFlags()
+            fileManagerStore.refreshProtectionFlags(using: safetyGuard)
+            cleanupCenterStore.refreshProtectionFlags(using: safetyGuard)
+            return true
+        }
+        let saved = prefsStore?.save(preferences) ?? false
         refreshAppProtectionFlags()
+        fileManagerStore.refreshProtectionFlags(using: safetyGuard)
+        cleanupCenterStore.refreshProtectionFlags(using: safetyGuard)
+        return saved
     }
 
     func refreshPermissionStatus() {
+        if isDemoMode {
+            hasFullDiskAccess = true
+            return
+        }
         hasFullDiskAccess = PermissionChecker.checkFullDiskAccess().hasFullDiskAccess
     }
 
     func openSystemSettings(_ url: URL) {
+        if isDemoMode {
+            banner = OperationBanner(
+                isError: false,
+                message: l10n.t("演示模式：已模拟打开系统设置", "Demo mode: System Settings action simulated"),
+                showAppManagementLink: false,
+                showFDALink: false
+            )
+            return
+        }
         NSWorkspace.shared.open(url)
     }
 
     func revealInFinder(_ url: URL) {
+        if isDemoMode {
+            banner = OperationBanner(
+                isError: false,
+                message: l10n.t("演示模式：在 Finder 中显示 \(url.path)", "Demo mode: Reveal in Finder (\(url.path))"),
+                showAppManagementLink: false,
+                showFDALink: false
+            )
+            return
+        }
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
     func revealSelfAppInFinder() {
+        if isDemoMode {
+            revealInFinder(URL(fileURLWithPath: "/Applications/MacSweep.app"))
+            return
+        }
         let bundleURL = Bundle.main.bundleURL
         let targetURL = bundleURL.pathExtension.lowercased() == "app"
             ? bundleURL
@@ -207,13 +599,18 @@ final class AppState: ObservableObject {
     }
 
     func clearHistory() {
-        historyStore.clear()
+        if isDemoMode {
+            cleanupHistory = []
+            return
+        }
+        historyStore?.clear()
         cleanupHistory = []
     }
 
     // MARK: - Applications Scanning
 
     func loadInitialDataIfNeeded() async {
+        if isDemoMode { return }
         refreshPermissionStatus()
         if apps.isEmpty && !isScanningApps {
             await scanApplications()
@@ -221,6 +618,18 @@ final class AppState: ObservableObject {
     }
 
     func scanApplications() async {
+        if isDemoMode {
+            if let catalog = demoCatalog {
+                apps = catalog.applications
+                refreshAppProtectionFlags()
+                if let sel = selectedAppID, !apps.contains(where: { $0.id == sel }) {
+                    selectedAppID = catalog.defaultSelectedAppID
+                }
+            }
+            isScanningApps = false
+            isCalculatingSizes = false
+            return
+        }
         scanGeneration += 1
         let gen = scanGeneration
         sizeTask?.cancel()
@@ -373,6 +782,7 @@ final class AppState: ObservableObject {
     }
 
     private func enrichSelectedAppWithPackages(appID: String) {
+        guard !isDemoMode else { return }
         guard let idx = apps.firstIndex(where: { $0.id == appID }) else { return }
         let targetApp = apps[idx]
         guard !targetApp.hasEnrichedPackages,
@@ -465,7 +875,7 @@ final class AppState: ObservableObject {
     }
 
     /// Handles Drag & Drop of any `.app` bundle (even outside `/Applications`) or Dock drop.
-    func inspectDroppedApp(at url: URL) {
+    public func inspectDroppedApp(at url: URL) {
         guard url.isFileURL,
               !url.path.contains("\0"),
               url.pathExtension.lowercased() == "app" else { return }
@@ -484,6 +894,15 @@ final class AppState: ObservableObject {
         let stdPathNorm = Self.normalizedPathKey(stdPath)
         if let existing = apps.first(where: { Self.normalizedPathKey($0.url.path) == stdPathNorm }) {
             selectApp(id: existing.id)
+            return
+        }
+        if isDemoMode {
+            banner = OperationBanner(
+                isError: false,
+                message: l10n.t("演示模式：仅展示预置脱敏应用。", "Demo mode: showing curated demo applications only."),
+                showAppManagementLink: false,
+                showFDALink: false
+            )
             return
         }
 
@@ -705,6 +1124,75 @@ final class AppState: ObservableObject {
         savePreferences()
     }
 
+    @discardableResult
+    func addProtectedPath(_ rawPath: String) -> ProtectedPathAddResult {
+        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !trimmed.contains("\0") else { return .invalid }
+
+        let expanded: String
+        if isDemoMode {
+            if trimmed == "~" {
+                expanded = DemoFixtureCatalog.homeDirectoryPath
+            } else if trimmed.hasPrefix("~/") {
+                expanded = DemoFixtureCatalog.homeDirectoryPath + String(trimmed.dropFirst(1))
+            } else {
+                expanded = trimmed
+            }
+        } else {
+            expanded = (trimmed as NSString).expandingTildeInPath
+        }
+        guard expanded.hasPrefix("/"), !expanded.contains("\0") else { return .invalid }
+
+        let normalized = URL(fileURLWithPath: expanded).standardizedFileURL.path
+        guard normalized != "/" else { return .invalid }
+        let key = Self.normalizedPathKey(normalized)
+        if preferences.protectedPaths.contains(where: { Self.normalizedPathKey($0) == key }) {
+            return .duplicate
+        }
+
+        preferences.protectedPaths.append(normalized)
+        if !savePreferences() {
+            return .saveFailed
+        }
+        return .added(normalized)
+    }
+
+    @discardableResult
+    func addProtectedPaths(urls: [URL]) -> Bool {
+        var changed = false
+        for url in urls where url.isFileURL {
+            let normalized = url.standardizedFileURL.path
+            guard !normalized.isEmpty, normalized != "/", !normalized.contains("\0") else { continue }
+            let key = Self.normalizedPathKey(normalized)
+            if !preferences.protectedPaths.contains(where: { Self.normalizedPathKey($0) == key }) {
+                preferences.protectedPaths.append(normalized)
+                changed = true
+            }
+        }
+        if changed {
+            return savePreferences()
+        }
+        return true
+    }
+
+    @discardableResult
+    func removeProtectedPath(_ path: String) -> Bool {
+        let key = Self.normalizedPathKey(path)
+        preferences.protectedPaths.removeAll { Self.normalizedPathKey($0) == key }
+        return savePreferences()
+    }
+
+    private func isURLProtectedByGuardOrDemo(_ url: URL) -> Bool {
+        if !safetyGuard.validateForRemoval(url).isAllowed {
+            return true
+        }
+        if isDemoMode, let bid = fileManagerStore.demoBundleID(for: url),
+           safetyGuard.matchesProtectedBundleID(bid) {
+            return true
+        }
+        return false
+    }
+
     private func refreshAppProtectionFlags() {
         let guardCopy = safetyGuard
         for i in apps.indices {
@@ -716,9 +1204,34 @@ final class AppState: ObservableObject {
             dropped.isProtected = guardCopy.isUserProtected(bundleID: dropped.bundleID, url: dropped.url)
             droppedApp = dropped
         }
+        for gIdx in leftoverGroups.indices {
+            for fIdx in leftoverGroups[gIdx].files.indices {
+                if isURLProtectedByGuardOrDemo(leftoverGroups[gIdx].files[fIdx].url) {
+                    leftoverGroups[gIdx].files[fIdx].isSelected = false
+                }
+            }
+            leftoverGroups[gIdx].isChecked = leftoverGroups[gIdx].files.contains(where: \.isSelected)
+        }
     }
 
     func quitApp(_ app: AppItem) async {
+        if isDemoMode {
+            demoRunningBundleIDs.remove(app.bundleID.lowercased())
+            if let idx = apps.firstIndex(where: { $0.id == app.id }) {
+                apps[idx].isRunning = false
+            }
+            if var dropped = droppedApp, dropped.id == app.id {
+                dropped.isRunning = false
+                droppedApp = dropped
+            }
+            banner = OperationBanner(
+                isError: false,
+                message: l10n.t("演示模式：已退出 \(app.localizedName)", "Demo mode: Quit \(app.localizedName)"),
+                showAppManagementLink: false,
+                showFDALink: false
+            )
+            return
+        }
         let safeIDs = AppScanner.safeProcessMatchBundleID(for: app).map { [$0] } ?? []
         _ = await RemovalEngine.terminateRunningApps(
             bundleIDs: safeIDs,
@@ -784,8 +1297,18 @@ final class AppState: ObservableObject {
             }
             guard !targets.isEmpty else { return }
             let guardCopy = safetyGuard
-            let hasLocked = targets.contains { guardCopy.isUserImmutable($0.url) }
-            let running = AppScanner.runningProcesses(matchingBundleIDs: targetBundleIDs, bundleURLs: targetAppURLs)
+            let hasLocked = isDemoMode ? false : targets.contains { guardCopy.isUserImmutable($0.url) }
+            let runningIDs: [String]
+            let runningNames: [String]
+            if isDemoMode {
+                let runningBatch = batch.filter { $0.isRunning || demoRunningBundleIDs.contains($0.bundleID.lowercased()) }
+                runningIDs = Array(Set(runningBatch.map(\.bundleID)))
+                runningNames = Array(Set(runningBatch.map(\.localizedName)))
+            } else {
+                let running = AppScanner.runningProcesses(matchingBundleIDs: targetBundleIDs, bundleURLs: targetAppURLs)
+                runningIDs = Array(Set(running.map(\.bundleID).filter { !$0.isEmpty }))
+                runningNames = Array(Set(running.map(\.name)))
+            }
             let title = l10n.isChinese
                 ? "批量卸载 \(batch.count) 个应用"
                 : (batch.count == 1 ? "Uninstall 1 app" : "Uninstall \(batch.count) apps")
@@ -794,8 +1317,8 @@ final class AppState: ObservableObject {
                 isReset: false,
                 targets: targets,
                 packageIDsToForget: Array(Set(pkgIDs)),
-                runningAppBundleIDs: Array(Set(running.map(\.bundleID).filter { !$0.isEmpty })),
-                runningAppNames: Array(Set(running.map(\.name))),
+                runningAppBundleIDs: runningIDs,
+                runningAppNames: runningNames,
                 targetAppBundleIDs: targetBundleIDs,
                 targetAppURLs: targetAppURLs,
                 browserBundleIDsToRequireClosed: [],
@@ -839,8 +1362,18 @@ final class AppState: ObservableObject {
 
         guard !targets.isEmpty else { return }
         let guardCopy = safetyGuard
-        let hasLocked = targets.contains { guardCopy.isUserImmutable($0.url) }
-        let running = AppScanner.runningProcesses(matchingBundleIDs: targetBundleIDs, bundleURLs: targetAppURLs)
+        let hasLocked = isDemoMode ? false : targets.contains { guardCopy.isUserImmutable($0.url) }
+        let runningIDs: [String]
+        let runningNames: [String]
+        if isDemoMode {
+            let isAppRunning = app.isRunning || demoRunningBundleIDs.contains(app.bundleID.lowercased())
+            runningIDs = isAppRunning ? [app.bundleID] : []
+            runningNames = isAppRunning ? [app.localizedName] : []
+        } else {
+            let running = AppScanner.runningProcesses(matchingBundleIDs: targetBundleIDs, bundleURLs: targetAppURLs)
+            runningIDs = Array(Set(running.map(\.bundleID).filter { !$0.isEmpty }))
+            runningNames = Array(Set(running.map(\.name)))
+        }
         let title = isReset
             ? (l10n.isChinese ? "重置 \(app.localizedName)" : "Reset \(app.localizedName)")
             : (l10n.isChinese ? "卸载 \(app.localizedName)" : "Uninstall \(app.localizedName)")
@@ -850,8 +1383,8 @@ final class AppState: ObservableObject {
             isReset: isReset,
             targets: targets,
             packageIDsToForget: pkgIDs,
-            runningAppBundleIDs: Array(Set(running.map(\.bundleID).filter { !$0.isEmpty })),
-            runningAppNames: Array(Set(running.map(\.name))),
+            runningAppBundleIDs: runningIDs,
+            runningAppNames: runningNames,
             targetAppBundleIDs: targetBundleIDs,
             targetAppURLs: targetAppURLs,
             browserBundleIDsToRequireClosed: [],
@@ -868,12 +1401,80 @@ final class AppState: ObservableObject {
         )
     }
 
-    func executePendingConfirmation(mode: RemovalMode) async {
+    public func executePendingConfirmation(mode: RemovalMode) async {
         guard let conf = pendingConfirmation else { return }
         pendingConfirmation = nil
         isPerformingRemoval = true
 
-        // 0. TOCTOU guard for browser extensions (Chromium & Firefox): abort if browser launched while sheet was open.
+        let trashDir = URL(fileURLWithPath: safetyGuard.homeDirectoryPath).appendingPathComponent(".Trash")
+
+        if isDemoMode {
+            let allowedTargets = conf.targets.filter { !isURLProtectedByGuardOrDemo($0.url) }
+            guard !allowedTargets.isEmpty else {
+                isPerformingRemoval = false
+                banner = OperationBanner(
+                    isError: true,
+                    message: l10n.fileOperationBlockedTitle,
+                    showAppManagementLink: false,
+                    showFDALink: false
+                )
+                return
+            }
+            let trashTargets = allowedTargets.filter { RemovalEngine.isInsideDirectory($0.url, directory: trashDir) }
+            let nonTrashTargets = allowedTargets.filter { !RemovalEngine.isInsideDirectory($0.url, directory: trashDir) }
+            let removedPaths = allowedTargets.map { $0.url.standardizedFileURL.path }
+            let freedBytes = allowedTargets.reduce(Int64(0)) { $0 + max(0, $1.estimatedSize) }
+
+            if mode == .trash && !trashTargets.isEmpty && !nonTrashTargets.isEmpty {
+                let nonTrashPaths = nonTrashTargets.map { $0.url.standardizedFileURL.path }
+                let nonTrashBytes = nonTrashTargets.reduce(Int64(0)) { $0 + max(0, $1.estimatedSize) }
+                let trashPaths = trashTargets.map { $0.url.standardizedFileURL.path }
+                let trashBytes = trashTargets.reduce(Int64(0)) { $0 + max(0, $1.estimatedSize) }
+                let trashTitle = l10n.isChinese ? "\(conf.title)（清空废纸篓）" : "\(conf.title) (Empty Trash)"
+                cleanupHistory.insert(CleanupRecord(
+                    actionTitle: trashTitle,
+                    mode: .permanent,
+                    itemCount: trashPaths.count,
+                    freedBytes: trashBytes,
+                    removedPaths: trashPaths
+                ), at: 0)
+                cleanupHistory.insert(CleanupRecord(
+                    actionTitle: conf.title,
+                    mode: .trash,
+                    itemCount: nonTrashPaths.count,
+                    freedBytes: nonTrashBytes,
+                    removedPaths: nonTrashPaths
+                ), at: 0)
+            } else {
+                let effectiveMode: RemovalMode = (conf.forcePermanentMode || nonTrashTargets.isEmpty) ? .permanent : mode
+                let record = CleanupRecord(
+                    actionTitle: conf.title,
+                    mode: effectiveMode,
+                    itemCount: removedPaths.count,
+                    freedBytes: freedBytes,
+                    removedPaths: removedPaths
+                )
+                cleanupHistory.insert(record, at: 0)
+            }
+            if cleanupHistory.count > 100 {
+                cleanupHistory = Array(cleanupHistory.prefix(100))
+            }
+            applyIncrementalRemoval(removedPaths: Set(removedPaths), forgottenPackageIDs: conf.packageIDsToForget)
+            isPerformingRemoval = false
+            let freed = ByteFormatter.format(freedBytes)
+            let msg = l10n.isChinese
+                ? "演示模式：已移除 \(removedPaths.count) 个项目，释放 \(freed)"
+                : "Demo mode: removed \(removedPaths.count) items, freed \(freed)"
+            banner = OperationBanner(
+                isError: false,
+                message: msg,
+                showAppManagementLink: false,
+                showFDALink: false
+            )
+            return
+        }
+
+        // 0. TOCTOU guard for browsers (Chromium & Firefox extensions or browser caches): abort if browser launched while sheet was open.
         if !conf.browserBundleIDsToRequireClosed.isEmpty {
             let liveBrowsers = AppScanner.runningProcesses(
                 matchingBundleIDs: conf.browserBundleIDsToRequireClosed,
@@ -882,12 +1483,18 @@ final class AppState: ObservableObject {
             if !liveBrowsers.isEmpty {
                 isPerformingRemoval = false
                 let names = liveBrowsers.map(\.name).joined(separator: ", ")
-                banner = OperationBanner(
-                    isError: true,
-                    message: l10n.t(
+                let msg = conf.sourceTab == .junkCleaner
+                    ? l10n.t(
+                        "检测到浏览器（\(names)）正在运行，已中止清理浏览器缓存，请先退出浏览器后再试。",
+                        "Browser (\(names)) is currently running. Cache cleanup aborted — quit the browser first and retry."
+                    )
+                    : l10n.t(
                         "检测到浏览器（\(names)）正在运行，已中止移除扩展，请先退出浏览器后再试。",
                         "Browser (\(names)) is currently running. Extension removal aborted — quit the browser first and retry."
-                    ),
+                    )
+                banner = OperationBanner(
+                    isError: true,
+                    message: msg,
                     showAppManagementLink: false,
                     showFDALink: false
                 )
@@ -928,7 +1535,7 @@ final class AppState: ObservableObject {
         }
 
         let guardCopy = safetyGuard
-        let histStore = historyStore
+        let histStore = historyStore ?? CleanupHistoryStore()
 
         // 2. Unload launchd services whose plists are about to be removed (F2).
         //    Only pass plists whose canonical parent still matches scan time (TOCTOU guard).
@@ -965,18 +1572,50 @@ final class AppState: ObservableObject {
         // F1 + F2 interaction: NEVER forget pkg receipts if any launchd service failed to unload and stayed on disk.
         let safePkgIDs = stillLoadedPlists.isEmpty ? conf.packageIDsToForget : []
         let removalTargets = targetsToRemove
+        let trashTitle = l10n.isChinese ? "\(conf.title)（清空废纸篓）" : "\(conf.title) (Empty Trash)"
         let report = await Task.detached(priority: .userInitiated) {
             let engine = RemovalEngine(safetyGuard: guardCopy, historyStore: histStore)
+            let trashTargets = removalTargets.filter { RemovalEngine.isInsideDirectory($0.url, directory: trashDir) }
+            let nonTrashTargets = removalTargets.filter { !RemovalEngine.isInsideDirectory($0.url, directory: trashDir) }
+
+            if mode == .trash && !trashTargets.isEmpty && !nonTrashTargets.isEmpty {
+                let nonTrashReport = engine.remove(
+                    targets: nonTrashTargets,
+                    mode: .trash,
+                    actionTitle: conf.title,
+                    packageIDsToForget: []
+                )
+                if nonTrashReport.cancelledByUser {
+                    return nonTrashReport
+                }
+                let trashReport = engine.remove(
+                    targets: trashTargets,
+                    mode: .permanent,
+                    actionTitle: trashTitle,
+                    packageIDsToForget: []
+                )
+                return RemovalReport(
+                    succeededURLs: nonTrashReport.succeededURLs + trashReport.succeededURLs,
+                    failures: nonTrashReport.failures + trashReport.failures,
+                    warnings: nonTrashReport.warnings + trashReport.warnings,
+                    freedBytes: nonTrashReport.freedBytes + trashReport.freedBytes,
+                    needsAppManagementPermission: nonTrashReport.needsAppManagementPermission || trashReport.needsAppManagementPermission,
+                    usedFinderFallbackToAdmin: nonTrashReport.usedFinderFallbackToAdmin || trashReport.usedFinderFallbackToAdmin,
+                    cancelledByUser: nonTrashReport.cancelledByUser || trashReport.cancelledByUser
+                )
+            }
+
+            let effectiveMode: RemovalMode = (nonTrashTargets.isEmpty && !trashTargets.isEmpty) ? .permanent : mode
             return engine.remove(
                 targets: removalTargets,
-                mode: mode,
+                mode: effectiveMode,
                 actionTitle: conf.title,
                 packageIDsToForget: safePkgIDs
             )
         }.value
 
         isPerformingRemoval = false
-        cleanupHistory = historyStore.load()
+        cleanupHistory = histStore.load()
 
         // Always sync UI for any paths that were actually removed (even if user cancelled partway).
         let removedSet = Set(report.succeededURLs.map { $0.standardizedFileURL.path })
@@ -1038,7 +1677,9 @@ final class AppState: ObservableObject {
                 isError: true,
                 message: msg,
                 showAppManagementLink: report.needsAppManagementPermission,
-                showFDALink: false
+                showFDALink: !hasFullDiskAccess
+                    && !report.needsAppManagementPermission
+                    && report.failures.contains(where: \.isPermissionDenied)
             )
         }
     }
@@ -1084,6 +1725,21 @@ final class AppState: ObservableObject {
 
     /// Explicit, user-initiated force quit offered by the banner after a graceful quit timed out.
     func forceQuitApps(bundleIDs: [String], bundleURLs: [URL] = []) async {
+        if isDemoMode {
+            for bid in bundleIDs {
+                demoRunningBundleIDs.remove(bid.lowercased())
+            }
+            for i in apps.indices where bundleIDs.contains(where: { $0.lowercased() == apps[i].bundleID.lowercased() }) {
+                apps[i].isRunning = false
+            }
+            banner = OperationBanner(
+                isError: false,
+                message: l10n.t("演示模式：已强制退出。", "Demo mode: Force quit done."),
+                showAppManagementLink: false,
+                showFDALink: false
+            )
+            return
+        }
         let still = await RemovalEngine.terminateRunningApps(
             bundleIDs: bundleIDs,
             bundleURLs: bundleURLs,
@@ -1142,7 +1798,7 @@ final class AppState: ObservableObject {
         var updatedSysPaths: [String: Set<String>] = [:]
         var updatedSysIDs = Set<String>()
         for (bid, paths) in systemInventoryPathsByID {
-            let remaining = paths.filter { !removedNorm.contains(Self.normalizedPathKey($0)) }
+            let remaining = paths.filter { !Self.matchesAnyRemoved($0, removedNormalized: removedNorm) }
             if !remaining.isEmpty {
                 updatedSysPaths[bid] = remaining
                 updatedSysIDs.insert(bid)
@@ -1152,7 +1808,7 @@ final class AppState: ObservableObject {
         systemInventoryBundleIDs = updatedSysIDs
         var updatedSysGroupOwners: [String: Set<String>] = [:]
         for (groupID, paths) in systemInventoryGroupOwners {
-            let remaining = paths.filter { !removedNorm.contains($0) }
+            let remaining = paths.filter { !Self.matchesAnyRemoved($0, removedNormalized: removedNorm) }
             if !remaining.isEmpty {
                 updatedSysGroupOwners[groupID] = remaining
             }
@@ -1161,18 +1817,18 @@ final class AppState: ObservableObject {
 
         // 1. Sync Applications tab & dropped app
         if var dropped = droppedApp {
-            if removedNorm.contains(Self.normalizedPathKey(dropped.url.path)) {
+            if Self.matchesAnyRemoved(dropped.url.path, removedNormalized: removedNorm) {
                 droppedApp = nil
             } else {
-                dropped.serviceFiles.removeAll { removedNorm.contains(Self.normalizedPathKey($0.url.path)) }
+                dropped.serviceFiles.removeAll { Self.matchesAnyRemoved($0.url.path, removedNormalized: removedNorm) }
                 droppedApp = dropped
             }
         }
-        apps.removeAll { removedNorm.contains(Self.normalizedPathKey($0.url.path)) }
+        apps.removeAll { Self.matchesAnyRemoved($0.url.path, removedNormalized: removedNorm) }
         var bundleCounts: [String: Int] = [:]
         for app in apps { bundleCounts[app.bundleID.lowercased(), default: 0] += 1 }
         for i in apps.indices {
-            apps[i].serviceFiles.removeAll { removedNorm.contains(Self.normalizedPathKey($0.url.path)) }
+            apps[i].serviceFiles.removeAll { Self.matchesAnyRemoved($0.url.path, removedNormalized: removedNorm) }
             let lowerID = apps[i].bundleID.lowercased()
             let appPathNorm = Self.normalizedPathKey(apps[i].url.path)
             let hasOtherSystemCopy = (systemInventoryPathsByID[lowerID] ?? []).contains {
@@ -1192,43 +1848,72 @@ final class AppState: ObservableObject {
             selectedAppID = nil
         }
 
-        // 2. Sync Startup tab (direct plist removal OR parent app removal)
+        // 2. Sync Startup tab (direct plist removal OR parent directory/app removal)
         startupItems.removeAll { item in
-            let plistKey = Self.normalizedPathKey(item.plistURL.path)
-            if removedNorm.contains(plistKey) { return true }
-            if let assoc = item.associatedAppPath, removedNorm.contains(Self.normalizedPathKey(assoc)) {
-                return item.scope == .appLoginItem
+            if Self.matchesAnyRemoved(item.plistURL.path, removedNormalized: removedNorm) {
+                return true
             }
-            return false
-        }
-
-        // 3. Sync Extensions tab (direct removal OR host app removal)
-        extensionItems.removeAll { item in
-            let extKey = Self.normalizedPathKey(item.path.path)
-            if removedNorm.contains(extKey) { return true }
-            if let host = item.hostAppPath?.path, removedNorm.contains(Self.normalizedPathKey(host)) {
+            if item.scope == .appLoginItem,
+               let assoc = item.associatedAppPath,
+               Self.matchesAnyRemoved(assoc, removedNormalized: removedNorm) {
                 return true
             }
             return false
         }
+        if let selStartup = selectedStartupID, !startupItems.contains(where: { $0.id == selStartup }) {
+            selectedStartupID = nil
+        }
+
+        // 3. Sync Extensions tab (direct removal OR parent directory/host app removal)
+        extensionItems.removeAll { item in
+            if Self.matchesAnyRemoved(item.path.path, removedNormalized: removedNorm) {
+                return true
+            }
+            if let host = item.hostAppPath?.path,
+               Self.matchesAnyRemoved(host, removedNormalized: removedNorm) {
+                return true
+            }
+            return false
+        }
+        if let selExt = selectedExtensionID, !extensionItems.contains(where: { $0.id == selExt }) {
+            selectedExtensionID = nil
+        }
 
         // 4. Sync Leftovers tab
         for i in leftoverGroups.indices {
-            leftoverGroups[i].files.removeAll { removedNorm.contains(Self.normalizedPathKey($0.url.path)) }
+            leftoverGroups[i].files.removeAll { Self.matchesAnyRemoved($0.url.path, removedNormalized: removedNorm) }
             leftoverGroups[i].isChecked = leftoverGroups[i].files.contains(where: \.isSelected)
         }
         leftoverGroups.removeAll { $0.files.isEmpty }
+        if let selLeftover = selectedLeftoverGroupID, !leftoverGroups.contains(where: { $0.id == selLeftover }) {
+            selectedLeftoverGroupID = nil
+        }
+
+        // 5. Sync File Manager tab
+        fileManagerStore.applyIncrementalRemoval(removedPaths: removedNorm)
+
+        // 6. Sync Junk Cleaner & Resource Release tabs
+        cleanupCenterStore.applyIncrementalRemoval(removedPaths: removedNorm)
     }
 
     // MARK: - Startup Programs
 
     func loadStartupIfNeeded() async {
+        if isDemoMode { return }
         if startupItems.isEmpty && !isScanningStartup {
             await scanStartupItems()
         }
     }
 
     func scanStartupItems() async {
+        if isDemoMode {
+            if let catalog = demoCatalog {
+                startupItems = catalog.startupItems
+                selectedStartupID = catalog.defaultSelectedStartupID
+            }
+            isScanningStartup = false
+            return
+        }
         isScanningStartup = true
         let guardCopy = safetyGuard
         let found = await Task.detached(priority: .userInitiated) {
@@ -1242,6 +1927,21 @@ final class AppState: ObservableObject {
         guard !togglingStartupIDs.contains(item.id) else { return }
         togglingStartupIDs.insert(item.id)
         defer { togglingStartupIDs.remove(item.id) }
+
+        if isDemoMode {
+            if let idx = startupItems.firstIndex(where: { $0.id == item.id }) {
+                startupItems[idx].isEnabled = enable
+            }
+            banner = OperationBanner(
+                isError: false,
+                message: enable
+                    ? l10n.t("演示模式：已启用启动项 \(item.label)", "Demo mode: Enabled startup item \(item.label)")
+                    : l10n.t("演示模式：已禁用启动项 \(item.label)", "Demo mode: Disabled startup item \(item.label)"),
+                showAppManagementLink: false,
+                showFDALink: false
+            )
+            return
+        }
 
         let guardCopy = safetyGuard
         let result: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
@@ -1277,8 +1977,20 @@ final class AppState: ObservableObject {
         }
     }
 
-    func prepareRemovalForStartupItem(_ item: StartupItem) {
+    public func prepareRemovalForStartupItem(_ item: StartupItem) {
         guard item.canRemove, !isPerformingRemoval else { return }
+        let isProtected = isURLProtectedByGuardOrDemo(item.plistURL)
+            || safetyGuard.matchesProtectedBundleID(item.label)
+            || (item.associatedAppPath.map { isURLProtectedByGuardOrDemo(URL(fileURLWithPath: $0)) } ?? false)
+        if isProtected {
+            banner = OperationBanner(
+                isError: true,
+                message: l10n.fileOperationBlockedTitle,
+                showAppManagementLink: false,
+                showFDALink: false
+            )
+            return
+        }
         let target = RemovalTarget(
             url: item.plistURL,
             estimatedSize: item.fileSize,
@@ -1302,13 +2014,14 @@ final class AppState: ObservableObject {
             affectedStartupIDs: [item.id],
             affectedExtensionIDs: [],
             affectedLeftoverIDs: [],
-            hasUserLockedItems: safetyGuard.isUserImmutable(item.plistURL)
+            hasUserLockedItems: isDemoMode ? false : safetyGuard.isUserImmutable(item.plistURL)
         )
     }
 
     // MARK: - Leftovers
 
     func loadLeftoversIfNeeded() async {
+        if isDemoMode { return }
         if leftoverGroups.isEmpty && !isScanningLeftovers {
             await scanLeftovers()
         }
@@ -1316,6 +2029,15 @@ final class AppState: ObservableObject {
 
     /// Always rebuilds a fresh `LibraryIndex` from disk so manual refresh accurately reflects recent removals/changes.
     func scanLeftovers() async {
+        if isDemoMode {
+            if let catalog = demoCatalog {
+                let ignoredLower = Set(preferences.ignoredLeftoverIDs.map { $0.lowercased() })
+                leftoverGroups = catalog.leftoverGroups.filter { !ignoredLower.contains($0.id.lowercased()) }
+                selectedLeftoverGroupID = leftoverGroups.first?.id
+            }
+            isScanningLeftovers = false
+            return
+        }
         isScanningLeftovers = true
         let guardCopy = safetyGuard
         let ignored = preferences.ignoredLeftoverIDs
@@ -1382,17 +2104,21 @@ final class AppState: ObservableObject {
         leftoverGroups.removeAll { $0.id == group.id }
     }
 
-    func prepareRemovalForCheckedLeftovers() {
+    public func prepareRemovalForCheckedLeftovers() {
         var targets: [RemovalTarget] = []
         var seen = Set<String>()
         var groupIDs: [String] = []
+        var hadSelectedFiles = false
         for group in leftoverGroups where group.isChecked {
             let selected = group.files.filter(\.isSelected)
             guard !selected.isEmpty else { continue }
-            groupIDs.append(group.id)
+            hadSelectedFiles = true
+            var addedForGroup = false
             for file in selected {
+                guard !isURLProtectedByGuardOrDemo(file.url) else { continue }
                 let key = file.url.standardizedFileURL.path
                 if seen.insert(key).inserted {
+                    addedForGroup = true
                     targets.append(RemovalTarget(
                         url: file.url,
                         estimatedSize: file.size ?? 0,
@@ -1401,10 +2127,23 @@ final class AppState: ObservableObject {
                     ))
                 }
             }
+            if addedForGroup {
+                groupIDs.append(group.id)
+            }
         }
-        guard !targets.isEmpty else { return }
+        guard !targets.isEmpty else {
+            if hadSelectedFiles {
+                banner = OperationBanner(
+                    isError: true,
+                    message: l10n.fileOperationBlockedTitle,
+                    showAppManagementLink: false,
+                    showFDALink: false
+                )
+            }
+            return
+        }
         let guardCopy = safetyGuard
-        let hasLocked = targets.contains { guardCopy.isUserImmutable($0.url) }
+        let hasLocked = isDemoMode ? false : targets.contains { guardCopy.isUserImmutable($0.url) }
         pendingConfirmation = PendingConfirmation(
             title: l10n.isChinese
                 ? "清理 \(groupIDs.count) 组残留文件"
@@ -1431,12 +2170,23 @@ final class AppState: ObservableObject {
     // MARK: - Extensions
 
     func loadExtensionsIfNeeded() async {
+        if isDemoMode { return }
         if extensionItems.isEmpty && !isScanningExtensions {
             await scanExtensions()
         }
     }
 
     func scanExtensions() async {
+        if isDemoMode {
+            if let catalog = demoCatalog {
+                extensionItems = catalog.extensionItems
+                extensionsNeedFDAForBrowsers = catalog.extensionScanResult.needsFullDiskAccessForBrowsers
+                blockedBrowserNames = catalog.extensionScanResult.blockedBrowserNames
+                selectedExtensionID = catalog.defaultSelectedExtensionID
+            }
+            isScanningExtensions = false
+            return
+        }
         isScanningExtensions = true
         let guardCopy = safetyGuard
         let sizerRef = sizer
@@ -1453,6 +2203,21 @@ final class AppState: ObservableObject {
         guard item.canToggle, !togglingExtensionIDs.contains(item.id) else { return }
         togglingExtensionIDs.insert(item.id)
         defer { togglingExtensionIDs.remove(item.id) }
+
+        if isDemoMode {
+            if let idx = extensionItems.firstIndex(where: { $0.id == item.id }) {
+                extensionItems[idx].isEnabled = enable
+            }
+            banner = OperationBanner(
+                isError: false,
+                message: enable
+                    ? l10n.t("演示模式：已启用扩展 \(item.name)", "Demo mode: Enabled extension \(item.name)")
+                    : l10n.t("演示模式：已禁用扩展 \(item.name)", "Demo mode: Disabled extension \(item.name)"),
+                showAppManagementLink: false,
+                showFDALink: false
+            )
+            return
+        }
 
         let res: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
             do {
@@ -1488,11 +2253,19 @@ final class AppState: ObservableObject {
 
     func isBrowserRunning(for item: ExtensionItem) -> Bool {
         guard let bid = item.browserBundleID?.lowercased() else { return false }
+        if isDemoMode {
+            return demoRunningBundleIDs.contains(bid)
+        }
         return AppScanner.runningBundleIDs().contains(bid)
     }
 
     func quitBrowser(for item: ExtensionItem) async {
         guard let bid = item.browserBundleID else { return }
+        if isDemoMode {
+            demoRunningBundleIDs.remove(bid.lowercased())
+            objectWillChange.send()
+            return
+        }
         let browserURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bid)
         _ = await RemovalEngine.terminateRunningApps(
             bundleIDs: [bid],
@@ -1503,8 +2276,20 @@ final class AppState: ObservableObject {
         objectWillChange.send()
     }
 
-    func prepareRemovalForExtension(_ item: ExtensionItem) {
+    public func prepareRemovalForExtension(_ item: ExtensionItem) {
         guard item.canRemove, !isPerformingRemoval else { return }
+        let isProtected = isURLProtectedByGuardOrDemo(item.path)
+            || safetyGuard.matchesProtectedBundleID(item.identifier)
+            || (item.hostAppPath.map { isURLProtectedByGuardOrDemo($0) } ?? false)
+        if isProtected {
+            banner = OperationBanner(
+                isError: true,
+                message: l10n.fileOperationBlockedTitle,
+                showAppManagementLink: false,
+                showFDALink: false
+            )
+            return
+        }
         // Require browser quit for ALL removable browser extensions (Chromium AND Firefox).
         let requiredClosedBrowser: [String] = (item.category.isBrowser && item.browserBundleID != nil)
             ? [item.browserBundleID!]
@@ -1541,7 +2326,220 @@ final class AppState: ObservableObject {
             affectedStartupIDs: [],
             affectedExtensionIDs: [item.id],
             affectedLeftoverIDs: [],
-            hasUserLockedItems: safetyGuard.isUserImmutable(item.path)
+            hasUserLockedItems: isDemoMode ? false : safetyGuard.isUserImmutable(item.path)
+        )
+    }
+
+    // MARK: - File Manager Removal Preparation
+
+    public func prepareRemovalForFileManagerItems(
+        _ items: [(url: URL, size: Int64, requiresAdmin: Bool, expectedCanonicalParent: String)],
+        title: String,
+        preferredRemovalModeOverride: RemovalMode? = nil
+    ) {
+        guard !isPerformingRemoval else { return }
+        let guardCopy = safetyGuard
+        let trashDir = URL(fileURLWithPath: guardCopy.homeDirectoryPath).appendingPathComponent(".Trash")
+
+        var targets: [RemovalTarget] = []
+        var seen = Set<String>()
+        var targetAppURLs: [URL] = []
+        var trashTargetCount = 0
+
+        for item in items {
+            let stdURL = item.url.standardizedFileURL
+            let isProtectedDemoApp: Bool
+            if isDemoMode, let bundleID = fileManagerStore.demoBundleID(for: stdURL) {
+                isProtectedDemoApp = guardCopy.matchesProtectedBundleID(bundleID)
+            } else {
+                isProtectedDemoApp = false
+            }
+            guard !isProtectedDemoApp, guardCopy.validateForRemoval(stdURL).isAllowed else { continue }
+            guard seen.insert(stdURL.path).inserted else { continue }
+            if RemovalEngine.isInsideDirectory(stdURL, directory: trashDir) {
+                trashTargetCount += 1
+            }
+            if stdURL.pathExtension.lowercased() == "app" {
+                targetAppURLs.append(stdURL)
+            }
+            targets.append(RemovalTarget(
+                url: stdURL,
+                estimatedSize: max(0, item.size),
+                requiresAdmin: isDemoMode ? item.requiresAdmin : (item.requiresAdmin || guardCopy.requiresAdmin(for: stdURL)),
+                expectedCanonicalParent: item.expectedCanonicalParent
+            ))
+        }
+
+        guard !targets.isEmpty else {
+            banner = OperationBanner(
+                isError: true,
+                message: l10n.fileOperationBlockedTitle,
+                showAppManagementLink: false,
+                showFDALink: false
+            )
+            return
+        }
+
+        let hasTrashItems = trashTargetCount > 0
+        let allTargetsInTrash = trashTargetCount == targets.count
+        let hasLocked = isDemoMode ? false : targets.contains { guardCopy.isUserImmutable($0.url) }
+        let runningIDs: [String]
+        let runningNames: [String]
+        if isDemoMode {
+            var matchedIDs = Set<String>()
+            var matchedNames = Set<String>()
+            for appURL in targetAppURLs {
+                if let bundleID = fileManagerStore.demoBundleID(for: appURL) {
+                    let lowerID = bundleID.lowercased()
+                    let matchingApp = apps.first { $0.bundleID.lowercased() == lowerID }
+                    let isRunning = (matchingApp?.isRunning ?? false) || demoRunningBundleIDs.contains(lowerID)
+                    if isRunning {
+                        matchedIDs.insert(bundleID)
+                        matchedNames.insert(matchingApp?.localizedName ?? appURL.deletingPathExtension().lastPathComponent)
+                    }
+                }
+            }
+            runningIDs = Array(matchedIDs)
+            runningNames = Array(matchedNames)
+        } else {
+            let running = targetAppURLs.isEmpty
+                ? []
+                : AppScanner.runningProcesses(matchingBundleIDs: [], bundleURLs: targetAppURLs)
+            runningIDs = Array(Set(running.map(\.bundleID).filter { !$0.isEmpty }))
+            runningNames = Array(Set(running.map(\.name)))
+        }
+
+        pendingConfirmation = PendingConfirmation(
+            title: title,
+            isReset: false,
+            targets: targets,
+            packageIDsToForget: [],
+            runningAppBundleIDs: runningIDs,
+            runningAppNames: runningNames,
+            targetAppBundleIDs: [],
+            targetAppURLs: targetAppURLs,
+            browserBundleIDsToRequireClosed: [],
+            hasAppleAppStoreApp: false,
+            hasChromiumExtension: false,
+            sourceTab: .fileManager,
+            affectedAppIDs: [],
+            affectedStartupIDs: [],
+            affectedExtensionIDs: [],
+            affectedLeftoverIDs: [],
+            hasUserLockedItems: hasLocked,
+            preferredRemovalModeOverride: allTargetsInTrash ? .permanent : preferredRemovalModeOverride,
+            forcePermanentMode: allTargetsInTrash,
+            hasTrashItems: hasTrashItems
+        )
+    }
+
+    // MARK: - Junk Cleaner & Resource Release Removal Preparation
+
+    func prepareRemovalForCleanupItems(
+        _ items: [CleanupRemovalInput],
+        title: String,
+        sourceTab: MainTab,
+        browserBundleIDsToRequireClosed: [String] = [],
+        preferredRemovalModeOverride: RemovalMode? = nil
+    ) {
+        guard !isPerformingRemoval else { return }
+        let guardCopy = safetyGuard
+        let trashDir = URL(fileURLWithPath: guardCopy.homeDirectoryPath).appendingPathComponent(".Trash")
+
+        var targets: [RemovalTarget] = []
+        var seen = Set<String>()
+        var targetAppURLs: [URL] = []
+        var trashTargetCount = 0
+
+        for item in items {
+            let stdURL = item.url.standardizedFileURL
+            let isProtectedDemoApp: Bool
+            if isDemoMode, let bundleID = fileManagerStore.demoBundleID(for: stdURL) {
+                isProtectedDemoApp = guardCopy.matchesProtectedBundleID(bundleID)
+            } else {
+                isProtectedDemoApp = false
+            }
+            guard !isProtectedDemoApp else { continue }
+            if item.requireCacheSubpath {
+                guard guardCopy.validateCacheSubpath(stdURL).isAllowed else { continue }
+            } else {
+                guard guardCopy.validateForRemoval(stdURL).isAllowed else { continue }
+            }
+            guard seen.insert(stdURL.path).inserted else { continue }
+            if RemovalEngine.isInsideDirectory(stdURL, directory: trashDir) {
+                trashTargetCount += 1
+            }
+            if stdURL.pathExtension.lowercased() == "app" {
+                targetAppURLs.append(stdURL)
+            }
+            targets.append(RemovalTarget(
+                url: stdURL,
+                estimatedSize: max(0, item.size),
+                requiresAdmin: isDemoMode ? item.requiresAdmin : (item.requiresAdmin || guardCopy.requiresAdmin(for: stdURL)),
+                expectedCanonicalParent: item.expectedCanonicalParent
+            ))
+        }
+
+        guard !targets.isEmpty else {
+            banner = OperationBanner(
+                isError: true,
+                message: l10n.fileOperationBlockedTitle,
+                showAppManagementLink: false,
+                showFDALink: false
+            )
+            return
+        }
+
+        let hasTrashItems = trashTargetCount > 0
+        let allTargetsInTrash = trashTargetCount == targets.count
+        let hasLocked = isDemoMode ? false : targets.contains { guardCopy.isUserImmutable($0.url) }
+        let runningIDs: [String]
+        let runningNames: [String]
+        if isDemoMode {
+            var matchedIDs = Set<String>()
+            var matchedNames = Set<String>()
+            for appURL in targetAppURLs {
+                if let bundleID = fileManagerStore.demoBundleID(for: appURL) {
+                    let lowerID = bundleID.lowercased()
+                    let matchingApp = apps.first { $0.bundleID.lowercased() == lowerID }
+                    let isRunning = (matchingApp?.isRunning ?? false) || demoRunningBundleIDs.contains(lowerID)
+                    if isRunning {
+                        matchedIDs.insert(bundleID)
+                        matchedNames.insert(matchingApp?.localizedName ?? appURL.deletingPathExtension().lastPathComponent)
+                    }
+                }
+            }
+            runningIDs = Array(matchedIDs)
+            runningNames = Array(matchedNames)
+        } else {
+            let running = targetAppURLs.isEmpty
+                ? []
+                : AppScanner.runningProcesses(matchingBundleIDs: [], bundleURLs: targetAppURLs)
+            runningIDs = Array(Set(running.map(\.bundleID).filter { !$0.isEmpty }))
+            runningNames = Array(Set(running.map(\.name)))
+        }
+
+        pendingConfirmation = PendingConfirmation(
+            title: title,
+            isReset: false,
+            targets: targets,
+            packageIDsToForget: [],
+            runningAppBundleIDs: runningIDs,
+            runningAppNames: runningNames,
+            targetAppBundleIDs: [],
+            targetAppURLs: targetAppURLs,
+            browserBundleIDsToRequireClosed: browserBundleIDsToRequireClosed,
+            hasAppleAppStoreApp: false,
+            hasChromiumExtension: false,
+            sourceTab: sourceTab,
+            affectedAppIDs: [],
+            affectedStartupIDs: [],
+            affectedExtensionIDs: [],
+            affectedLeftoverIDs: [],
+            hasUserLockedItems: hasLocked,
+            preferredRemovalModeOverride: allTargetsInTrash ? .permanent : preferredRemovalModeOverride,
+            forcePermanentMode: allTargetsInTrash,
+            hasTrashItems: hasTrashItems
         )
     }
 }

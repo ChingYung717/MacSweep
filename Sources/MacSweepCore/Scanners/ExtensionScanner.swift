@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 
-public struct ExtensionScanResult: Sendable {
+public struct ExtensionScanResult: Sendable, Equatable {
     public let items: [ExtensionItem]
     public let needsFullDiskAccessForBrowsers: Bool
     public let blockedBrowserNames: [String]
@@ -140,6 +140,9 @@ public struct ExtensionScanner: Sendable {
 
         let fm = FileManager.default
         for browser in chromiumBrowsers {
+            guard safetyGuard.isContainedCanonicalSubpath(relativePath: browser.relPath, under: homeDirectory) else {
+                continue
+            }
             let rootURL = homeDirectory.appendingPathComponent(browser.relPath)
             guard fm.fileExists(atPath: rootURL.path) else { continue }
             if !PermissionChecker.canReadDirectory(rootURL) {
@@ -156,8 +159,10 @@ public struct ExtensionScanner: Sendable {
         }
 
         // 2. Firefox (supports `profiles.ini` custom paths + fallback to `Profiles/`)
-        let firefoxBaseURL = homeDirectory.appendingPathComponent("Library/Application Support/Firefox")
-        if fm.fileExists(atPath: firefoxBaseURL.path) {
+        let firefoxRelPath = "Library/Application Support/Firefox"
+        let firefoxBaseURL = homeDirectory.appendingPathComponent(firefoxRelPath)
+        if safetyGuard.isContainedCanonicalSubpath(relativePath: firefoxRelPath, under: homeDirectory),
+           fm.fileExists(atPath: firefoxBaseURL.path) {
             if !PermissionChecker.canReadDirectory(firefoxBaseURL) {
                 needsFDA = true
                 blockedBrowsers.append("Firefox")
@@ -196,9 +201,11 @@ public struct ExtensionScanner: Sendable {
         browserBundleID: String,
         computeSize: Bool = true
     ) -> [ExtensionItem] {
-        guard !safetyGuard.isSymbolicLink(userDataURL) else { return [] }
+        guard safetyGuard.isContainedDirectory(userDataURL),
+              let resolvedUserData = SafetyGuard.posixRealpath(userDataURL.standardizedFileURL.path) else {
+            return []
+        }
         let fm = FileManager.default
-        let resolvedUserData = userDataURL.resolvingSymlinksInPath().standardizedFileURL.path
         guard let children = try? fm.contentsOfDirectory(
             at: userDataURL,
             includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
@@ -209,14 +216,13 @@ public struct ExtensionScanner: Sendable {
 
         var results: [ExtensionItem] = []
         for profileDir in children {
-            guard !safetyGuard.isSymbolicLink(profileDir) else { continue }
-            let profileVals = try? profileDir.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-            guard profileVals?.isDirectory == true, profileVals?.isSymbolicLink != true else { continue }
+            let profileName = profileDir.lastPathComponent
+            guard safetyGuard.isContainedCanonicalSubpath(relativePath: profileName, under: userDataURL) else {
+                continue
+            }
 
             let extRoot = profileDir.appendingPathComponent("Extensions")
-            guard !safetyGuard.isSymbolicLink(extRoot) else { continue }
-            let extRootVals = try? extRoot.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-            guard extRootVals?.isDirectory == true, extRootVals?.isSymbolicLink != true,
+            guard safetyGuard.isContainedCanonicalSubpath(relativePath: "Extensions", under: profileDir),
                   let extDirs = try? fm.contentsOfDirectory(
                     at: extRoot,
                     includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
@@ -225,20 +231,17 @@ public struct ExtensionScanner: Sendable {
                 continue
             }
 
-            let profileName = profileDir.lastPathComponent
             let extRootCanonical = PrivilegedExecutor.canonicalParentPath(for: extRoot.standardizedFileURL.path)
             for extDir in extDirs {
-                guard !safetyGuard.isSymbolicLink(extDir) else { continue }
-                let extVals = try? extDir.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-                guard extVals?.isDirectory == true, extVals?.isSymbolicLink != true else { continue }
-                let resolvedExt = extDir.resolvingSymlinksInPath().standardizedFileURL.path
-                guard resolvedExt.hasPrefix(resolvedUserData + "/"),
+                let extID = extDir.lastPathComponent
+                if extID == "Temp" { continue }
+                guard safetyGuard.isContainedCanonicalSubpath(relativePath: extID, under: extRoot),
+                      let resolvedExt = SafetyGuard.posixRealpath(extDir.standardizedFileURL.path),
+                      resolvedExt.hasPrefix(resolvedUserData + "/"),
                       safetyGuard.validateForRemoval(extDir).isAllowed,
                       !safetyGuard.requiresAdmin(for: extDir) else {
                     continue
                 }
-                let extID = extDir.lastPathComponent
-                if extID == "Temp" { continue }
                 guard let parsed = Self.parseChromiumExtensionDirectory(
                     extDir,
                     extID: extID,
@@ -275,7 +278,14 @@ public struct ExtensionScanner: Sendable {
         }
 
         let sortedVersions = versionDirs
-            .filter { fm.fileExists(atPath: $0.appendingPathComponent("manifest.json").path) }
+            .filter { dir in
+                var st = stat()
+                guard lstat(dir.path, &st) == 0,
+                      (st.st_mode & S_IFMT) == S_IFDIR else {
+                    return false
+                }
+                return fm.fileExists(atPath: dir.appendingPathComponent("manifest.json").path)
+            }
             .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedDescending }
 
         guard let latestDir = sortedVersions.first else { return nil }
@@ -361,7 +371,7 @@ public struct ExtensionScanner: Sendable {
     // MARK: - Firefox Scanner (profiles.ini + Profiles/ fallback)
 
     public func scanFirefoxBase(at firefoxBaseURL: URL, computeSize: Bool = true) -> [ExtensionItem] {
-        guard !safetyGuard.isSymbolicLink(firefoxBaseURL) else { return [] }
+        guard safetyGuard.isContainedDirectory(firefoxBaseURL) else { return [] }
         let fm = FileManager.default
         var profileDirs: [URL] = []
         var seenPaths = Set<String>()
@@ -374,7 +384,7 @@ public struct ExtensionScanner: Sendable {
                 allowedAbsoluteRoot: homeDirectory
             ) {
                 let p = dir.standardizedFileURL.path
-                if fm.fileExists(atPath: p), !safetyGuard.isSymbolicLink(dir), seenPaths.insert(p).inserted {
+                if fm.fileExists(atPath: p), safetyGuard.isContainedDirectory(dir, trustedRoots: [firefoxBaseURL]), seenPaths.insert(p).inserted {
                     profileDirs.append(dir)
                 }
             }
@@ -382,14 +392,14 @@ public struct ExtensionScanner: Sendable {
 
         // Also include any non-symlink folders inside non-symlink `Profiles/` not listed in `profiles.ini`
         let profilesRoot = firefoxBaseURL.appendingPathComponent("Profiles")
-        if !safetyGuard.isSymbolicLink(profilesRoot),
+        if safetyGuard.isContainedCanonicalSubpath(relativePath: "Profiles", under: firefoxBaseURL),
            let dirs = try? fm.contentsOfDirectory(
             at: profilesRoot,
             includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
             options: [.skipsHiddenFiles]
            ) {
             for dir in dirs {
-                guard !safetyGuard.isSymbolicLink(dir) else { continue }
+                guard safetyGuard.isContainedCanonicalSubpath(relativePath: dir.lastPathComponent, under: profilesRoot) else { continue }
                 let p = dir.standardizedFileURL.path
                 if seenPaths.insert(p).inserted {
                     profileDirs.append(dir)
@@ -399,14 +409,16 @@ public struct ExtensionScanner: Sendable {
 
         var results: [ExtensionItem] = []
         for profile in profileDirs {
-            var profStat = stat()
-            guard lstat(profile.path, &profStat) == 0,
-                  (profStat.st_mode & S_IFMT) == S_IFDIR,
-                  !safetyGuard.isSymbolicLink(profile) else {
+            guard safetyGuard.isContainedDirectory(profile, trustedRoots: [firefoxBaseURL]) else {
                 continue
             }
             let extDir = profile.appendingPathComponent("extensions")
-            guard !safetyGuard.isSymbolicLink(extDir) else { continue }
+            var extSt = stat()
+            if lstat(extDir.path, &extSt) == 0 {
+                guard safetyGuard.isContainedCanonicalSubpath(relativePath: "extensions", under: profile) else {
+                    continue
+                }
+            }
 
             let extJSON = profile.appendingPathComponent("extensions.json")
             guard let data = SafeFileReader.readBoundedRegularFile(at: extJSON) else { continue }
@@ -738,41 +750,44 @@ public struct ExtensionScanner: Sendable {
     // MARK: - System Plugin Directories
 
     public func scanSystemPluginDirectories(computeSize: Bool = true) -> [ExtensionItem] {
-        let userLib = homeDirectory.appendingPathComponent("Library")
-        let specs: [(dir: URL, category: ExtensionCategory, isHAL: Bool)] = [
-            (userLib.appendingPathComponent("PreferencePanes"), .preferencePane, false),
-            (systemLibraryURL.appendingPathComponent("PreferencePanes"), .preferencePane, false),
-            (userLib.appendingPathComponent("QuickLook"), .quickLook, false),
-            (systemLibraryURL.appendingPathComponent("QuickLook"), .quickLook, false),
-            (userLib.appendingPathComponent("Spotlight"), .spotlight, false),
-            (systemLibraryURL.appendingPathComponent("Spotlight"), .spotlight, false),
-            (userLib.appendingPathComponent("Screen Savers"), .screenSaver, false),
-            (systemLibraryURL.appendingPathComponent("Screen Savers"), .screenSaver, false),
-            (userLib.appendingPathComponent("Internet Plug-Ins"), .internetPlugin, false),
-            (systemLibraryURL.appendingPathComponent("Internet Plug-Ins"), .internetPlugin, false),
-            (userLib.appendingPathComponent("Audio/Plug-Ins/Components"), .audioPlugin, false),
-            (systemLibraryURL.appendingPathComponent("Audio/Plug-Ins/Components"), .audioPlugin, false),
-            (userLib.appendingPathComponent("Audio/Plug-Ins/VST"), .audioPlugin, false),
-            (systemLibraryURL.appendingPathComponent("Audio/Plug-Ins/VST"), .audioPlugin, false),
-            (userLib.appendingPathComponent("Audio/Plug-Ins/VST3"), .audioPlugin, false),
-            (systemLibraryURL.appendingPathComponent("Audio/Plug-Ins/VST3"), .audioPlugin, false),
-            (userLib.appendingPathComponent("Audio/Plug-Ins/HAL"), .audioPlugin, true),
-            (systemLibraryURL.appendingPathComponent("Audio/Plug-Ins/HAL"), .audioPlugin, true),
+        let specs: [(base: URL, relPath: String, category: ExtensionCategory, isHAL: Bool)] = [
+            (homeDirectory, "Library/PreferencePanes", .preferencePane, false),
+            (systemLibraryURL, "PreferencePanes", .preferencePane, false),
+            (homeDirectory, "Library/QuickLook", .quickLook, false),
+            (systemLibraryURL, "QuickLook", .quickLook, false),
+            (homeDirectory, "Library/Spotlight", .spotlight, false),
+            (systemLibraryURL, "Spotlight", .spotlight, false),
+            (homeDirectory, "Library/Screen Savers", .screenSaver, false),
+            (systemLibraryURL, "Screen Savers", .screenSaver, false),
+            (homeDirectory, "Library/Internet Plug-Ins", .internetPlugin, false),
+            (systemLibraryURL, "Internet Plug-Ins", .internetPlugin, false),
+            (homeDirectory, "Library/Audio/Plug-Ins/Components", .audioPlugin, false),
+            (systemLibraryURL, "Audio/Plug-Ins/Components", .audioPlugin, false),
+            (homeDirectory, "Library/Audio/Plug-Ins/VST", .audioPlugin, false),
+            (systemLibraryURL, "Audio/Plug-Ins/VST", .audioPlugin, false),
+            (homeDirectory, "Library/Audio/Plug-Ins/VST3", .audioPlugin, false),
+            (systemLibraryURL, "Audio/Plug-Ins/VST3", .audioPlugin, false),
+            (homeDirectory, "Library/Audio/Plug-Ins/HAL", .audioPlugin, true),
+            (systemLibraryURL, "Audio/Plug-Ins/HAL", .audioPlugin, true),
         ]
 
         let fm = FileManager.default
         var results: [ExtensionItem] = []
 
         for spec in specs {
-            guard !safetyGuard.isSymbolicLink(spec.dir),
-                  let children = try? fm.contentsOfDirectory(
-                at: spec.dir,
+            guard safetyGuard.isContainedDirectory(spec.base),
+                  safetyGuard.isContainedCanonicalSubpath(relativePath: spec.relPath, under: spec.base) else {
+                continue
+            }
+            let dirURL = spec.base.appendingPathComponent(spec.relPath).standardizedFileURL
+            guard let children = try? fm.contentsOfDirectory(
+                at: dirURL,
                 includingPropertiesForKeys: nil,
                 options: [.skipsHiddenFiles]
             ) else {
                 continue
             }
-            let dirCanonicalParent = PrivilegedExecutor.canonicalParentPath(for: spec.dir.standardizedFileURL.path)
+            let dirCanonicalParent = PrivilegedExecutor.canonicalParentPath(for: dirURL.path)
 
             for itemURL in children {
                 guard safetyGuard.validateForRemoval(itemURL).isAllowed else { continue }

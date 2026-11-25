@@ -1,5 +1,6 @@
 import AppKit
 import MacSweepCore
+import MacSweepUI
 import SwiftUI
 
 @MainActor
@@ -29,9 +30,32 @@ final class MacSweepAppDelegate: NSObject, NSApplicationDelegate {
 }
 
 @main
-struct MacSweepApp: App {
+enum MacSweepEntryPoint {
+    @MainActor
+    static func main() {
+        let options = DemoLaunchOptions.fromProcessInfo()
+        if let parseError = options.parseError {
+            fputs("Error: \(parseError)\n", stderr)
+            Darwin.exit(2)
+        }
+        if let exportPath = options.exportScreenshotsPath {
+            guard options.isDemoMode else {
+                fputs("Error: --export-screenshots requires --demo-mode or MACSWEEP_DEMO_MODE=1\n", stderr)
+                Darwin.exit(2)
+            }
+            DemoScreenshotExporter.runCLI(options: options, outputPath: exportPath)
+        } else {
+            MacSweepMainApp.launchOptions = options
+            MacSweepMainApp.main()
+        }
+    }
+}
+
+struct MacSweepMainApp: App {
+    @MainActor static var launchOptions: DemoLaunchOptions = .fromProcessInfo()
+
     @NSApplicationDelegateAdaptor(MacSweepAppDelegate.self) private var appDelegate
-    @StateObject private var state = AppState()
+    @StateObject private var state = AppState(launchOptions: MacSweepMainApp.launchOptions)
 
     init() {
         if !Bundle.main.bundlePath.hasSuffix(".app") {

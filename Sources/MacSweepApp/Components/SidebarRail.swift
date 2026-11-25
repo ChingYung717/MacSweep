@@ -2,17 +2,19 @@ import SwiftUI
 
 struct SidebarRail: View {
     @ObservedObject var state: AppState
+    @ObservedObject var cleanupStore: CleanupCenterStore
     let palette: AppPalette
 
     var body: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 5) {
             // Room for macOS traffic-light window buttons
-            Spacer().frame(height: 36)
+            Spacer().frame(height: 34)
 
             ForEach(MainTab.allCases) { tab in
                 SidebarTabButton(
                     tab: tab,
                     title: tabTitle(tab),
+                    helpTitle: fullTabTitle(tab),
                     badgeCount: badgeCount(for: tab),
                     isSelected: state.activeTab == tab,
                     palette: palette
@@ -21,14 +23,14 @@ struct SidebarRail: View {
                 }
             }
 
-            Spacer()
+            Spacer(minLength: 8)
 
             // Permission indicator pill
             Button {
                 state.refreshPermissionStatus()
                 state.showSettingsSheet = true
             } label: {
-                VStack(spacing: 4) {
+                VStack(spacing: 3) {
                     ZStack(alignment: .topTrailing) {
                         Image(systemName: state.hasFullDiskAccess ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
                             .font(.system(size: 16, weight: .medium))
@@ -42,7 +44,7 @@ struct SidebarRail: View {
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(palette.secondaryText)
                 }
-                .frame(width: 62, height: 42)
+                .frame(width: 62, height: 40)
                 .background(
                     RoundedRectangle(cornerRadius: 8)
                         .fill(palette.cardBackground.opacity(0.45))
@@ -63,7 +65,7 @@ struct SidebarRail: View {
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(palette.secondaryText)
                 }
-                .frame(width: 62, height: 40)
+                .frame(width: 62, height: 38)
             }
             .buttonStyle(.plain)
 
@@ -71,7 +73,7 @@ struct SidebarRail: View {
             Text("MacSweep")
                 .font(.system(size: 10, weight: .semibold, design: .rounded))
                 .foregroundStyle(palette.tertiaryText)
-                .padding(.bottom, 12)
+                .padding(.bottom, 10)
         }
         .frame(width: 82)
         .background(palette.sidebarBackground)
@@ -88,6 +90,16 @@ struct SidebarRail: View {
         case .startup: return state.l10n.tabStartup
         case .extensions: return state.l10n.tabExtensions
         case .leftovers: return state.l10n.tabLeftovers
+        case .fileManager: return state.l10n.tabFileManager
+        case .junkCleaner: return state.l10n.tabJunkCleaner
+        case .resourceRelease: return state.l10n.tabResourceRelease
+        }
+    }
+
+    private func fullTabTitle(_ tab: MainTab) -> String {
+        switch tab {
+        case .resourceRelease: return state.l10n.resourceReleaseTitle
+        default: return tabTitle(tab)
         }
     }
 
@@ -98,6 +110,9 @@ struct SidebarRail: View {
             return checked > 0 ? checked : nil
         case .leftovers:
             return state.leftoverGroups.isEmpty ? nil : state.leftoverGroups.count
+        case .junkCleaner:
+            let selected = cleanupStore.selectedJunkCount
+            return selected > 0 ? selected : nil
         default:
             return nil
         }
@@ -107,6 +122,7 @@ struct SidebarRail: View {
 private struct SidebarTabButton: View {
     let tab: MainTab
     let title: String
+    let helpTitle: String
     let badgeCount: Int?
     let isSelected: Bool
     let palette: AppPalette
@@ -117,19 +133,20 @@ private struct SidebarTabButton: View {
     var body: some View {
         Button(action: action) {
             ZStack(alignment: .topTrailing) {
-                VStack(spacing: 5) {
+                VStack(spacing: 3) {
                     Image(systemName: tab.symbolName)
-                        .font(.system(size: 20, weight: isSelected ? .semibold : .regular))
-                        .foregroundStyle(isSelected ? Color.white : palette.secondaryText)
-                        .shadow(color: isSelected ? palette.accentGlow : .clear, radius: 6)
+                        .font(.system(size: 17, weight: isSelected ? .semibold : .regular))
+                        .foregroundStyle(isSelected ? palette.sidebarActiveForeground : palette.secondaryText)
+                        .shadow(color: (isSelected && palette.isDark) ? palette.accentGlow : .clear, radius: 6)
 
                     Text(title)
-                        .font(.system(size: 10.5, weight: isSelected ? .semibold : .medium))
-                        .foregroundStyle(isSelected ? Color.white : palette.secondaryText)
+                        .font(.system(size: 10, weight: isSelected ? .semibold : .medium))
+                        .foregroundStyle(isSelected ? palette.sidebarActiveForeground : palette.secondaryText)
                         .lineLimit(1)
-                        .minimumScaleFactor(0.85)
+                        .minimumScaleFactor(0.68)
+                        .padding(.horizontal, 3)
                 }
-                .frame(width: 66, height: 58)
+                .frame(width: 68, height: 48)
                 .background {
                     if isSelected {
                         RoundedRectangle(cornerRadius: 11, style: .continuous)
@@ -144,7 +161,7 @@ private struct SidebarTabButton: View {
                                 RoundedRectangle(cornerRadius: 11, style: .continuous)
                                     .strokeBorder(palette.activeBorder, lineWidth: 1)
                             )
-                            .shadow(color: palette.accentGlow, radius: 10, x: 0, y: 2)
+                            .shadow(color: palette.isDark ? palette.accentGlow : Color.black.opacity(0.06), radius: palette.isDark ? 10 : 4, x: 0, y: 2)
                     } else if hoverState.value {
                         RoundedRectangle(cornerRadius: 11, style: .continuous)
                             .fill(palette.cardBackground.opacity(0.65))
@@ -163,6 +180,7 @@ private struct SidebarTabButton: View {
             }
         }
         .buttonStyle(.plain)
+        .help(helpTitle)
         .onHover { hovering in
             hoverState.value = hovering
         }

@@ -6,6 +6,7 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .library(name: "MacSweepCore", targets: ["MacSweepCore"]),
+        .library(name: "MacSweepUI", targets: ["MacSweepUI"]),
         .executable(name: "MacSweepApp", targets: ["MacSweepApp"]),
     ],
     targets: [
@@ -13,15 +14,21 @@ let package = Package(
             name: "MacSweepCore",
             path: "Sources/MacSweepCore"
         ),
-        .executableTarget(
-            name: "MacSweepApp",
+        .target(
+            name: "MacSweepUI",
             dependencies: ["MacSweepCore"],
             path: "Sources/MacSweepApp",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         .executableTarget(
+            name: "MacSweepApp",
+            dependencies: ["MacSweepCore", "MacSweepUI"],
+            path: "Sources/MacSweepAppEntry",
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .executableTarget(
             name: "MacSweepChecks",
-            dependencies: ["MacSweepCore"],
+            dependencies: ["MacSweepCore", "MacSweepUI"],
             path: "Tests/MacSweepChecks"
         ),
     ]

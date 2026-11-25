@@ -5,7 +5,6 @@ struct ExtensionsView: View {
     @ObservedObject var state: AppState
     let palette: AppPalette
 
-    @StateObject private var selectedIDBox = LocalState<String?>(nil)
     @StateObject private var filterBox = LocalState<ExtFilter>(.all)
     @StateObject private var collapsedCatsBox = LocalState<Set<ExtensionCategory>>([])
 
@@ -34,7 +33,7 @@ struct ExtensionsView: View {
     }
 
     private var selectedItem: ExtensionItem? {
-        guard let id = selectedIDBox.value else { return nil }
+        guard let id = state.selectedExtensionID else { return nil }
         return state.extensionItems.first(where: { $0.id == id })
     }
 
@@ -241,7 +240,7 @@ struct ExtensionsView: View {
     }
 
     private func extensionRow(_ item: ExtensionItem) -> some View {
-        let isSelected = selectedIDBox.value == item.id
+        let isSelected = state.selectedExtensionID == item.id
         let isToggling = state.togglingExtensionIDs.contains(item.id)
         return HStack(spacing: 10) {
             if let host = item.hostAppPath, item.hostAppExists {
@@ -311,7 +310,7 @@ struct ExtensionsView: View {
         )
         .contentShape(Rectangle())
         .onTapGesture {
-            selectedIDBox.value = item.id
+            state.selectedExtensionID = item.id
         }
     }
 

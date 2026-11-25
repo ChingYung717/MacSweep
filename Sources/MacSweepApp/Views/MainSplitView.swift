@@ -1,18 +1,23 @@
 import MacSweepCore
 import SwiftUI
 
-struct MainSplitView: View {
+public struct MainSplitView: View {
     @ObservedObject var state: AppState
     @Environment(\.colorScheme) private var systemScheme
+    @StateObject private var qlBridge = QLPreviewPanelBridge()
+
+    public init(state: AppState) {
+        self.state = state
+    }
 
     private var palette: AppPalette {
         AppPalette.resolve(mode: state.preferences.themeMode, systemScheme: systemScheme)
     }
 
-    var body: some View {
+    public var body: some View {
         ZStack(alignment: .top) {
             HStack(spacing: 0) {
-                SidebarRail(state: state, palette: palette)
+                SidebarRail(state: state, cleanupStore: state.cleanupCenterStore, palette: palette)
 
                 Group {
                     switch state.activeTab {
@@ -24,11 +29,21 @@ struct MainSplitView: View {
                         ExtensionsView(state: state, palette: palette)
                     case .leftovers:
                         LeftoversView(state: state, palette: palette)
+                    case .fileManager:
+                        FileManagerView(state: state, store: state.fileManagerStore, qlBridge: qlBridge, palette: palette)
+                    case .junkCleaner:
+                        JunkCleanerView(state: state, store: state.cleanupCenterStore, qlBridge: qlBridge, palette: palette)
+                    case .resourceRelease:
+                        ResourceReleaseView(state: state, store: state.cleanupCenterStore, qlBridge: qlBridge, palette: palette)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             .background(palette.windowBackground)
+            .background(
+                QuickLookPanelBridgeHost(bridge: qlBridge)
+                    .frame(width: 0, height: 0)
+            )
 
             // Floating operation feedback banner
             if let banner = state.banner {
@@ -102,7 +117,7 @@ struct MainSplitView: View {
         .sheet(item: $state.pendingConfirmation) { conf in
             ConfirmationSheet(
                 confirmation: conf,
-                defaultMode: state.preferences.defaultRemovalMode,
+                defaultMode: conf.preferredRemovalModeOverride ?? state.preferences.defaultRemovalMode,
                 palette: palette,
                 l10n: state.l10n,
                 onCancel: {

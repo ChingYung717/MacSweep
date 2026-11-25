@@ -1,3 +1,4 @@
+import AppKit
 import MacSweepCore
 import SwiftUI
 
@@ -6,15 +7,12 @@ struct SettingsSheet: View {
     let palette: AppPalette
     @Environment(\.dismiss) private var dismiss
 
-    @StateObject private var selectedTabBox = LocalState(SettingsTab.general)
+    @StateObject private var newProtectedPathBox = LocalState("")
+    @StateObject private var pathErrorBox = LocalState<String?>(nil)
+    @StateObject private var suppressNextPathErrorClearBox = LocalState(false)
+    @StateObject private var generalSaveErrorBox = LocalState<String?>(nil)
 
-    enum SettingsTab: String, CaseIterable, Identifiable {
-        case general
-        case permissions
-        case protection
-        case history
-        var id: String { rawValue }
-    }
+    typealias SettingsTab = SettingsSheetTab
 
     private var l10n: L10n { state.l10n }
 
@@ -36,7 +34,7 @@ struct SettingsSheet: View {
             }
 
             // Tab Strip
-            Picker("", selection: $selectedTabBox.value) {
+            Picker("", selection: $state.settingsTab) {
                 Text(l10n.t("通用与外观", "General")).tag(SettingsTab.general)
                 Text(l10n.t("系统权限", "Permissions")).tag(SettingsTab.permissions)
                 Text(l10n.t("保护名单", "Skip List")).tag(SettingsTab.protection)
@@ -48,7 +46,7 @@ struct SettingsSheet: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    switch selectedTabBox.value {
+                    switch state.settingsTab {
                     case .general:
                         generalSection
                     case .permissions:
@@ -75,10 +73,16 @@ struct SettingsSheet: View {
 
     private var generalSection: some View {
         VStack(alignment: .leading, spacing: 14) {
+            if let err = generalSaveErrorBox.value {
+                Text(err)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(palette.danger)
+            }
+
             settingCard(title: l10n.t("视觉主题", "Appearance")) {
                 Picker(l10n.t("主题风格", "Theme"), selection: Binding(
                     get: { state.preferences.themeMode },
-                    set: { state.preferences.themeMode = $0; state.savePreferences() }
+                    set: { state.preferences.themeMode = $0; saveGeneralPreferences() }
                 )) {
                     Text(l10n.t("深海蓝暗色（默认）", "Deep Ocean Dark (Default)")).tag(ThemeMode.deepOcean)
                     Text(l10n.t("跟随系统浅色/深色", "Follow System Light/Dark")).tag(ThemeMode.system)
@@ -89,7 +93,7 @@ struct SettingsSheet: View {
             settingCard(title: l10n.t("界面语言", "Language")) {
                 Picker(l10n.t("语言", "Language"), selection: Binding(
                     get: { state.preferences.language },
-                    set: { state.preferences.language = $0; state.savePreferences() }
+                    set: { state.preferences.language = $0; saveGeneralPreferences() }
                 )) {
                     Text(l10n.t("跟随系统", "System Default")).tag(AppLanguage.system)
                     Text("简体中文").tag(AppLanguage.zhHans)
@@ -101,7 +105,7 @@ struct SettingsSheet: View {
             settingCard(title: l10n.t("默认删除方式", "Default Removal Mode")) {
                 Picker("", selection: Binding(
                     get: { state.preferences.defaultRemovalMode },
-                    set: { state.preferences.defaultRemovalMode = $0; state.savePreferences() }
+                    set: { state.preferences.defaultRemovalMode = $0; saveGeneralPreferences() }
                 )) {
                     Text(l10n.moveToTrashOption).tag(RemovalMode.trash)
                     Text(l10n.permanentDeleteOption).tag(RemovalMode.permanent)
@@ -115,7 +119,7 @@ struct SettingsSheet: View {
                     get: { state.preferences.includeUtilitiesFolder },
                     set: {
                         state.preferences.includeUtilitiesFolder = $0
-                        state.savePreferences()
+                        saveGeneralPreferences()
                         Task { await state.scanApplications() }
                     }
                 ))
@@ -123,7 +127,7 @@ struct SettingsSheet: View {
                     get: { state.preferences.showSystemApps },
                     set: {
                         state.preferences.showSystemApps = $0
-                        state.savePreferences()
+                        saveGeneralPreferences()
                         Task { await state.scanApplications() }
                     }
                 ))
@@ -206,6 +210,103 @@ struct SettingsSheet: View {
 
     private var protectionSection: some View {
         VStack(alignment: .leading, spacing: 14) {
+            settingCard(title: l10n.protectedPathsTitle) {
+                Text(l10n.protectedPathsDescription)
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(palette.secondaryText)
+
+                HStack(spacing: 8) {
+                    TextField(l10n.protectedPathPlaceholder, text: $newProtectedPathBox.value)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12, design: .monospaced))
+                        .onSubmit {
+                            submitManualProtectedPath()
+                        }
+                        .onChange(of: newProtectedPathBox.value) { _, _ in
+                            if suppressNextPathErrorClearBox.value {
+                                suppressNextPathErrorClearBox.value = false
+                            } else {
+                                pathErrorBox.value = nil
+                            }
+                        }
+
+                    Button(l10n.addPath) {
+                        submitManualProtectedPath()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(newProtectedPathBox.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                    Button(l10n.browsePath) {
+                        pickProtectedPaths()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+
+                if let err = pathErrorBox.value {
+                    Text(err)
+                        .font(.system(size: 11))
+                        .foregroundStyle(palette.danger)
+                }
+
+                if state.preferences.protectedPaths.isEmpty {
+                    Text(l10n.protectedPathsEmpty)
+                        .font(.system(size: 12))
+                        .foregroundStyle(palette.tertiaryText)
+                } else {
+                    ForEach(state.preferences.protectedPaths, id: \.self) { path in
+                        let exists: Bool = {
+                            if state.isDemoMode {
+                                return state.demoPathExists(path)
+                            }
+                            if FileManager.default.fileExists(atPath: path) { return true }
+                            var st = stat()
+                            return lstat(path, &st) == 0
+                        }()
+                        HStack(spacing: 8) {
+                            Text(SafeFileReader.sanitizeForDisplay(path))
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundStyle(palette.primaryText)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .help(SafeFileReader.sanitizeForDisplay(path))
+
+                            Spacer()
+
+                            if !exists {
+                                Text(l10n.pathMissingOnDisk)
+                                    .font(.system(size: 10.5))
+                                    .foregroundStyle(palette.warning)
+                            }
+
+                            Button {
+                                state.revealInFinder(URL(fileURLWithPath: path))
+                            } label: {
+                                Image(systemName: "folder")
+                                    .foregroundStyle(exists ? palette.secondaryText : palette.tertiaryText)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(!exists)
+                            .help(l10n.revealInFinder)
+
+                            Button {
+                                if !state.removeProtectedPath(path) {
+                                    pathErrorBox.value = l10n.preferencesSaveFailedWarning
+                                } else {
+                                    pathErrorBox.value = nil
+                                }
+                            } label: {
+                                Image(systemName: "trash")
+                                    .foregroundStyle(palette.danger)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+            }
+
             settingCard(title: l10n.t("受保护的应用 Bundle ID", "Protected App Bundle IDs")) {
                 if state.preferences.protectedBundleIDs.isEmpty {
                     Text(l10n.t("暂无受保护应用。可在应用详情页点击「保护此应用」添加。", "No protected apps. Click 'Protect' on any app detail header to add."))
@@ -220,7 +321,11 @@ struct SettingsSheet: View {
                             Spacer()
                             Button {
                                 state.preferences.protectedBundleIDs.removeAll { $0 == bid }
-                                state.savePreferences()
+                                if !state.savePreferences() {
+                                    pathErrorBox.value = l10n.preferencesSaveFailedWarning
+                                } else {
+                                    pathErrorBox.value = nil
+                                }
                             } label: {
                                 Image(systemName: "trash")
                                     .foregroundStyle(palette.danger)
@@ -246,7 +351,11 @@ struct SettingsSheet: View {
                             Spacer()
                             Button {
                                 state.preferences.ignoredLeftoverIDs.removeAll { $0 == lid }
-                                state.savePreferences()
+                                if !state.savePreferences() {
+                                    pathErrorBox.value = l10n.preferencesSaveFailedWarning
+                                } else {
+                                    pathErrorBox.value = nil
+                                }
                             } label: {
                                 Image(systemName: "trash")
                                     .foregroundStyle(palette.danger)
@@ -319,7 +428,7 @@ struct SettingsSheet: View {
                                     }
                                     if rec.mode == .trash {
                                         Button(l10n.t("打开废纸篓（可用「放回原处」恢复）", "Open Trash (use Put Back to restore)")) {
-                                            NSWorkspace.shared.open(FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".Trash"))
+                                            state.openDemoOrRealTrash()
                                         }
                                         .buttonStyle(.link)
                                         .font(.system(size: 11))
@@ -344,6 +453,61 @@ struct SettingsSheet: View {
                     )
                 }
             }
+        }
+    }
+
+    private func saveGeneralPreferences() {
+        generalSaveErrorBox.value = state.savePreferences() ? nil : l10n.preferencesSaveFailedWarning
+    }
+
+    private func submitManualProtectedPath() {
+        switch state.addProtectedPath(newProtectedPathBox.value) {
+        case .added:
+            newProtectedPathBox.value = ""
+            pathErrorBox.value = nil
+        case .invalid:
+            pathErrorBox.value = l10n.invalidPathError
+        case .duplicate:
+            pathErrorBox.value = l10n.duplicatePathError
+        case .saveFailed:
+            if !newProtectedPathBox.value.isEmpty {
+                suppressNextPathErrorClearBox.value = true
+                newProtectedPathBox.value = ""
+            }
+            pathErrorBox.value = l10n.preferencesSaveFailedWarning
+        }
+    }
+
+    private func pickProtectedPaths() {
+        if state.isDemoMode {
+            state.banner = OperationBanner(
+                isError: false,
+                message: l10n.t("演示模式：请使用文本框输入 /Users/alex/... 示例路径", "Demo mode: enter a /Users/alex/... path in the field"),
+                showAppManagementLink: false,
+                showFDALink: false
+            )
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = true
+        panel.canCreateDirectories = false
+        panel.showsHiddenFiles = true
+        panel.resolvesAliases = false
+        panel.treatsFilePackagesAsDirectories = false
+        panel.prompt = l10n.addPath
+
+        if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+            panel.beginSheetModal(for: window) { response in
+                if response == .OK {
+                    let saved = state.addProtectedPaths(urls: panel.urls)
+                    pathErrorBox.value = saved ? nil : l10n.preferencesSaveFailedWarning
+                }
+            }
+        } else if panel.runModal() == .OK {
+            let saved = state.addProtectedPaths(urls: panel.urls)
+            pathErrorBox.value = saved ? nil : l10n.preferencesSaveFailedWarning
         }
     }
 

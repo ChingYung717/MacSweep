@@ -149,6 +149,10 @@ public actor DirectorySizer {
             return DirectorySizeMeasurement(bytes: 0, fileCount: 0, folderCount: 0, isTruncated: false)
         }
 
+        if (st.st_flags & UInt32(SF_DATALESS)) != 0 {
+            return DirectorySizeMeasurement(bytes: 0, fileCount: 0, folderCount: 0, isTruncated: false)
+        }
+
         let fileType = st.st_mode & S_IFMT
         if fileType == S_IFLNK {
             // Symbolic link itself occupies negligible metadata blocks; never follow target.
@@ -159,10 +163,8 @@ public actor DirectorySizer {
             return DirectorySizeMeasurement(bytes: bytes, fileCount: 1, folderCount: 0, isTruncated: false)
         }
 
+        let rootDev = st.st_dev
         let keys: Set<URLResourceKey> = [
-            .isRegularFileKey,
-            .isDirectoryKey,
-            .isSymbolicLinkKey,
             .totalFileAllocatedSizeKey,
             .fileAllocatedSizeKey,
             .fileSizeKey,
@@ -176,12 +178,18 @@ public actor DirectorySizer {
             return DirectorySizeMeasurement(bytes: 0, fileCount: 0, folderCount: 0, isTruncated: false)
         }
 
+        struct InodeKey: Hashable {
+            let dev: dev_t
+            let ino: ino_t
+        }
+
         let cap = max(0, maxEntries)
         var total: Int64 = 0
         var fileCount = 0
         var folderCount = 0
         var visited = 0
         var isTruncated = false
+        var seenHardlinks = Set<InodeKey>()
         for case let itemURL as URL in enumerator {
             visited += 1
             if visited > cap {
@@ -192,21 +200,46 @@ public actor DirectorySizer {
                 isTruncated = true
                 break
             }
-            guard let values = try? itemURL.resourceValues(forKeys: keys) else { continue }
-            if values.isSymbolicLink == true {
-                fileCount += 1
+            var itemSt = stat()
+            guard lstat(itemURL.path, &itemSt) == 0 else { continue }
+            let mode = itemSt.st_mode & S_IFMT
+            if (itemSt.st_flags & UInt32(SF_DATALESS)) != 0 {
+                if mode == S_IFDIR {
+                    enumerator.skipDescendants()
+                }
                 continue
             }
-            if values.isDirectory == true {
+            if itemSt.st_dev != rootDev {
+                if mode == S_IFDIR {
+                    enumerator.skipDescendants()
+                }
+                continue
+            }
+            if mode == S_IFLNK {
+                fileCount += 1
+                enumerator.skipDescendants()
+                continue
+            }
+            if mode == S_IFDIR {
                 folderCount += 1
                 continue
             }
-            if values.isRegularFile == true {
+            if mode == S_IFREG {
                 fileCount += 1
-                if let allocated = values.totalFileAllocatedSize ?? values.fileAllocatedSize {
-                    total += Int64(allocated)
-                } else if let size = values.fileSize {
-                    total += Int64(size)
+                if itemSt.st_nlink > 1 && itemSt.st_ino != 0 {
+                    let key = InodeKey(dev: itemSt.st_dev, ino: itemSt.st_ino)
+                    if !seenHardlinks.insert(key).inserted {
+                        continue
+                    }
+                }
+                if let values = try? itemURL.resourceValues(forKeys: keys) {
+                    if let allocated = values.totalFileAllocatedSize ?? values.fileAllocatedSize {
+                        total += Int64(allocated)
+                    } else if let size = values.fileSize {
+                        total += Int64(size)
+                    }
+                } else {
+                    total += itemSt.st_blocks > 0 ? Int64(itemSt.st_blocks) * 512 : Int64(itemSt.st_size)
                 }
             }
         }

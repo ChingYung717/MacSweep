@@ -238,6 +238,21 @@ struct FileRowView: View {
         guard isExpandedBox.value, childrenBox.value == nil, !isLoadingChildrenBox.value else {
             return
         }
+        if IconCache.shared.isDemoMode {
+            let demoItems = DemoFixtureCatalog.default.directoryChildren(for: file.url).map { child in
+                DirectoryChildItem(
+                    id: child.url.path,
+                    url: child.url,
+                    name: child.name,
+                    isDirectory: child.isDirectory,
+                    isSymbolicLink: child.isSymbolicLink,
+                    size: child.size
+                )
+            }
+            childrenBox.value = demoItems
+            overflowCountBox.value = 0
+            return
+        }
         isLoadingChildrenBox.value = true
         let targetURL = file.url
         Task.detached(priority: .userInitiated) {
@@ -312,7 +327,9 @@ struct FileRowView: View {
     }
 
     private func shortenedPath(_ path: String) -> String {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let home = IconCache.shared.isDemoMode
+            ? DemoFixtureCatalog.homeDirectoryPath
+            : FileManager.default.homeDirectoryForCurrentUser.path
         if path == home {
             return "~"
         }
@@ -442,6 +459,20 @@ private struct DirectoryChildRowView: View {
     private func toggle() {
         expandedBox.value.toggle()
         guard expandedBox.value, subChildrenBox.value == nil, !loadingBox.value else { return }
+        if IconCache.shared.isDemoMode {
+            subChildrenBox.value = DemoFixtureCatalog.default.directoryChildren(for: item.url).map { child in
+                DirectoryChildItem(
+                    id: child.url.path,
+                    url: child.url,
+                    name: child.name,
+                    isDirectory: child.isDirectory,
+                    isSymbolicLink: child.isSymbolicLink,
+                    size: child.size
+                )
+            }
+            overflowBox.value = 0
+            return
+        }
         loadingBox.value = true
         let targetURL = item.url
         Task.detached(priority: .userInitiated) {

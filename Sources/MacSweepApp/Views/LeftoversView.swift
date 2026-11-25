@@ -5,7 +5,6 @@ struct LeftoversView: View {
     @ObservedObject var state: AppState
     let palette: AppPalette
 
-    @StateObject private var selectedGroupIDBox = LocalState<String?>(nil)
     @StateObject private var filterBox = LocalState<LeftoverFilter>(.all)
 
     enum LeftoverFilter: String, CaseIterable, Identifiable {
@@ -33,7 +32,7 @@ struct LeftoversView: View {
     }
 
     private var selectedGroup: LeftoverGroup? {
-        guard let id = selectedGroupIDBox.value else { return nil }
+        guard let id = state.selectedLeftoverGroupID else { return nil }
         return state.leftoverGroups.first(where: { $0.id == id })
     }
 
@@ -196,7 +195,7 @@ struct LeftoversView: View {
     }
 
     private func leftoverGroupRow(_ group: LeftoverGroup) -> some View {
-        let isSelected = selectedGroupIDBox.value == group.id
+        let isSelected = state.selectedLeftoverGroupID == group.id
         let isSystemOnly = !group.hasUserScopeFiles
         return HStack(spacing: 10) {
             SweepCheckbox(
@@ -266,7 +265,7 @@ struct LeftoversView: View {
         )
         .contentShape(Rectangle())
         .onTapGesture {
-            selectedGroupIDBox.value = group.id
+            state.selectedLeftoverGroupID = group.id
         }
     }
 
@@ -292,8 +291,8 @@ struct LeftoversView: View {
                         Spacer()
                         Button {
                             state.ignoreLeftoverGroup(group)
-                            if selectedGroupIDBox.value == group.id {
-                                selectedGroupIDBox.value = nil
+                            if state.selectedLeftoverGroupID == group.id {
+                                state.selectedLeftoverGroupID = nil
                             }
                         } label: {
                             Label(l10n.t("永久忽略", "Ignore Forever"), systemImage: "eye.slash")

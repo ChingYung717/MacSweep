@@ -200,6 +200,7 @@ public struct RemovalEngine: Sendable {
         }
 
         // Phase 1: Validate & partition into normal vs privileged using scan-time expectedCanonicalParent.
+        let homeTrashDir = URL(fileURLWithPath: safetyGuard.homeDirectoryPath).appendingPathComponent(".Trash")
         for target in uniqueTargets {
             let rawURL = target.url.standardizedFileURL
             switch safetyGuard.validateForRemoval(rawURL) {
@@ -207,6 +208,16 @@ public struct RemovalEngine: Sendable {
                 break
             case let .blocked(reason):
                 failures.append(RemovalFailure(url: rawURL, reason: reason))
+                continue
+            }
+
+            if mode == .trash,
+               Self.isInsideDirectory(rawURL, directory: privilegedExecutor.trashDirectory)
+                || Self.isInsideDirectory(rawURL, directory: homeTrashDir) {
+                failures.append(RemovalFailure(
+                    url: rawURL,
+                    reason: "Item is already in Trash; select permanent deletion to empty Trash"
+                ))
                 continue
             }
 
@@ -1094,6 +1105,23 @@ public struct RemovalEngine: Sendable {
     public static func entryExists(_ url: URL) -> Bool {
         var st = stat()
         return lstat(url.path, &st) == 0
+    }
+
+    /// Returns `true` when `url` is a descendant strictly inside `directory`, comparing both
+    /// standardized paths and canonical paths (`realpath`/deepest ancestor) case-insensitively.
+    public static func isInsideDirectory(_ url: URL, directory: URL) -> Bool {
+        let stdCandidate = url.standardizedFileURL.path.precomposedStringWithCanonicalMapping.lowercased()
+        let stdDir = directory.standardizedFileURL.path.precomposedStringWithCanonicalMapping.lowercased()
+        let stdPrefix = stdDir == "/" ? "/" : (stdDir.hasSuffix("/") ? stdDir : stdDir + "/")
+        if stdCandidate.hasPrefix(stdPrefix) && stdCandidate != stdDir {
+            return true
+        }
+        let canonCandidate = PrivilegedExecutor.canonicalParentPath(for: url.standardizedFileURL.path)
+            .precomposedStringWithCanonicalMapping.lowercased()
+        let canonDir = PrivilegedExecutor.canonicalParentPath(for: directory.standardizedFileURL.path)
+            .precomposedStringWithCanonicalMapping.lowercased()
+        let canonPrefix = canonDir == "/" ? "/" : (canonDir.hasSuffix("/") ? canonDir : canonDir + "/")
+        return canonCandidate.hasPrefix(canonPrefix) && canonCandidate != canonDir
     }
 
     private static func isPermissionDenied(_ error: NSError) -> Bool {

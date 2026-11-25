@@ -157,7 +157,10 @@ public struct LibraryIndex: Sendable {
             expandVendors: Bool,
             isSystemScope: Bool
         ) {
-            let dirURL = base.appendingPathComponent(relPath)
+            guard safetyGuard.isContainedCanonicalSubpath(relativePath: relPath, under: base) else {
+                return
+            }
+            let dirURL = base.appendingPathComponent(relPath).standardizedFileURL
             guard let children = try? fm.contentsOfDirectory(
                 at: dirURL,
                 includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
@@ -165,7 +168,7 @@ public struct LibraryIndex: Sendable {
             ) else {
                 return
             }
-            let dirCanonicalParent = PrivilegedExecutor.canonicalParentPath(for: dirURL.standardizedFileURL.path)
+            let dirCanonicalParent = PrivilegedExecutor.canonicalParentPath(for: dirURL.path)
 
             for child in children {
                 let childName = child.lastPathComponent
@@ -188,13 +191,12 @@ public struct LibraryIndex: Sendable {
 
                 // Expand shared vendor folders 1 level deeper instead of treating the entire vendor dir as one app.
                 if expandVendors && SafetyGuard.sharedVendorFolderNames.contains(lowerName) {
-                    let isDir = !safetyGuard.isSymbolicLink(child)
-                        && ((try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false)
-                    if isDir, let subItems = try? fm.contentsOfDirectory(
+                    if safetyGuard.isContainedCanonicalSubpath(relativePath: childName, under: dirURL),
+                       let subItems = try? fm.contentsOfDirectory(
                         at: child,
                         includingPropertiesForKeys: nil,
                         options: [.skipsHiddenFiles]
-                    ) {
+                       ) {
                         let vendorCanonicalParent = PrivilegedExecutor.canonicalParentPath(for: child.standardizedFileURL.path)
                         for sub in subItems {
                             let admin = safetyGuard.requiresAdmin(for: sub)
@@ -239,21 +241,26 @@ public struct LibraryIndex: Sendable {
             }
         }
 
-        for (rel, cat, expand) in userSpecs {
-            scanDirectory(base: userLibraryURL, relPath: rel, category: cat, expandVendors: expand, isSystemScope: false)
+        if safetyGuard.isContainedDirectory(userLibraryURL) {
+            for (rel, cat, expand) in userSpecs {
+                scanDirectory(base: userLibraryURL, relPath: rel, category: cat, expandVendors: expand, isSystemScope: false)
+            }
         }
-        for (rel, cat, expand) in systemSpecs {
-            scanDirectory(base: systemLibraryURL, relPath: rel, category: cat, expandVendors: expand, isSystemScope: true)
+        if safetyGuard.isContainedDirectory(systemLibraryURL) {
+            for (rel, cat, expand) in systemSpecs {
+                scanDirectory(base: systemLibraryURL, relPath: rel, category: cat, expandVendors: expand, isSystemScope: true)
+            }
         }
 
         // Index safe app-specific home dot-folders (e.g. `~/.docker`) for installed app detail matching only.
         // Strictly excludes symlinks, shell/credential/developer tool dotfiles, and any path rejected by SafetyGuard.
         let homeURL = userLibraryURL.deletingLastPathComponent()
-        if let homeItems = try? fm.contentsOfDirectory(
+        if safetyGuard.isContainedDirectory(homeURL),
+           let homeItems = try? fm.contentsOfDirectory(
             at: homeURL,
             includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
             options: []
-        ) {
+           ) {
             let homeCanonicalParent = PrivilegedExecutor.canonicalParentPath(for: homeURL.standardizedFileURL.path)
             for child in homeItems {
                 let name = child.lastPathComponent

@@ -28,6 +28,7 @@ struct AppPalette {
     let buttonBottom: Color
     let sidebarActiveTop: Color
     let sidebarActiveBottom: Color
+    let sidebarActiveForeground: Color
 
     static let deepOcean = AppPalette(
         isDark: true,
@@ -53,7 +54,8 @@ struct AppPalette {
         buttonTop: Color(red: 0.22, green: 0.57, blue: 0.98),
         buttonBottom: Color(red: 0.13, green: 0.43, blue: 0.84),
         sidebarActiveTop: Color(red: 0.14, green: 0.38, blue: 0.66),
-        sidebarActiveBottom: Color(red: 0.08, green: 0.23, blue: 0.44)
+        sidebarActiveBottom: Color(red: 0.08, green: 0.23, blue: 0.44),
+        sidebarActiveForeground: Color.white
     )
 
     static func system(colorScheme: ColorScheme) -> AppPalette {
@@ -81,8 +83,9 @@ struct AppPalette {
             dropZoneFill: Color(nsColor: .controlBackgroundColor).opacity(0.6),
             buttonTop: Color.accentColor,
             buttonBottom: Color.accentColor.opacity(0.85),
-            sidebarActiveTop: Color.accentColor.opacity(dark ? 0.36 : 0.22),
-            sidebarActiveBottom: Color.accentColor.opacity(dark ? 0.24 : 0.14)
+            sidebarActiveTop: Color.accentColor.opacity(dark ? 0.36 : 0.18),
+            sidebarActiveBottom: Color.accentColor.opacity(dark ? 0.24 : 0.12),
+            sidebarActiveForeground: dark ? Color.white : Color(nsColor: .labelColor)
         )
     }
 
@@ -96,7 +99,7 @@ struct AppPalette {
     }
 }
 
-enum ByteFormatter {
+public enum ByteFormatter {
     @MainActor
     private static let shared: ByteCountFormatter = {
         let formatter = ByteCountFormatter()
@@ -108,7 +111,32 @@ enum ByteFormatter {
     }()
 
     @MainActor
-    static func format(_ bytes: Int64) -> String {
+    private static let memoryShared: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useBytes, .useKB, .useMB, .useGB, .useTB]
+        formatter.countStyle = .memory
+        formatter.includesUnit = true
+        formatter.isAdaptive = true
+        return formatter
+    }()
+
+    @MainActor
+    public static func format(_ bytes: Int64) -> String {
         shared.string(fromByteCount: max(0, bytes))
+    }
+
+    @MainActor
+    public static func format(_ bytes: UInt64) -> String {
+        format(Int64(min(bytes, UInt64(Int64.max))))
+    }
+
+    @MainActor
+    public static func formatMemory(_ bytes: Int64) -> String {
+        memoryShared.string(fromByteCount: max(0, bytes))
+    }
+
+    @MainActor
+    public static func formatMemory(_ bytes: UInt64) -> String {
+        formatMemory(Int64(min(bytes, UInt64(Int64.max))))
     }
 }
