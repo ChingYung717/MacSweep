@@ -213,7 +213,11 @@ struct FileManagerView: View {
             .fixedSize()
 
             Button {
-                if let chosen = chooseDirectoryPanel(title: l10n.chooseFolder, initialURL: store.analyzerRootURL) {
+                if let chosen = chooseDirectoryPanel(
+                    title: l10n.chooseFolder,
+                    initialURL: store.analyzerRootURL,
+                    showsHiddenFiles: store.analyzerIncludeHiddenFiles
+                ) {
                     store.startSpaceAnalysis(at: chosen)
                 }
             } label: {
@@ -477,6 +481,15 @@ struct FileManagerView: View {
                 .menuStyle(.borderlessButton)
                 .fixedSize()
 
+                Button {
+                    store.toggleAnalyzerIncludeHiddenFiles()
+                } label: {
+                    hiddenToggleChipLabel(isOn: store.analyzerIncludeHiddenFiles)
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(".", modifiers: [.command, .shift])
+                .help(l10n.includeHiddenFilesHelp)
+
                 if store.isAnalyzerFilterActive {
                     Button {
                         store.analyzerSizePreset = .all
@@ -542,6 +555,28 @@ struct FileManagerView: View {
                 )
             }
         }
+    }
+
+    private func hiddenToggleChipLabel(isOn: Bool) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: isOn ? "eye.fill" : "eye.slash")
+                .font(.system(size: 11))
+            Text(l10n.hiddenFilesChipLabel)
+                .font(.system(size: 11.5, weight: isOn ? .semibold : .medium))
+                .lineLimit(1)
+        }
+        .foregroundStyle(isOn ? palette.accent : palette.secondaryText)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .background(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(isOn ? palette.accent.opacity(0.14) : palette.cardBackground)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .strokeBorder(isOn ? palette.activeBorder : palette.border, lineWidth: 1)
+                )
+        )
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     private func filterMenuLabel(title: String, icon: String, isActive: Bool) -> some View {
@@ -653,6 +688,17 @@ struct FileManagerView: View {
                     .padding(.vertical, 8)
                 }
             }
+        } else {
+            VStack(spacing: 10) {
+                Spacer()
+                ProgressView()
+                    .controlSize(.regular)
+                Text(l10n.analyzingSpace)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(palette.secondaryText)
+                Spacer()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
@@ -684,10 +730,13 @@ struct FileManagerView: View {
                 HStack(spacing: 6) {
                     Text(verbatim: node.displayName)
                         .font(.system(size: 12.5, weight: .medium))
-                        .foregroundStyle(palette.primaryText)
+                        .foregroundStyle(node.isHidden ? palette.secondaryText : palette.primaryText)
                         .lineLimit(1)
                         .truncationMode(.middle)
 
+                    if node.isHidden {
+                        miniBadge(l10n.hiddenBadge, color: palette.secondaryText)
+                    }
                     if node.isPackage {
                         miniBadge(l10n.packageBadge, color: palette.accent)
                     } else if node.isSymlink {
@@ -735,9 +784,17 @@ struct FileManagerView: View {
 
             Spacer(minLength: 8)
 
-            Text(ByteFormatter.format(node.bytes))
+            let isPendingFolder = store.isAnalyzing
+                && node.isDirectory
+                && node.bytes == 0
+                && node.fileCount == 0
+                && node.folderCount == 0
+                && node.isAccessible
+                && !node.isTruncated
+
+            Text(isPendingFolder ? "..." : ByteFormatter.format(node.bytes))
                 .font(.system(size: 12.5, weight: .semibold, design: .rounded))
-                .foregroundStyle(palette.primaryText)
+                .foregroundStyle(isPendingFolder ? palette.tertiaryText : palette.primaryText)
                 .monospacedDigit()
 
             if node.isDirectory && !node.isPackage && !node.isSymlink && node.isAccessible {
@@ -832,9 +889,12 @@ struct FileManagerView: View {
                 HStack(spacing: 6) {
                     Text(verbatim: item.displayName)
                         .font(.system(size: 12.5, weight: .medium))
-                        .foregroundStyle(palette.primaryText)
+                        .foregroundStyle(item.isHidden ? palette.secondaryText : palette.primaryText)
                         .lineLimit(1)
                         .truncationMode(.middle)
+                    if item.isHidden {
+                        miniBadge(l10n.hiddenBadge, color: palette.secondaryText)
+                    }
                     if item.isProtected {
                         miniBadge(l10n.protectedBadge, color: palette.accent)
                     }
@@ -1072,14 +1132,7 @@ struct FileManagerView: View {
             Button {
                 store.toggleShowHiddenFiles()
             } label: {
-                Image(systemName: store.showHiddenFiles ? "eye.fill" : "eye.slash")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(store.showHiddenFiles ? palette.accent : palette.secondaryText)
-                    .frame(width: 26, height: 26)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6)
-                            .fill(store.showHiddenFiles ? palette.accent.opacity(0.15) : palette.cardBackground)
-                    )
+                hiddenToggleChipLabel(isOn: store.showHiddenFiles)
             }
             .buttonStyle(.plain)
             .keyboardShortcut(".", modifiers: [.command, .shift])
@@ -1329,6 +1382,9 @@ struct FileManagerView: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
 
+                    if entry.isHidden {
+                        miniBadge(l10n.hiddenBadge, color: palette.secondaryText)
+                    }
                     if entry.isSIPRestricted {
                         miniBadge(l10n.systemProtectedBadge, color: palette.danger)
                     } else if entry.isProtected {
@@ -1647,14 +1703,18 @@ struct FileManagerView: View {
 
     private func beginMove(entries: [FileBrowserEntry]) {
         guard !entries.isEmpty else { return }
-        if let destination = chooseDirectoryPanel(title: l10n.chooseMoveDestination, initialURL: store.currentDirectoryURL) {
+        if let destination = chooseDirectoryPanel(
+            title: l10n.chooseMoveDestination,
+            initialURL: store.currentDirectoryURL,
+            showsHiddenFiles: store.showHiddenFiles
+        ) {
             Task {
                 await store.moveEntries(entries, to: destination)
             }
         }
     }
 
-    private func chooseDirectoryPanel(title: String, initialURL: URL) -> URL? {
+    private func chooseDirectoryPanel(title: String, initialURL: URL, showsHiddenFiles: Bool) -> URL? {
         if state.isDemoMode {
             state.banner = OperationBanner(
                 isError: false,
@@ -1669,6 +1729,7 @@ struct FileManagerView: View {
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
         panel.canCreateDirectories = true
+        panel.showsHiddenFiles = showsHiddenFiles
         panel.title = title
         panel.directoryURL = initialURL
         return panel.runModal() == .OK ? panel.url?.standardizedFileURL : nil

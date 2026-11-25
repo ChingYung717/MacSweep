@@ -274,7 +274,7 @@
 | **M3** | 垃圾/缓存清理与扩展资源释放 | `JunkCacheScanner`、`LargeAndDuplicateScanner`、`MemoryReleaseService`、`JunkAndResourceModels`、`CleanupCenterStore`、`JunkCleanerView`、`ResourceReleaseView`（大文件 / 3 阶段去重 / Mach 内存监控与释放）、`SidebarRail`/`MainTab`/`L10n` 接入、`JunkAndResourceChecks` | M2 | **已完成** |
 | **M4** | 脱敏演示模式、截图流水线与 README 更新 | `DemoFixtureCatalog`、`AppState`/`IconCache` 演示隔离、`DemoScreenshotExporter`（`--export-screenshots`）、`DemoModeChecks`、生成 `docs/screenshots/*.png`、隐私泄漏审计、更新 `README.md`/`README_EN.md`/`README_ZH.md`（含校验数量与 7 页签修正） | M3 | **已完成** |
 | **E2E Track** | 独立黑盒端到端测试套件 | `TEST_INFRA.md`、`Tests/MacSweepE2E/`（Tiers 1–4 覆盖 F1–F11 核心契约与边界，`154/154` 严格通过），已发布 `TEST_READY.md` | 并行 | **已完成** |
-| **M5** | 终验阶段：E2E 全通与 Tier-5 对抗加固 | 通过 Tiers 1–4 100% E2E 测试（154/154），完成 Tier-5 对抗性覆盖加固与审计修复（144 项校验全通）、最终构建、校验、截图与文档一致性总审 | M4, E2E | **已完成** |
+| **M5** | 终验阶段：E2E 全通与 Tier-5 对抗加固 | 通过 Tiers 1–4 100% E2E 测试（154/154），完成 Tier-5 对抗性覆盖加固与审计修复（148 项校验全通）、最终构建、校验、截图与文档一致性总审 | M4, E2E | **已完成** |
 
 ### 6.2 最终验收清单（Acceptance Criteria）
 
@@ -282,5 +282,5 @@
 - [x] **全工程编译与零外部依赖**：`swift build`、`swift build --target MacSweepApp` 与 `./make_app.sh` 编译无错；`otool -L` 确认无任何 `/opt/homebrew` 或 `/usr/local` 第三方动态库；`Sources/MacSweepCore/` 零 `SwiftUI` 导入；`Sources/MacSweepApp/` 与 `Sources/MacSweepAppEntry/` 零 `@State` 宏使用。
 - [x] **交互真实完整**：所有新增界面（`SettingsSheet` 受保护路径管理、`FileManagerView`、`JunkCleanerView`、`ResourceReleaseView`）的按钮、开关、输入框与上下文动作均接入真实核心逻辑，无空壳按钮或占位流程。
 - [x] **路径安全与原子边界**：所有删除、移动、重命名、新建目录与缓存清理均经过 `SafetyGuard` 三重解析校验、TOCTOU 父目录 FD 校验、`O_NOFOLLOW` 非跟随操作及 `ConfirmationSheet` 确认（默认废纸篓优先，含废纸篓混合批次独立按项分流），不误操作受保护的系统目录或共享厂商根目录。
-- [x] **自动化测试与 E2E 全通**：`swift run MacSweepChecks`（144 项沙盒与回归校验，含原有 59 项 + M1–M5 新增与审计回归校验）与 `Tests/MacSweepE2E`（154/154 严格通过）100% 通过。
+- [x] **自动化测试与 E2E 全通**：`swift run MacSweepChecks`（148 项沙盒与回归校验，含原有 59 项 + M1–M5 新增与审计回归校验）与 `Tests/MacSweepE2E`（154/154 严格通过）100% 通过。
 - [x] **脱敏截图与 GitHub README 一致性**：`--demo-mode --export-screenshots docs/screenshots` 可稳定复现高清 2x Retina 截图且零真实本机隐私泄漏；`README.md`、`README_EN.md`、`README_ZH.md` 所有图片链接有效，功能描述与实际校验数量 100% 一致。

@@ -14,6 +14,7 @@ public struct DiskSpaceAnalyzer: Sendable {
     public let maxChildrenPerDirectory: Int
     public let progressThrottleInterval: TimeInterval
     public let maxTotalEntries: Int?
+    public let includeHiddenFiles: Bool
 
     private let statProvider: StatProvider?
     private let enumerationMode: EnumerationMode
@@ -26,12 +27,14 @@ public struct DiskSpaceAnalyzer: Sendable {
         safetyGuard: SafetyGuard = SafetyGuard(),
         maxChildrenPerDirectory: Int = 200,
         progressThrottleInterval: TimeInterval = 0.10,
-        maxTotalEntries: Int? = nil
+        maxTotalEntries: Int? = nil,
+        includeHiddenFiles: Bool = true
     ) {
         self.safetyGuard = safetyGuard
         self.maxChildrenPerDirectory = max(1, maxChildrenPerDirectory)
         self.progressThrottleInterval = max(0.01, progressThrottleInterval)
         self.maxTotalEntries = maxTotalEntries.map { max(1, $0) }
+        self.includeHiddenFiles = includeHiddenFiles
         self.statProvider = nil
         self.enumerationMode = .automatic
     }
@@ -41,6 +44,7 @@ public struct DiskSpaceAnalyzer: Sendable {
         maxChildrenPerDirectory: Int = 200,
         progressThrottleInterval: TimeInterval = 0.10,
         maxTotalEntries: Int? = nil,
+        includeHiddenFiles: Bool = true,
         statProvider: StatProvider? = nil,
         enumerationMode: EnumerationMode = .automatic
     ) {
@@ -48,6 +52,7 @@ public struct DiskSpaceAnalyzer: Sendable {
         self.maxChildrenPerDirectory = max(1, maxChildrenPerDirectory)
         self.progressThrottleInterval = max(0.01, progressThrottleInterval)
         self.maxTotalEntries = maxTotalEntries.map { max(1, $0) }
+        self.includeHiddenFiles = includeHiddenFiles
         self.statProvider = statProvider
         self.enumerationMode = enumerationMode
     }
@@ -58,6 +63,34 @@ public struct DiskSpaceAnalyzer: Sendable {
         root: URL,
         maxDepth: Int = 5,
         onProgress: @escaping @Sendable (DiskScanProgress) -> Void = { _ in }
+    ) async throws -> DiskTreeNode {
+        try await analyzeInternal(
+            root: root,
+            maxDepth: maxDepth,
+            onPartialTree: nil,
+            onProgress: onProgress
+        )
+    }
+
+    public func analyze(
+        root: URL,
+        maxDepth: Int = 5,
+        onPartialTree: @escaping @Sendable (DiskTreeNode) -> Void,
+        onProgress: @escaping @Sendable (DiskScanProgress) -> Void = { _ in }
+    ) async throws -> DiskTreeNode {
+        try await analyzeInternal(
+            root: root,
+            maxDepth: maxDepth,
+            onPartialTree: onPartialTree,
+            onProgress: onProgress
+        )
+    }
+
+    private func analyzeInternal(
+        root: URL,
+        maxDepth: Int,
+        onPartialTree: (@Sendable (DiskTreeNode) -> Void)?,
+        onProgress: @escaping @Sendable (DiskScanProgress) -> Void
     ) async throws -> DiskTreeNode {
         let stdRoot = try Self.validateRootURL(root)
         let effectiveMaxDepth = max(0, maxDepth)
@@ -72,6 +105,7 @@ public struct DiskSpaceAnalyzer: Sendable {
                             root: stdRoot,
                             maxDepth: effectiveMaxDepth,
                             cancelFlag: cancelFlag,
+                            onPartialTree: onPartialTree,
                             onProgress: onProgress
                         )
                         continuation.resume(returning: node)
@@ -240,9 +274,15 @@ public struct DiskSpaceAnalyzer: Sendable {
         let rootPath = root.url.path
 
         var results: [DiskFilteredItem] = []
-        var stack: [DiskTreeNode] = Array(root.children.reversed())
+        var stack: [(node: DiskTreeNode, ancestorHidden: Bool)] = root.children.reversed().map { ($0, false) }
 
-        while let node = stack.popLast() {
+        while let frame = stack.popLast() {
+            let node = frame.node
+            if !filter.includeHiddenFiles && node.isHidden {
+                continue
+            }
+            let effectiveHidden = node.isHidden || frame.ancestorHidden
+
             if !node.isSymlink {
                 let relativePath = Self.relativePath(of: node.url.path, under: rootPath)
                 let scopeMatches: Bool
@@ -276,6 +316,7 @@ public struct DiskSpaceAnalyzer: Sendable {
                         expectedCanonicalParent: node.expectedCanonicalParent,
                         isProtected: node.isProtected,
                         isUserImmutable: node.isUserImmutable,
+                        isHidden: effectiveHidden,
                         relativePathFromRoot: relativePath
                     ))
                 }
@@ -283,7 +324,7 @@ public struct DiskSpaceAnalyzer: Sendable {
 
             if node.isDirectory && !node.isPackage && !node.children.isEmpty {
                 for child in node.children.reversed() {
-                    stack.append(child)
+                    stack.append((child, effectiveHidden))
                 }
             }
         }
@@ -321,6 +362,115 @@ public struct DiskSpaceAnalyzer: Sendable {
         let dataLength: Int64
     }
 
+    private final class BulkReadScratch {
+        let buffer: UnsafeMutableRawBufferPointer
+
+        init(capacity: Int = DiskSpaceAnalyzer.bulkBufferSize) {
+            self.buffer = UnsafeMutableRawBufferPointer.allocate(byteCount: capacity, alignment: 16)
+        }
+
+        deinit {
+            buffer.deallocate()
+        }
+    }
+
+    private final class SharedHardlinkTable: @unchecked Sendable {
+        private let lock = NSLock()
+        private var seen = Set<FileInodeKey>()
+
+        func insertIfNew(_ key: FileInodeKey) -> Bool {
+            lock.lock()
+            let inserted = seen.insert(key).inserted
+            lock.unlock()
+            return inserted
+        }
+    }
+
+    private final class SharedProgressTracker: @unchecked Sendable {
+        private let lock = NSLock()
+        private let startTime: CFAbsoluteTime
+        private let throttleInterval: TimeInterval
+        private let onProgress: @Sendable (DiskScanProgress) -> Void
+
+        private var scannedFiles: Int = 0
+        private var scannedFolders: Int = 0
+        private var totalBytes: UInt64 = 0
+        private var skippedSymlinks: Int = 0
+        private var skippedDataless: Int = 0
+        private var skippedCrossVolume: Int = 0
+        private var deduplicatedHardlinks: Int = 0
+        private var lastEmitTime: CFAbsoluteTime
+
+        init(
+            startTime: CFAbsoluteTime,
+            throttleInterval: TimeInterval,
+            onProgress: @escaping @Sendable (DiskScanProgress) -> Void
+        ) {
+            self.startTime = startTime
+            self.throttleInterval = throttleInterval
+            self.onProgress = onProgress
+            self.lastEmitTime = startTime
+        }
+
+        func addDelta(
+            files: Int,
+            folders: Int,
+            bytes: UInt64,
+            skippedSymlinks: Int,
+            skippedDataless: Int,
+            skippedCrossVolume: Int,
+            deduplicatedHardlinks: Int,
+            currentPath: String
+        ) {
+            var payload: DiskScanProgress?
+            lock.lock()
+            self.scannedFiles += files
+            self.scannedFolders += folders
+            self.totalBytes &+= bytes
+            self.skippedSymlinks += skippedSymlinks
+            self.skippedDataless += skippedDataless
+            self.skippedCrossVolume += skippedCrossVolume
+            self.deduplicatedHardlinks += deduplicatedHardlinks
+            let now = CFAbsoluteTimeGetCurrent()
+            if now - lastEmitTime >= throttleInterval {
+                lastEmitTime = now
+                payload = DiskScanProgress(
+                    scannedFiles: self.scannedFiles,
+                    scannedFolders: self.scannedFolders,
+                    totalBytes: self.totalBytes,
+                    currentPath: currentPath,
+                    elapsedSeconds: max(0, now - startTime),
+                    skippedSymlinks: self.skippedSymlinks,
+                    skippedDataless: self.skippedDataless,
+                    skippedCrossVolume: self.skippedCrossVolume,
+                    deduplicatedHardlinks: self.deduplicatedHardlinks
+                )
+            }
+            lock.unlock()
+            if let payload {
+                onProgress(payload)
+            }
+        }
+
+        func emitFinal(currentPath: String) {
+            lock.lock()
+            let now = CFAbsoluteTimeGetCurrent()
+            let payload = DiskScanProgress(
+                scannedFiles: self.scannedFiles,
+                scannedFolders: self.scannedFolders,
+                totalBytes: self.totalBytes,
+                currentPath: currentPath,
+                elapsedSeconds: max(0, now - startTime),
+                skippedSymlinks: self.skippedSymlinks,
+                skippedDataless: self.skippedDataless,
+                skippedCrossVolume: self.skippedCrossVolume,
+                deduplicatedHardlinks: self.deduplicatedHardlinks
+            )
+            lock.unlock()
+            onProgress(payload)
+        }
+    }
+
     private struct ScanSession {
         let rootPath: String
         let rootDevice: dev_t
@@ -330,6 +480,9 @@ public struct DiskSpaceAnalyzer: Sendable {
         let progressThrottleInterval: TimeInterval
         let maxTotalEntries: Int?
         let cancelFlag: CancellationFlag
+        let scratch: BulkReadScratch
+        let sharedHardlinks: SharedHardlinkTable?
+        let sharedProgress: SharedProgressTracker?
 
         var seenHardlinks = Set<FileInodeKey>()
         var scannedFiles: Int = 0
@@ -343,19 +496,102 @@ public struct DiskSpaceAnalyzer: Sendable {
         var hitGlobalCap: Bool = false
         var lastEmitTime: CFAbsoluteTime = 0
 
-        mutating func recordVisitedEntry(currentPath: String) throws {
-            if cancelFlag.isCancelled || Task.isCancelled {
-                throw CancellationError()
+        // Unflushed deltas when running inside a parallel worker
+        var pendingFiles: Int = 0
+        var pendingFolders: Int = 0
+        var pendingBytes: UInt64 = 0
+        var pendingSkippedSymlinks: Int = 0
+        var pendingSkippedDataless: Int = 0
+        var pendingSkippedCrossVolume: Int = 0
+        var pendingDedupHardlinks: Int = 0
+
+        mutating func insertHardlinkIfNew(_ key: FileInodeKey) -> Bool {
+            if let sharedHardlinks {
+                return sharedHardlinks.insertIfNew(key)
             }
+            return seenHardlinks.insert(key).inserted
+        }
+
+        mutating func recordFile(bytes: UInt64) {
+            scannedFiles += 1
+            totalBytes &+= bytes
+            if sharedProgress != nil {
+                pendingFiles += 1
+                pendingBytes &+= bytes
+            }
+        }
+
+        mutating func recordFolder() {
+            scannedFolders += 1
+            if sharedProgress != nil {
+                pendingFolders += 1
+            }
+        }
+
+        mutating func recordSkippedSymlink() {
+            skippedSymlinks += 1
+            if sharedProgress != nil { pendingSkippedSymlinks += 1 }
+        }
+
+        mutating func recordSkippedDataless() {
+            skippedDataless += 1
+            if sharedProgress != nil { pendingSkippedDataless += 1 }
+        }
+
+        mutating func recordSkippedCrossVolume() {
+            skippedCrossVolume += 1
+            if sharedProgress != nil { pendingSkippedCrossVolume += 1 }
+        }
+
+        mutating func recordDedupHardlink() {
+            deduplicatedHardlinks += 1
+            if sharedProgress != nil { pendingDedupHardlinks += 1 }
+        }
+
+        mutating func flushSharedProgress(currentPath: String) {
+            guard let sharedProgress else { return }
+            if pendingFiles != 0 || pendingFolders != 0 || pendingBytes != 0
+                || pendingSkippedSymlinks != 0 || pendingSkippedDataless != 0
+                || pendingSkippedCrossVolume != 0 || pendingDedupHardlinks != 0 {
+                sharedProgress.addDelta(
+                    files: pendingFiles,
+                    folders: pendingFolders,
+                    bytes: pendingBytes,
+                    skippedSymlinks: pendingSkippedSymlinks,
+                    skippedDataless: pendingSkippedDataless,
+                    skippedCrossVolume: pendingSkippedCrossVolume,
+                    deduplicatedHardlinks: pendingDedupHardlinks,
+                    currentPath: currentPath
+                )
+                pendingFiles = 0
+                pendingFolders = 0
+                pendingBytes = 0
+                pendingSkippedSymlinks = 0
+                pendingSkippedDataless = 0
+                pendingSkippedCrossVolume = 0
+                pendingDedupHardlinks = 0
+            }
+        }
+
+        mutating func recordVisitedEntry(currentPath: String) throws {
             visitedEntries += 1
             if let cap = maxTotalEntries, visitedEntries > cap {
                 hitGlobalCap = true
             }
             if (visitedEntries & 0x3F) == 0 {
-                let now = CFAbsoluteTimeGetCurrent()
-                if now - lastEmitTime >= progressThrottleInterval {
-                    lastEmitTime = now
-                    emitProgress(currentPath: currentPath, now: now)
+                if cancelFlag.isCancelled || Task.isCancelled {
+                    throw CancellationError()
+                }
+                if sharedProgress != nil {
+                    if (visitedEntries & 0xFF) == 0 || progressThrottleInterval <= 0.02 {
+                        flushSharedProgress(currentPath: currentPath)
+                    }
+                } else {
+                    let now = CFAbsoluteTimeGetCurrent()
+                    if now - lastEmitTime >= progressThrottleInterval {
+                        lastEmitTime = now
+                        emitProgress(currentPath: currentPath, now: now)
+                    }
                 }
             }
         }
@@ -392,6 +628,7 @@ public struct DiskSpaceAnalyzer: Sendable {
         root stdRoot: URL,
         maxDepth: Int,
         cancelFlag: CancellationFlag,
+        onPartialTree: (@Sendable (DiskTreeNode) -> Void)?,
         onProgress: @escaping @Sendable (DiskScanProgress) -> Void
     ) throws -> DiskTreeNode {
         let rootStat = try obtainStat(at: stdRoot.path)
@@ -402,6 +639,7 @@ public struct DiskSpaceAnalyzer: Sendable {
         let rootMod = Self.dateFromTimespec(rootStat.st_mtimespec)
         let rootAcc = Self.dateFromTimespec(rootStat.st_atimespec)
         let displayName = stdRoot.path == "/" ? "/" : stdRoot.lastPathComponent
+        let rootHidden = Self.isEntryHidden(name: displayName, flags: rootStat.st_flags)
 
         if rootMode == S_IFLNK {
             return DiskTreeNode(
@@ -420,6 +658,7 @@ public struct DiskSpaceAnalyzer: Sendable {
                 isAccessible: true,
                 isProtected: rootProtected,
                 isUserImmutable: rootImmutable,
+                isHidden: rootHidden,
                 expectedCanonicalParent: rootParent
             )
         }
@@ -441,6 +680,7 @@ public struct DiskSpaceAnalyzer: Sendable {
                 isAccessible: true,
                 isProtected: rootProtected,
                 isUserImmutable: rootImmutable,
+                isHidden: rootHidden,
                 expectedCanonicalParent: rootParent
             )
         }
@@ -470,6 +710,7 @@ public struct DiskSpaceAnalyzer: Sendable {
                 isAccessible: true,
                 isProtected: rootProtected,
                 isUserImmutable: rootImmutable,
+                isHidden: rootHidden,
                 expectedCanonicalParent: rootParent
             )
             onProgress(DiskScanProgress(
@@ -482,6 +723,26 @@ public struct DiskSpaceAnalyzer: Sendable {
             return node
         }
 
+        // Parallel 2-level fan-out for unconstrained scans (no artificial entry cap or injected statProvider).
+        if maxTotalEntries == nil && statProvider == nil && maxDepth >= 1 {
+            return try analyzeRootParallel(
+                stdRoot: stdRoot,
+                displayName: displayName,
+                rootDevice: rootStat.st_dev,
+                rootMod: rootMod,
+                rootAcc: rootAcc,
+                rootImmutable: rootImmutable,
+                rootHidden: rootHidden,
+                rootProtected: rootProtected,
+                rootParent: rootParent,
+                maxDepth: maxDepth,
+                cancelFlag: cancelFlag,
+                onPartialTree: onPartialTree,
+                onProgress: onProgress
+            )
+        }
+
+        let scratch = BulkReadScratch()
         var session = ScanSession(
             rootPath: stdRoot.path,
             rootDevice: rootStat.st_dev,
@@ -490,18 +751,21 @@ public struct DiskSpaceAnalyzer: Sendable {
             onProgress: onProgress,
             progressThrottleInterval: progressThrottleInterval,
             maxTotalEntries: maxTotalEntries,
-            cancelFlag: cancelFlag
+            cancelFlag: cancelFlag,
+            scratch: scratch,
+            sharedHardlinks: nil,
+            sharedProgress: nil
         )
         session.lastEmitTime = session.startTime
 
-        guard let rootNode = try scanDirectory(
+        guard let rawRoot = try scanDirectory(
             dirURL: stdRoot,
             dirName: displayName,
             depth: 0,
             modDate: rootMod,
             accDate: rootAcc,
             isUserImmutable: rootImmutable,
-            isProtected: rootProtected,
+            isHidden: rootHidden,
             expectedCanonicalParent: rootParent,
             isRootCall: true,
             session: &session
@@ -509,8 +773,715 @@ public struct DiskSpaceAnalyzer: Sendable {
             throw DiskScanError.notFound(path: stdRoot.path)
         }
 
+        let annotatedRoot = rawRoot.updatingProtection(using: safetyGuard)
         session.emitProgress(currentPath: stdRoot.path)
-        return rootNode
+        return annotatedRoot
+    }
+
+    private func analyzeRootParallel(
+        stdRoot: URL,
+        displayName: String,
+        rootDevice: dev_t,
+        rootMod: Date?,
+        rootAcc: Date?,
+        rootImmutable: Bool,
+        rootHidden: Bool,
+        rootProtected: Bool,
+        rootParent: String,
+        maxDepth: Int,
+        cancelFlag: CancellationFlag,
+        onPartialTree: (@Sendable (DiskTreeNode) -> Void)?,
+        onProgress: @escaping @Sendable (DiskScanProgress) -> Void
+    ) throws -> DiskTreeNode {
+        let startTime = CFAbsoluteTimeGetCurrent()
+        let rootScratch = BulkReadScratch()
+        let sharedHardlinks = SharedHardlinkTable()
+        let sharedProgress = SharedProgressTracker(
+            startTime: startTime,
+            throttleInterval: progressThrottleInterval,
+            onProgress: onProgress
+        )
+
+        let rootPath = stdRoot.path
+        let rootIsPackage = Self.detectIsPackage(at: stdRoot)
+        let rootEntries = try readDirectoryEntries(at: stdRoot, expectedDevice: rootDevice, scratch: rootScratch)
+        let canonicalSelf = PrivilegedExecutor.canonicalParentPath(for: rootPath)
+
+        struct TopDirSlot: Sendable {
+            let url: URL
+            let name: String
+            let isPackage: Bool
+            let modDate: Date?
+            let accDate: Date?
+            let isUserImmutable: Bool
+            let isHidden: Bool
+            let isProtected: Bool
+            let canonicalSelf: String
+            var directFiles: [DiskTreeNode]
+            var directFileBytes: UInt64
+            var directFileCount: Int
+            var isAccessible: Bool
+            var completedSubdirNodes: [DiskTreeNode]
+            var pendingSubdirCount: Int
+            var finishedNode: DiskTreeNode?
+        }
+
+        struct WorkUnit: Sendable {
+            let topSlotIndex: Int
+            let url: URL
+            let name: String
+            let depth: Int
+            let modDate: Date?
+            let accDate: Date?
+            let isUserImmutable: Bool
+            let isHidden: Bool
+            let expectedCanonicalParent: String
+        }
+
+        var directRootFiles: [DiskTreeNode] = []
+        var rootFileBytes: UInt64 = 0
+        var rootFileCount = 0
+        var topDirSlots: [TopDirSlot] = []
+        var workUnits: [WorkUnit] = []
+
+        var rootSkippedSymlinks = 0
+        var rootSkippedDataless = 0
+        var rootSkippedCrossVolume = 0
+        var rootDedupHardlinks = 0
+        var rootVisitedCount = 0
+
+        for entry in rootEntries {
+            if cancelFlag.isCancelled || Task.isCancelled {
+                throw CancellationError()
+            }
+            rootVisitedCount += 1
+            if Self.shouldSkipSpecialRootChild(name: entry.name, parentPath: rootPath, scanRootPath: rootPath) {
+                rootSkippedCrossVolume += 1
+                continue
+            }
+            if entry.objType == UInt32(VLNK.rawValue) {
+                rootSkippedSymlinks += 1
+                continue
+            }
+            if (entry.flags & UInt32(SF_DATALESS)) != 0 {
+                rootSkippedDataless += 1
+                continue
+            }
+            if entry.dev != rootDevice {
+                rootSkippedCrossVolume += 1
+                continue
+            }
+            if entry.objType == UInt32(VDIR.rawValue),
+               (entry.dirMountStatus & UInt32(DIR_MNTSTATUS_MNTPOINT)) != 0 {
+                rootSkippedCrossVolume += 1
+                continue
+            }
+
+            let childHidden = Self.isEntryHidden(name: entry.name, flags: entry.flags)
+            if !includeHiddenFiles && childHidden {
+                continue
+            }
+
+            let childURL = stdRoot.appendingPathComponent(entry.name)
+            let childImmutable = (entry.flags & UInt32(UF_IMMUTABLE)) != 0
+
+            if entry.objType == UInt32(VREG.rawValue) {
+                var fileBytes = entry.allocSize > 0
+                    ? UInt64(entry.allocSize)
+                    : UInt64(max(0, entry.dataLength))
+                if entry.linkCount > 1 {
+                    let key = FileInodeKey(dev: entry.dev, ino: ino_t(entry.fileID))
+                    if !sharedHardlinks.insertIfNew(key) {
+                        fileBytes = 0
+                        rootDedupHardlinks += 1
+                    }
+                }
+                rootFileBytes &+= fileBytes
+                rootFileCount += 1
+                sharedProgress.addDelta(
+                    files: 1,
+                    folders: 0,
+                    bytes: fileBytes,
+                    skippedSymlinks: 0,
+                    skippedDataless: 0,
+                    skippedCrossVolume: 0,
+                    deduplicatedHardlinks: 0,
+                    currentPath: rootPath
+                )
+                directRootFiles.append(DiskTreeNode(
+                    url: childURL,
+                    name: entry.name,
+                    isDirectory: false,
+                    isPackage: false,
+                    isSymlink: false,
+                    bytes: fileBytes,
+                    fileCount: 1,
+                    folderCount: 0,
+                    modificationDate: entry.modDate,
+                    accessDate: entry.accDate,
+                    children: [],
+                    isTruncated: false,
+                    truncatedChildCount: 0,
+                    isAccessible: true,
+                    isProtected: false,
+                    isUserImmutable: childImmutable,
+                    isHidden: childHidden,
+                    expectedCanonicalParent: canonicalSelf
+                ))
+            } else if entry.objType == UInt32(VDIR.rawValue) {
+                let slotIdx = topDirSlots.count
+                let childIsPkg = Self.detectIsPackage(at: childURL)
+                let childProtected = !safetyGuard.validateForRemoval(childURL).isAllowed
+
+                if maxDepth == 1 {
+                    topDirSlots.append(TopDirSlot(
+                        url: childURL,
+                        name: entry.name,
+                        isPackage: childIsPkg,
+                        modDate: entry.modDate,
+                        accDate: entry.accDate,
+                        isUserImmutable: childImmutable,
+                        isHidden: childHidden,
+                        isProtected: childProtected,
+                        canonicalSelf: "",
+                        directFiles: [],
+                        directFileBytes: 0,
+                        directFileCount: 0,
+                        isAccessible: true,
+                        completedSubdirNodes: [],
+                        pendingSubdirCount: 1,
+                        finishedNode: nil
+                    ))
+                    workUnits.append(WorkUnit(
+                        topSlotIndex: slotIdx,
+                        url: childURL,
+                        name: entry.name,
+                        depth: 1,
+                        modDate: entry.modDate,
+                        accDate: entry.accDate,
+                        isUserImmutable: childImmutable,
+                        isHidden: childHidden,
+                        expectedCanonicalParent: canonicalSelf
+                    ))
+                    sharedProgress.addDelta(
+                        files: 0,
+                        folders: 1,
+                        bytes: 0,
+                        skippedSymlinks: 0,
+                        skippedDataless: 0,
+                        skippedCrossVolume: 0,
+                        deduplicatedHardlinks: 0,
+                        currentPath: childURL.path
+                    )
+                } else {
+                    // Expand one level down (depth 1 -> depth 2) so giant folders like ~/Library
+                    // or ~/Projects fan out cleanly across all worker cores with zero deadlock risk.
+                    let subEntries: [RawDirEntry]
+                    do {
+                        subEntries = try readDirectoryEntries(at: childURL, expectedDevice: rootDevice, scratch: rootScratch)
+                    } catch let scanErr as DiskScanError {
+                        switch scanErr {
+                        case .permissionDenied:
+                            let inaccessible = DiskTreeNode(
+                                url: childURL,
+                                name: entry.name,
+                                isDirectory: true,
+                                isPackage: childIsPkg,
+                                isSymlink: false,
+                                bytes: 0,
+                                fileCount: 0,
+                                folderCount: 0,
+                                modificationDate: entry.modDate,
+                                accessDate: entry.accDate,
+                                children: [],
+                                isTruncated: true,
+                                truncatedChildCount: 0,
+                                isAccessible: false,
+                                isProtected: childProtected,
+                                isUserImmutable: childImmutable,
+                                isHidden: childHidden,
+                                expectedCanonicalParent: canonicalSelf
+                            )
+                            topDirSlots.append(TopDirSlot(
+                                url: childURL,
+                                name: entry.name,
+                                isPackage: childIsPkg,
+                                modDate: entry.modDate,
+                                accDate: entry.accDate,
+                                isUserImmutable: childImmutable,
+                                isHidden: childHidden,
+                                isProtected: childProtected,
+                                canonicalSelf: "",
+                                directFiles: [],
+                                directFileBytes: 0,
+                                directFileCount: 0,
+                                isAccessible: false,
+                                completedSubdirNodes: [],
+                                pendingSubdirCount: 0,
+                                finishedNode: inaccessible
+                            ))
+                            sharedProgress.addDelta(
+                                files: 0,
+                                folders: 1,
+                                bytes: 0,
+                                skippedSymlinks: 0,
+                                skippedDataless: 0,
+                                skippedCrossVolume: 0,
+                                deduplicatedHardlinks: 0,
+                                currentPath: childURL.path
+                            )
+                            continue
+                        case .notFound, .invalidPath:
+                            continue
+                        default:
+                            throw scanErr
+                        }
+                    }
+
+                    let subCanonicalSelf = PrivilegedExecutor.canonicalParentPath(for: childURL.path)
+                    var subFiles: [DiskTreeNode] = []
+                    var subFileBytes: UInt64 = 0
+                    var subFileCount = 0
+                    var subDirWorkCount = 0
+                    var subSkipSym = 0
+                    var subSkipDataless = 0
+                    var subSkipXVol = 0
+                    var subDedup = 0
+
+                    for sub in subEntries {
+                        rootVisitedCount += 1
+                        if (rootVisitedCount & 0x3F) == 0, cancelFlag.isCancelled || Task.isCancelled {
+                            throw CancellationError()
+                        }
+                        if Self.shouldSkipSpecialRootChild(name: sub.name, parentPath: childURL.path, scanRootPath: rootPath) {
+                            subSkipXVol += 1
+                            continue
+                        }
+                        if sub.objType == UInt32(VLNK.rawValue) {
+                            subSkipSym += 1
+                            continue
+                        }
+                        if (sub.flags & UInt32(SF_DATALESS)) != 0 {
+                            subSkipDataless += 1
+                            continue
+                        }
+                        if sub.dev != rootDevice {
+                            subSkipXVol += 1
+                            continue
+                        }
+                        if sub.objType == UInt32(VDIR.rawValue),
+                           (sub.dirMountStatus & UInt32(DIR_MNTSTATUS_MNTPOINT)) != 0 {
+                            subSkipXVol += 1
+                            continue
+                        }
+
+                        let subHidden = Self.isEntryHidden(name: sub.name, flags: sub.flags)
+                        if !includeHiddenFiles && subHidden {
+                            continue
+                        }
+
+                        let subURL = childURL.appendingPathComponent(sub.name)
+                        let subImmutable = (sub.flags & UInt32(UF_IMMUTABLE)) != 0
+
+                        if sub.objType == UInt32(VREG.rawValue) {
+                            var fileBytes = sub.allocSize > 0
+                                ? UInt64(sub.allocSize)
+                                : UInt64(max(0, sub.dataLength))
+                            if sub.linkCount > 1 {
+                                let key = FileInodeKey(dev: sub.dev, ino: ino_t(sub.fileID))
+                                if !sharedHardlinks.insertIfNew(key) {
+                                    fileBytes = 0
+                                    subDedup += 1
+                                }
+                            }
+                            subFileBytes &+= fileBytes
+                            subFileCount += 1
+                            subFiles.append(DiskTreeNode(
+                                url: subURL,
+                                name: sub.name,
+                                isDirectory: false,
+                                isPackage: false,
+                                isSymlink: false,
+                                bytes: fileBytes,
+                                fileCount: 1,
+                                folderCount: 0,
+                                modificationDate: sub.modDate,
+                                accessDate: sub.accDate,
+                                children: [],
+                                isTruncated: false,
+                                truncatedChildCount: 0,
+                                isAccessible: true,
+                                isProtected: false,
+                                isUserImmutable: subImmutable,
+                                isHidden: subHidden,
+                                expectedCanonicalParent: subCanonicalSelf
+                            ))
+                        } else if sub.objType == UInt32(VDIR.rawValue) {
+                            subDirWorkCount += 1
+                            workUnits.append(WorkUnit(
+                                topSlotIndex: slotIdx,
+                                url: subURL,
+                                name: sub.name,
+                                depth: 2,
+                                modDate: sub.modDate,
+                                accDate: sub.accDate,
+                                isUserImmutable: subImmutable,
+                                isHidden: subHidden,
+                                expectedCanonicalParent: subCanonicalSelf
+                            ))
+                        }
+                    }
+
+                    sharedProgress.addDelta(
+                        files: subFileCount,
+                        folders: 1,
+                        bytes: subFileBytes,
+                        skippedSymlinks: subSkipSym,
+                        skippedDataless: subSkipDataless,
+                        skippedCrossVolume: subSkipXVol,
+                        deduplicatedHardlinks: subDedup,
+                        currentPath: childURL.path
+                    )
+                    if cancelFlag.isCancelled || Task.isCancelled {
+                        throw CancellationError()
+                    }
+
+                    let finishedIfNoSubdirs: DiskTreeNode?
+                    if subDirWorkCount == 0 {
+                        subFiles.sort { lhs, rhs in
+                            if lhs.bytes != rhs.bytes { return lhs.bytes > rhs.bytes }
+                            return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+                        }
+                        let trunc = subFiles.count > maxChildrenPerDirectory
+                        let kept = (trunc ? Array(subFiles.prefix(maxChildrenPerDirectory)) : subFiles)
+                            .map { $0.updatingProtection(using: safetyGuard) }
+                        finishedIfNoSubdirs = DiskTreeNode(
+                            url: childURL,
+                            name: entry.name,
+                            isDirectory: true,
+                            isPackage: childIsPkg,
+                            isSymlink: false,
+                            bytes: subFileBytes,
+                            fileCount: subFileCount,
+                            folderCount: 0,
+                            modificationDate: entry.modDate,
+                            accessDate: entry.accDate,
+                            children: kept,
+                            isTruncated: trunc,
+                            truncatedChildCount: trunc ? (subFiles.count - maxChildrenPerDirectory) : 0,
+                            isAccessible: true,
+                            isProtected: childProtected,
+                            isUserImmutable: childImmutable,
+                            isHidden: childHidden,
+                            expectedCanonicalParent: canonicalSelf
+                        )
+                    } else {
+                        finishedIfNoSubdirs = nil
+                    }
+
+                    topDirSlots.append(TopDirSlot(
+                        url: childURL,
+                        name: entry.name,
+                        isPackage: childIsPkg,
+                        modDate: entry.modDate,
+                        accDate: entry.accDate,
+                        isUserImmutable: childImmutable,
+                        isHidden: childHidden,
+                        isProtected: childProtected,
+                        canonicalSelf: subCanonicalSelf,
+                        directFiles: subFiles,
+                        directFileBytes: subFileBytes,
+                        directFileCount: subFileCount,
+                        isAccessible: true,
+                        completedSubdirNodes: [],
+                        pendingSubdirCount: subDirWorkCount,
+                        finishedNode: finishedIfNoSubdirs
+                    ))
+                }
+            }
+        }
+
+        // Flush any skipped counters accumulated at the root level.
+        if rootSkippedSymlinks != 0 || rootSkippedDataless != 0 || rootSkippedCrossVolume != 0 || rootDedupHardlinks != 0 {
+            sharedProgress.addDelta(
+                files: 0,
+                folders: 0,
+                bytes: 0,
+                skippedSymlinks: rootSkippedSymlinks,
+                skippedDataless: rootSkippedDataless,
+                skippedCrossVolume: rootSkippedCrossVolume,
+                deduplicatedHardlinks: rootDedupHardlinks,
+                currentPath: rootPath
+            )
+        }
+        if cancelFlag.isCancelled || Task.isCancelled {
+            throw CancellationError()
+        }
+
+        // Annotate direct root files once (typically tiny count).
+        let annotatedDirectRootFiles = directRootFiles.map { $0.updatingProtection(using: safetyGuard) }
+        let capturedRootFileBytes = rootFileBytes
+        let capturedRootFileCount = rootFileCount
+        let capturedMaxChildren = maxChildrenPerDirectory
+
+        let buildSnapshot: @Sendable ([TopDirSlot], Bool) -> DiskTreeNode = { slots, isFinal in
+            var allChildren: [DiskTreeNode] = annotatedDirectRootFiles
+            allChildren.reserveCapacity(annotatedDirectRootFiles.count + slots.count)
+
+            var totalBytes = capturedRootFileBytes
+            var totalFiles = capturedRootFileCount
+            var totalFolders = 0
+
+            for slot in slots {
+                if let finished = slot.finishedNode {
+                    totalBytes &+= finished.bytes
+                    totalFiles += finished.fileCount
+                    totalFolders += 1 + finished.folderCount
+                    allChildren.append(finished)
+                } else {
+                    // Progressive in-flight node for live UI updates.
+                    var runningBytes = slot.directFileBytes
+                    var runningFiles = slot.directFileCount
+                    var runningFolders = 0
+                    for sub in slot.completedSubdirNodes {
+                        runningBytes &+= sub.bytes
+                        runningFiles += sub.fileCount
+                        runningFolders += 1 + sub.folderCount
+                    }
+                    totalBytes &+= runningBytes
+                    totalFiles += runningFiles
+                    totalFolders += 1 + runningFolders
+
+                    var partialSubChildren = slot.directFiles + slot.completedSubdirNodes
+                    partialSubChildren.sort { lhs, rhs in
+                        if lhs.bytes != rhs.bytes { return lhs.bytes > rhs.bytes }
+                        return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+                    }
+                    if partialSubChildren.count > capturedMaxChildren {
+                        partialSubChildren = Array(partialSubChildren.prefix(capturedMaxChildren))
+                    }
+                    allChildren.append(DiskTreeNode(
+                        url: slot.url,
+                        name: slot.name,
+                        isDirectory: true,
+                        isPackage: slot.isPackage,
+                        isSymlink: false,
+                        bytes: runningBytes,
+                        fileCount: runningFiles,
+                        folderCount: runningFolders,
+                        modificationDate: slot.modDate,
+                        accessDate: slot.accDate,
+                        children: partialSubChildren,
+                        isTruncated: false,
+                        truncatedChildCount: 0,
+                        isAccessible: slot.isAccessible,
+                        isProtected: slot.isProtected,
+                        isUserImmutable: slot.isUserImmutable,
+                        isHidden: slot.isHidden,
+                        expectedCanonicalParent: canonicalSelf
+                    ))
+                }
+            }
+
+            allChildren.sort { lhs, rhs in
+                if lhs.bytes != rhs.bytes { return lhs.bytes > rhs.bytes }
+                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+            }
+
+            let trunc = allChildren.count > capturedMaxChildren
+            let kept = trunc ? Array(allChildren.prefix(capturedMaxChildren)) : allChildren
+            _ = isFinal
+
+            return DiskTreeNode(
+                url: stdRoot,
+                name: displayName,
+                isDirectory: true,
+                isPackage: rootIsPackage,
+                isSymlink: false,
+                bytes: totalBytes,
+                fileCount: totalFiles,
+                folderCount: totalFolders,
+                modificationDate: rootMod,
+                accessDate: rootAcc,
+                children: kept,
+                isTruncated: trunc,
+                truncatedChildCount: trunc ? (allChildren.count - capturedMaxChildren) : 0,
+                isAccessible: true,
+                isProtected: rootProtected,
+                isUserImmutable: rootImmutable,
+                isHidden: rootHidden,
+                expectedCanonicalParent: rootParent
+            )
+        }
+
+        // Emit immediate skeleton snapshot (< 20 ms) so the UI renders top-level folders right away.
+        if let onPartialTree {
+            onPartialTree(buildSnapshot(topDirSlots, false))
+        }
+
+        if !workUnits.isEmpty {
+            final class ParallelCoordinator: @unchecked Sendable {
+                let lock = NSLock()
+                var nextUnitIndex = 0
+                var slots: [TopDirSlot]
+                var firstError: Error?
+                var lastPartialEmit: CFAbsoluteTime
+
+                init(slots: [TopDirSlot]) {
+                    self.slots = slots
+                    self.lastPartialEmit = CFAbsoluteTimeGetCurrent()
+                }
+            }
+
+            let coordinator = ParallelCoordinator(slots: topDirSlots)
+            let partialThrottle: TimeInterval = 0.22
+            let workerCount = min(workUnits.count, min(6, max(2, ProcessInfo.processInfo.activeProcessorCount)))
+            let unitsCopy = workUnits
+            let analyzer = self
+
+            DispatchQueue.concurrentPerform(iterations: workerCount) { _ in
+                let workerScratch = BulkReadScratch()
+                var workerSession = ScanSession(
+                    rootPath: rootPath,
+                    rootDevice: rootDevice,
+                    maxDepth: maxDepth,
+                    startTime: startTime,
+                    onProgress: onProgress,
+                    progressThrottleInterval: progressThrottleInterval,
+                    maxTotalEntries: nil,
+                    cancelFlag: cancelFlag,
+                    scratch: workerScratch,
+                    sharedHardlinks: sharedHardlinks,
+                    sharedProgress: sharedProgress
+                )
+
+                while true {
+                    if cancelFlag.isCancelled {
+                        break
+                    }
+                    coordinator.lock.lock()
+                    if coordinator.firstError != nil || coordinator.nextUnitIndex >= unitsCopy.count {
+                        coordinator.lock.unlock()
+                        break
+                    }
+                    let unit = unitsCopy[coordinator.nextUnitIndex]
+                    coordinator.nextUnitIndex += 1
+                    coordinator.lock.unlock()
+
+                    do {
+                        let rawNode = try analyzer.scanDirectory(
+                            dirURL: unit.url,
+                            dirName: unit.name,
+                            depth: unit.depth,
+                            modDate: unit.modDate,
+                            accDate: unit.accDate,
+                            isUserImmutable: unit.isUserImmutable,
+                            isHidden: unit.isHidden,
+                            expectedCanonicalParent: unit.expectedCanonicalParent,
+                            isRootCall: false,
+                            session: &workerSession
+                        )
+                        if rawNode != nil {
+                            if unit.depth >= 2 {
+                                workerSession.recordFolder()
+                            }
+                        }
+                        workerSession.flushSharedProgress(currentPath: unit.url.path)
+
+                        let annotatedNode = rawNode?.updatingProtection(using: analyzer.safetyGuard)
+                        var partialToEmit: DiskTreeNode?
+
+                        coordinator.lock.lock()
+                        let slotIdx = unit.topSlotIndex
+                        if unit.depth == 1 {
+                            coordinator.slots[slotIdx].pendingSubdirCount = 0
+                            if let annotatedNode {
+                                coordinator.slots[slotIdx].finishedNode = annotatedNode
+                            } else {
+                                coordinator.slots[slotIdx].isAccessible = false
+                            }
+                        } else {
+                            if let annotatedNode {
+                                coordinator.slots[slotIdx].completedSubdirNodes.append(annotatedNode)
+                            }
+                            coordinator.slots[slotIdx].pendingSubdirCount -= 1
+                            if coordinator.slots[slotIdx].pendingSubdirCount <= 0 {
+                                let slot = coordinator.slots[slotIdx]
+                                var combined = slot.directFiles + slot.completedSubdirNodes
+                                combined.sort { lhs, rhs in
+                                    if lhs.bytes != rhs.bytes { return lhs.bytes > rhs.bytes }
+                                    return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+                                }
+                                let trunc = combined.count > capturedMaxChildren
+                                let rawKept = trunc ? Array(combined.prefix(capturedMaxChildren)) : combined
+                                let kept = rawKept.map { node in
+                                    node.isDirectory ? node : node.updatingProtection(using: analyzer.safetyGuard)
+                                }
+                                let subBytes = slot.completedSubdirNodes.reduce(slot.directFileBytes) { $0 &+ $1.bytes }
+                                let subFiles = slot.completedSubdirNodes.reduce(slot.directFileCount) { $0 + $1.fileCount }
+                                let subFolders = slot.completedSubdirNodes.reduce(0) { $0 + 1 + $1.folderCount }
+
+                                coordinator.slots[slotIdx].finishedNode = DiskTreeNode(
+                                    url: slot.url,
+                                    name: slot.name,
+                                    isDirectory: true,
+                                    isPackage: slot.isPackage,
+                                    isSymlink: false,
+                                    bytes: subBytes,
+                                    fileCount: subFiles,
+                                    folderCount: subFolders,
+                                    modificationDate: slot.modDate,
+                                    accessDate: slot.accDate,
+                                    children: kept,
+                                    isTruncated: trunc,
+                                    truncatedChildCount: trunc ? (combined.count - capturedMaxChildren) : 0,
+                                    isAccessible: slot.isAccessible,
+                                    isProtected: slot.isProtected,
+                                    isUserImmutable: slot.isUserImmutable,
+                                    isHidden: slot.isHidden,
+                                    expectedCanonicalParent: canonicalSelf
+                                )
+                                coordinator.slots[slotIdx].directFiles = []
+                                coordinator.slots[slotIdx].completedSubdirNodes = []
+                            }
+                        }
+
+                        if onPartialTree != nil {
+                            let now = CFAbsoluteTimeGetCurrent()
+                            if now - coordinator.lastPartialEmit >= partialThrottle {
+                                coordinator.lastPartialEmit = now
+                                partialToEmit = buildSnapshot(coordinator.slots, false)
+                            }
+                        }
+                        coordinator.lock.unlock()
+
+                        if let partialToEmit, let onPartialTree {
+                            onPartialTree(partialToEmit)
+                        }
+                    } catch {
+                        coordinator.lock.lock()
+                        if coordinator.firstError == nil {
+                            coordinator.firstError = error
+                        }
+                        coordinator.lock.unlock()
+                        break
+                    }
+                }
+            }
+
+            if cancelFlag.isCancelled || Task.isCancelled {
+                throw CancellationError()
+            }
+            if let firstError = coordinator.firstError {
+                throw firstError
+            }
+            // Drop any depth-1 slot that vanished mid-scan when maxDepth == 1
+            topDirSlots = coordinator.slots.filter { $0.finishedNode != nil }
+        }
+
+        let finalTree = buildSnapshot(topDirSlots, true)
+        sharedProgress.emitFinal(currentPath: rootPath)
+        return finalTree
     }
 
     private func scanDirectory(
@@ -520,7 +1491,7 @@ public struct DiskSpaceAnalyzer: Sendable {
         modDate: Date?,
         accDate: Date?,
         isUserImmutable: Bool,
-        isProtected: Bool,
+        isHidden: Bool,
         expectedCanonicalParent: String,
         isRootCall: Bool,
         session: inout ScanSession
@@ -556,15 +1527,16 @@ public struct DiskSpaceAnalyzer: Sendable {
                 isTruncated: !collapsed.isAccessible || collapsed.hadAnyEntry || collapsed.hitGlobalCap,
                 truncatedChildCount: 0,
                 isAccessible: collapsed.isAccessible,
-                isProtected: isProtected,
+                isProtected: false,
                 isUserImmutable: isUserImmutable,
+                isHidden: isHidden,
                 expectedCanonicalParent: expectedCanonicalParent
             )
         }
 
         let entries: [RawDirEntry]
         do {
-            entries = try readDirectoryEntries(at: dirURL, expectedDevice: session.rootDevice)
+            entries = try readDirectoryEntries(at: dirURL, expectedDevice: session.rootDevice, scratch: session.scratch)
         } catch let scanErr as DiskScanError {
             if !isRootCall {
                 switch scanErr {
@@ -584,8 +1556,9 @@ public struct DiskSpaceAnalyzer: Sendable {
                         isTruncated: true,
                         truncatedChildCount: 0,
                         isAccessible: false,
-                        isProtected: isProtected,
+                        isProtected: false,
                         isUserImmutable: isUserImmutable,
+                        isHidden: isHidden,
                         expectedCanonicalParent: expectedCanonicalParent
                     )
                 case .notFound, .invalidPath:
@@ -622,33 +1595,37 @@ public struct DiskSpaceAnalyzer: Sendable {
                 parentPath: dirPath,
                 scanRootPath: session.rootPath
             ) {
-                session.skippedCrossVolume += 1
+                session.recordSkippedCrossVolume()
                 continue
             }
 
             if entry.objType == UInt32(VLNK.rawValue) {
-                session.skippedSymlinks += 1
+                session.recordSkippedSymlink()
                 continue
             }
 
             if (entry.flags & UInt32(SF_DATALESS)) != 0 {
-                session.skippedDataless += 1
+                session.recordSkippedDataless()
                 continue
             }
 
             if entry.dev != session.rootDevice {
-                session.skippedCrossVolume += 1
+                session.recordSkippedCrossVolume()
                 continue
             }
 
             if entry.objType == UInt32(VDIR.rawValue),
                (entry.dirMountStatus & UInt32(DIR_MNTSTATUS_MNTPOINT)) != 0 {
-                session.skippedCrossVolume += 1
+                session.recordSkippedCrossVolume()
+                continue
+            }
+
+            let childHidden = Self.isEntryHidden(name: entry.name, flags: entry.flags)
+            if !includeHiddenFiles && childHidden {
                 continue
             }
 
             let childURL = dirURL.appendingPathComponent(entry.name)
-            let childProtected = !safetyGuard.validateForRemoval(childURL).isAllowed
             let childImmutable = (entry.flags & UInt32(UF_IMMUTABLE)) != 0
 
             if entry.objType == UInt32(VREG.rawValue) {
@@ -658,14 +1635,13 @@ public struct DiskSpaceAnalyzer: Sendable {
 
                 if entry.linkCount > 1 {
                     let key = FileInodeKey(dev: entry.dev, ino: ino_t(entry.fileID))
-                    if !session.seenHardlinks.insert(key).inserted {
+                    if !session.insertHardlinkIfNew(key) {
                         fileBytes = 0
-                        session.deduplicatedHardlinks += 1
+                        session.recordDedupHardlink()
                     }
                 }
 
-                session.scannedFiles += 1
-                session.totalBytes &+= fileBytes
+                session.recordFile(bytes: fileBytes)
                 totalBytes &+= fileBytes
                 totalFiles += 1
 
@@ -684,8 +1660,9 @@ public struct DiskSpaceAnalyzer: Sendable {
                     isTruncated: false,
                     truncatedChildCount: 0,
                     isAccessible: true,
-                    isProtected: childProtected,
+                    isProtected: false,
                     isUserImmutable: childImmutable,
+                    isHidden: childHidden,
                     expectedCanonicalParent: canonicalSelf
                 ))
             } else if entry.objType == UInt32(VDIR.rawValue) {
@@ -696,12 +1673,12 @@ public struct DiskSpaceAnalyzer: Sendable {
                     modDate: entry.modDate,
                     accDate: entry.accDate,
                     isUserImmutable: childImmutable,
-                    isProtected: childProtected,
+                    isHidden: childHidden,
                     expectedCanonicalParent: canonicalSelf,
                     isRootCall: false,
                     session: &session
                 ) {
-                    session.scannedFolders += 1
+                    session.recordFolder()
                     totalBytes &+= childNode.bytes
                     totalFiles += childNode.fileCount
                     totalFolders += 1 + childNode.folderCount
@@ -740,8 +1717,9 @@ public struct DiskSpaceAnalyzer: Sendable {
             isTruncated: truncatedByChildCap || hitCapHere || session.hitGlobalCap,
             truncatedChildCount: truncatedCount,
             isAccessible: true,
-            isProtected: isProtected,
+            isProtected: false,
             isUserImmutable: isUserImmutable,
+            isHidden: isHidden,
             expectedCanonicalParent: expectedCanonicalParent
         )
     }
@@ -749,9 +1727,21 @@ public struct DiskSpaceAnalyzer: Sendable {
     private func measureCollapsedSubtree(
         at rootDirURL: URL,
         throwOnRootPermissionDenied: Bool = false,
+        includeHiddenOverride: Bool? = nil,
         session: inout ScanSession
     ) throws -> (bytes: UInt64, fileCount: Int, folderCount: Int, hadAnyEntry: Bool, hitGlobalCap: Bool, isAccessible: Bool, rootVanished: Bool) {
-        var stack: [URL] = [rootDirURL]
+        let allowHidden = includeHiddenOverride ?? includeHiddenFiles
+        let shouldUseBulk: Bool
+        switch enumerationMode {
+        case .automatic:
+            shouldUseBulk = (statProvider == nil)
+        case .bulkOnly:
+            shouldUseBulk = true
+        case .fallbackOnly:
+            shouldUseBulk = false
+        }
+
+        var stack: [String] = [rootDirURL.path]
         var totalBytes: UInt64 = 0
         var totalFiles = 0
         var totalFolders = 0
@@ -760,7 +1750,23 @@ public struct DiskSpaceAnalyzer: Sendable {
         var rootVanished = false
         var isFirst = true
 
-        while let currentURL = stack.popLast() {
+        var fastAlist = attrlist()
+        fastAlist.bitmapcount = UInt16(ATTR_BIT_MAP_COUNT)
+        fastAlist.commonattr = UInt32(ATTR_CMN_RETURNED_ATTRS)
+            | UInt32(ATTR_CMN_NAME)
+            | UInt32(ATTR_CMN_DEVID)
+            | UInt32(ATTR_CMN_OBJTYPE)
+            | UInt32(ATTR_CMN_FLAGS)
+            | UInt32(ATTR_CMN_FILEID)
+            | UInt32(ATTR_CMN_ERROR)
+        fastAlist.dirattr = UInt32(ATTR_DIR_MOUNTSTATUS)
+        fastAlist.fileattr = UInt32(ATTR_FILE_LINKCOUNT)
+            | UInt32(ATTR_FILE_ALLOCSIZE)
+            | UInt32(ATTR_FILE_DATALENGTH)
+
+        let rawBuf = session.scratch.buffer
+
+        while let currentPath = stack.popLast() {
             if session.cancelFlag.isCancelled || Task.isCancelled {
                 throw CancellationError()
             }
@@ -768,9 +1774,315 @@ public struct DiskSpaceAnalyzer: Sendable {
                 return (totalBytes, totalFiles, totalFolders, hadAnyEntry, true, rootAccessible, rootVanished)
             }
 
+            if shouldUseBulk {
+                let fd = open(currentPath, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+                if fd < 0 {
+                    let err = errno
+                    if err == EACCES || err == EPERM {
+                        if isFirst {
+                            if throwOnRootPermissionDenied {
+                                throw DiskScanError.permissionDenied(path: currentPath)
+                            }
+                            rootAccessible = false
+                        }
+                        isFirst = false
+                        continue
+                    }
+                    if err == ENOENT || err == ELOOP || err == ENOTDIR {
+                        if isFirst {
+                            if throwOnRootPermissionDenied {
+                                throw err == ENOENT
+                                    ? DiskScanError.notFound(path: currentPath)
+                                    : DiskScanError.invalidPath(path: currentPath)
+                            }
+                            rootVanished = true
+                        }
+                        isFirst = false
+                        continue
+                    }
+                    throw DiskScanError.posixError(code: err, path: currentPath, detail: String(cString: strerror(err)))
+                }
+
+                var ownsFD = true
+                defer {
+                    if ownsFD { close(fd) }
+                }
+
+                if statProvider == nil {
+                    var openedStat = stat()
+                    if fstat(fd, &openedStat) == 0, openedStat.st_dev != session.rootDevice {
+                        isFirst = false
+                        continue
+                    }
+                }
+
+                let needsSpecialRootCheck = (currentPath == "/" || currentPath == "/System/Volumes")
+                let pathPrefix = currentPath == "/" ? "/" : (currentPath + "/")
+                var firstBatch = true
+                var fellBack = false
+
+                while true {
+                    let count = getattrlistbulk(fd, &fastAlist, rawBuf.baseAddress, rawBuf.count, 0)
+                    if count == 0 { break }
+                    if count < 0 {
+                        let err = errno
+                        if firstBatch && (err == ENOTSUP || err == EINVAL || err == ERANGE) {
+                            if enumerationMode == .bulkOnly {
+                                throw DiskScanError.posixError(code: ENOTSUP, path: currentPath, detail: "getattrlistbulk not supported")
+                            }
+                            fellBack = true
+                            break
+                        }
+                        if err == EACCES || err == EPERM {
+                            if isFirst {
+                                if throwOnRootPermissionDenied {
+                                    throw DiskScanError.permissionDenied(path: currentPath)
+                                }
+                                rootAccessible = false
+                            }
+                            break
+                        }
+                        if err == ENOENT {
+                            if isFirst {
+                                if throwOnRootPermissionDenied {
+                                    throw DiskScanError.notFound(path: currentPath)
+                                }
+                                rootVanished = true
+                            }
+                            break
+                        }
+                        throw DiskScanError.posixError(code: err, path: currentPath, detail: String(cString: strerror(err)))
+                    }
+                    firstBatch = false
+
+                    guard let base = rawBuf.baseAddress else { break }
+                    var entryOffset = 0
+                    for _ in 0..<Int(count) {
+                        guard entryOffset + 4 <= rawBuf.count else { break }
+                        let entryStart = base.advanced(by: entryOffset)
+                        let entryLength = Int(entryStart.loadUnaligned(as: UInt32.self))
+                        guard entryLength >= 4, entryOffset + entryLength <= rawBuf.count else { break }
+                        entryOffset += entryLength
+
+                        var cursor = entryStart.advanced(by: 4)
+                        let entryEnd = entryStart.advanced(by: entryLength)
+
+                        guard cursor.advanced(by: MemoryLayout<attribute_set_t>.size) <= entryEnd else { continue }
+                        let returned = cursor.loadUnaligned(as: attribute_set_t.self)
+                        cursor = cursor.advanced(by: MemoryLayout<attribute_set_t>.size)
+
+                        var nameSliceStart: UnsafeRawPointer?
+                        var nameSliceLen = 0
+                        if (returned.commonattr & UInt32(ATTR_CMN_NAME)) != 0 {
+                            guard cursor.advanced(by: MemoryLayout<attrreference_t>.size) <= entryEnd else { continue }
+                            let refPtr = cursor
+                            let nameRef = refPtr.loadUnaligned(as: attrreference_t.self)
+                            cursor = cursor.advanced(by: MemoryLayout<attrreference_t>.size)
+                            let strStart = refPtr.advanced(by: Int(nameRef.attr_dataoffset))
+                            let strLen = Int(nameRef.attr_length)
+                            if strStart >= entryStart && strStart.advanced(by: strLen) <= entryEnd && strLen > 0 {
+                                nameSliceStart = UnsafeRawPointer(strStart)
+                                nameSliceLen = strLen
+                            }
+                        }
+
+                        var dev: dev_t = 0
+                        if (returned.commonattr & UInt32(ATTR_CMN_DEVID)) != 0 {
+                            guard cursor.advanced(by: MemoryLayout<dev_t>.size) <= entryEnd else { continue }
+                            dev = cursor.loadUnaligned(as: dev_t.self)
+                            cursor = cursor.advanced(by: MemoryLayout<dev_t>.size)
+                        }
+
+                        var objType: UInt32 = 0
+                        if (returned.commonattr & UInt32(ATTR_CMN_OBJTYPE)) != 0 {
+                            guard cursor.advanced(by: MemoryLayout<fsobj_type_t>.size) <= entryEnd else { continue }
+                            objType = cursor.loadUnaligned(as: UInt32.self)
+                            cursor = cursor.advanced(by: MemoryLayout<fsobj_type_t>.size)
+                        }
+
+                        var flags: UInt32 = 0
+                        if (returned.commonattr & UInt32(ATTR_CMN_FLAGS)) != 0 {
+                            guard cursor.advanced(by: MemoryLayout<UInt32>.size) <= entryEnd else { continue }
+                            flags = cursor.loadUnaligned(as: UInt32.self)
+                            cursor = cursor.advanced(by: MemoryLayout<UInt32>.size)
+                        }
+
+                        var fileID: UInt64 = 0
+                        if (returned.commonattr & UInt32(ATTR_CMN_FILEID)) != 0 {
+                            guard cursor.advanced(by: MemoryLayout<UInt64>.size) <= entryEnd else { continue }
+                            fileID = cursor.loadUnaligned(as: UInt64.self)
+                            cursor = cursor.advanced(by: MemoryLayout<UInt64>.size)
+                        }
+
+                        var entryError: UInt32 = 0
+                        if (returned.commonattr & UInt32(ATTR_CMN_ERROR)) != 0 {
+                            guard cursor.advanced(by: MemoryLayout<UInt32>.size) <= entryEnd else { continue }
+                            entryError = cursor.loadUnaligned(as: UInt32.self)
+                            cursor = cursor.advanced(by: MemoryLayout<UInt32>.size)
+                        }
+
+                        var dirMountStatus: UInt32 = 0
+                        if (returned.dirattr & UInt32(ATTR_DIR_MOUNTSTATUS)) != 0 {
+                            guard cursor.advanced(by: MemoryLayout<UInt32>.size) <= entryEnd else { continue }
+                            dirMountStatus = cursor.loadUnaligned(as: UInt32.self)
+                            cursor = cursor.advanced(by: MemoryLayout<UInt32>.size)
+                        }
+
+                        var linkCount: UInt32 = 1
+                        if (returned.fileattr & UInt32(ATTR_FILE_LINKCOUNT)) != 0 {
+                            guard cursor.advanced(by: MemoryLayout<UInt32>.size) <= entryEnd else { continue }
+                            linkCount = cursor.loadUnaligned(as: UInt32.self)
+                            cursor = cursor.advanced(by: MemoryLayout<UInt32>.size)
+                        }
+
+                        var allocSize: Int64 = 0
+                        if (returned.fileattr & UInt32(ATTR_FILE_ALLOCSIZE)) != 0 {
+                            guard cursor.advanced(by: MemoryLayout<off_t>.size) <= entryEnd else { continue }
+                            allocSize = cursor.loadUnaligned(as: off_t.self)
+                            cursor = cursor.advanced(by: MemoryLayout<off_t>.size)
+                        }
+
+                        var dataLength: Int64 = 0
+                        if (returned.fileattr & UInt32(ATTR_FILE_DATALENGTH)) != 0 {
+                            guard cursor.advanced(by: MemoryLayout<off_t>.size) <= entryEnd else { continue }
+                            dataLength = cursor.loadUnaligned(as: off_t.self)
+                            cursor = cursor.advanced(by: MemoryLayout<off_t>.size)
+                        }
+
+                        guard let nStart = nameSliceStart, nameSliceLen > 0 else { continue }
+                        let firstByte = nStart.load(as: UInt8.self)
+                        if firstByte == 0 { continue }
+                        if firstByte == 0x2E { // '.'
+                            let trimmed = UnsafeRawBufferPointer(start: nStart, count: nameSliceLen).firstIndex(of: 0) ?? nameSliceLen
+                            if trimmed == 1 || (trimmed == 2 && nStart.advanced(by: 1).load(as: UInt8.self) == 0x2E) {
+                                continue
+                            }
+                        }
+                        if entryError != 0 && objType == 0 { continue }
+
+                        if session.hitGlobalCap {
+                            return (totalBytes, totalFiles, totalFolders, hadAnyEntry, true, rootAccessible, rootVanished)
+                        }
+                        try session.recordVisitedEntry(currentPath: currentPath)
+                        if session.hitGlobalCap {
+                            return (totalBytes, totalFiles, totalFolders, hadAnyEntry, true, rootAccessible, rootVanished)
+                        }
+
+                        if needsSpecialRootCheck {
+                            let bytes = UnsafeRawBufferPointer(start: nStart, count: nameSliceLen)
+                            let trimmed = bytes.firstIndex(of: 0) ?? bytes.count
+                            let nameStr = String(decoding: bytes.prefix(trimmed), as: UTF8.self)
+                            if Self.shouldSkipSpecialRootChild(name: nameStr, parentPath: currentPath, scanRootPath: session.rootPath) {
+                                session.recordSkippedCrossVolume()
+                                continue
+                            }
+                        }
+
+                        if objType == UInt32(VLNK.rawValue) {
+                            session.recordSkippedSymlink()
+                            continue
+                        }
+                        if (flags & UInt32(SF_DATALESS)) != 0 {
+                            session.recordSkippedDataless()
+                            continue
+                        }
+                        if dev != session.rootDevice {
+                            session.recordSkippedCrossVolume()
+                            continue
+                        }
+                        if objType == UInt32(VDIR.rawValue),
+                           (dirMountStatus & UInt32(DIR_MNTSTATUS_MNTPOINT)) != 0 {
+                            session.recordSkippedCrossVolume()
+                            continue
+                        }
+                        if !allowHidden && (firstByte == 0x2E || (flags & UInt32(UF_HIDDEN)) != 0) {
+                            continue
+                        }
+
+                        if objType == UInt32(VREG.rawValue) {
+                            hadAnyEntry = true
+                            var fileBytes = allocSize > 0
+                                ? UInt64(allocSize)
+                                : UInt64(max(0, dataLength))
+                            if linkCount > 1 {
+                                let key = FileInodeKey(dev: dev, ino: ino_t(fileID))
+                                if !session.insertHardlinkIfNew(key) {
+                                    fileBytes = 0
+                                    session.recordDedupHardlink()
+                                }
+                            }
+                            session.recordFile(bytes: fileBytes)
+                            totalBytes &+= fileBytes
+                            totalFiles += 1
+                        } else if objType == UInt32(VDIR.rawValue) {
+                            hadAnyEntry = true
+                            session.recordFolder()
+                            totalFolders += 1
+                            let bytes = UnsafeRawBufferPointer(start: nStart, count: nameSliceLen)
+                            let trimmed = bytes.firstIndex(of: 0) ?? bytes.count
+                            let nameStr = String(decoding: bytes.prefix(trimmed), as: UTF8.self)
+                            stack.append(pathPrefix + nameStr)
+                        }
+                    }
+                }
+
+                if !fellBack {
+                    isFirst = false
+                    continue
+                }
+                _ = lseek(fd, 0, SEEK_SET)
+                let fallbackEntries = try readDirectoryEntriesFallback(
+                    dirFD: fd,
+                    ownsFD: &ownsFD,
+                    dirURL: URL(fileURLWithPath: currentPath)
+                )
+                isFirst = false
+                for entry in fallbackEntries {
+                    if session.hitGlobalCap {
+                        return (totalBytes, totalFiles, totalFolders, hadAnyEntry, true, rootAccessible, rootVanished)
+                    }
+                    try session.recordVisitedEntry(currentPath: currentPath)
+                    if session.hitGlobalCap {
+                        return (totalBytes, totalFiles, totalFolders, hadAnyEntry, true, rootAccessible, rootVanished)
+                    }
+                    if Self.shouldSkipSpecialRootChild(name: entry.name, parentPath: currentPath, scanRootPath: session.rootPath) {
+                        session.recordSkippedCrossVolume()
+                        continue
+                    }
+                    if entry.objType == UInt32(VLNK.rawValue) { session.recordSkippedSymlink(); continue }
+                    if (entry.flags & UInt32(SF_DATALESS)) != 0 { session.recordSkippedDataless(); continue }
+                    if entry.dev != session.rootDevice { session.recordSkippedCrossVolume(); continue }
+                    if entry.objType == UInt32(VDIR.rawValue), (entry.dirMountStatus & UInt32(DIR_MNTSTATUS_MNTPOINT)) != 0 {
+                        session.recordSkippedCrossVolume()
+                        continue
+                    }
+                    if !allowHidden && Self.isEntryHidden(name: entry.name, flags: entry.flags) {
+                        continue
+                    }
+                    if entry.objType == UInt32(VREG.rawValue) {
+                        hadAnyEntry = true
+                        var fileBytes = entry.allocSize > 0 ? UInt64(entry.allocSize) : UInt64(max(0, entry.dataLength))
+                        if entry.linkCount > 1 {
+                            let key = FileInodeKey(dev: entry.dev, ino: ino_t(entry.fileID))
+                            if !session.insertHardlinkIfNew(key) { fileBytes = 0; session.recordDedupHardlink() }
+                        }
+                        session.recordFile(bytes: fileBytes)
+                        totalBytes &+= fileBytes
+                        totalFiles += 1
+                    } else if entry.objType == UInt32(VDIR.rawValue) {
+                        hadAnyEntry = true
+                        session.recordFolder()
+                        totalFolders += 1
+                        stack.append(pathPrefix + entry.name)
+                    }
+                }
+                continue
+            }
+
+            let currentURL = URL(fileURLWithPath: currentPath)
             let entries: [RawDirEntry]
             do {
-                entries = try readDirectoryEntries(at: currentURL, expectedDevice: session.rootDevice)
+                entries = try readDirectoryEntries(at: currentURL, expectedDevice: session.rootDevice, scratch: session.scratch)
             } catch let scanErr as DiskScanError {
                 switch scanErr {
                 case .permissionDenied:
@@ -797,7 +2109,7 @@ public struct DiskSpaceAnalyzer: Sendable {
             }
             isFirst = false
 
-            let currentPath = currentURL.path
+            let pathPrefix = currentPath == "/" ? "/" : (currentPath + "/")
             for entry in entries {
                 if session.hitGlobalCap {
                     return (totalBytes, totalFiles, totalFolders, hadAnyEntry, true, rootAccessible, rootVanished)
@@ -812,25 +2124,28 @@ public struct DiskSpaceAnalyzer: Sendable {
                     parentPath: currentPath,
                     scanRootPath: session.rootPath
                 ) {
-                    session.skippedCrossVolume += 1
+                    session.recordSkippedCrossVolume()
                     continue
                 }
 
                 if entry.objType == UInt32(VLNK.rawValue) {
-                    session.skippedSymlinks += 1
+                    session.recordSkippedSymlink()
                     continue
                 }
                 if (entry.flags & UInt32(SF_DATALESS)) != 0 {
-                    session.skippedDataless += 1
+                    session.recordSkippedDataless()
                     continue
                 }
                 if entry.dev != session.rootDevice {
-                    session.skippedCrossVolume += 1
+                    session.recordSkippedCrossVolume()
                     continue
                 }
                 if entry.objType == UInt32(VDIR.rawValue),
                    (entry.dirMountStatus & UInt32(DIR_MNTSTATUS_MNTPOINT)) != 0 {
-                    session.skippedCrossVolume += 1
+                    session.recordSkippedCrossVolume()
+                    continue
+                }
+                if !allowHidden && Self.isEntryHidden(name: entry.name, flags: entry.flags) {
                     continue
                 }
 
@@ -841,20 +2156,19 @@ public struct DiskSpaceAnalyzer: Sendable {
                         : UInt64(max(0, entry.dataLength))
                     if entry.linkCount > 1 {
                         let key = FileInodeKey(dev: entry.dev, ino: ino_t(entry.fileID))
-                        if !session.seenHardlinks.insert(key).inserted {
+                        if !session.insertHardlinkIfNew(key) {
                             fileBytes = 0
-                            session.deduplicatedHardlinks += 1
+                            session.recordDedupHardlink()
                         }
                     }
-                    session.scannedFiles += 1
-                    session.totalBytes &+= fileBytes
+                    session.recordFile(bytes: fileBytes)
                     totalBytes &+= fileBytes
                     totalFiles += 1
                 } else if entry.objType == UInt32(VDIR.rawValue) {
                     hadAnyEntry = true
-                    session.scannedFolders += 1
+                    session.recordFolder()
                     totalFolders += 1
-                    stack.append(currentURL.appendingPathComponent(entry.name))
+                    stack.append(pathPrefix + entry.name)
                 }
             }
         }
@@ -879,7 +2193,9 @@ public struct DiskSpaceAnalyzer: Sendable {
             days > 0 ? referenceDate.addingTimeInterval(-TimeInterval(days) * 86_400) : nil
         }
         let query = filter.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let allowHidden = includeHiddenFiles && filter.includeHiddenFiles
 
+        let scratch = BulkReadScratch()
         var session = ScanSession(
             rootPath: stdRoot.path,
             rootDevice: rootStat.st_dev,
@@ -888,7 +2204,10 @@ public struct DiskSpaceAnalyzer: Sendable {
             onProgress: onProgress,
             progressThrottleInterval: progressThrottleInterval,
             maxTotalEntries: maxTotalEntries,
-            cancelFlag: cancelFlag
+            cancelFlag: cancelFlag,
+            scratch: scratch,
+            sharedHardlinks: nil,
+            sharedProgress: nil
         )
         session.lastEmitTime = session.startTime
 
@@ -902,7 +2221,9 @@ public struct DiskSpaceAnalyzer: Sendable {
             let accDate = Self.dateFromTimespec(rootStat.st_atimespec)
             let isProtected = !safetyGuard.validateForRemoval(stdRoot).isAllowed
             let isImmutable = (rootStat.st_flags & UInt32(UF_IMMUTABLE)) != 0
-            if bytes >= filter.minBytes,
+            let isHidden = Self.isEntryHidden(name: stdRoot.lastPathComponent, flags: rootStat.st_flags)
+            if (allowHidden || !isHidden),
+               bytes >= filter.minBytes,
                !(filter.excludeProtected && isProtected),
                Self.matchesAge(modDate: modDate, accDate: accDate, cutoffDate: cutoffDate, basis: filter.ageBasis),
                Self.matchesSearch(name: stdRoot.lastPathComponent, relativePath: stdRoot.lastPathComponent, query: query) {
@@ -917,6 +2238,7 @@ public struct DiskSpaceAnalyzer: Sendable {
                     expectedCanonicalParent: PrivilegedExecutor.canonicalParentPath(forTargetURL: stdRoot),
                     isProtected: isProtected,
                     isUserImmutable: isImmutable,
+                    isHidden: isHidden,
                     relativePathFromRoot: stdRoot.lastPathComponent
                 ))
             }
@@ -933,6 +2255,8 @@ public struct DiskSpaceAnalyzer: Sendable {
             let accDate: Date?
             let isProtected: Bool
             let isUserImmutable: Bool
+            let isHidden: Bool
+            let hasHiddenAncestor: Bool
             let expectedCanonicalParent: String
             let relativePath: String
             let canonicalSelf: String
@@ -942,7 +2266,7 @@ public struct DiskSpaceAnalyzer: Sendable {
             var accumulatedBytes: UInt64 = 0
         }
 
-        let rootEntries = try readDirectoryEntries(at: stdRoot, expectedDevice: session.rootDevice)
+        let rootEntries = try readDirectoryEntries(at: stdRoot, expectedDevice: session.rootDevice, scratch: session.scratch)
         let rootCanonicalSelf = PrivilegedExecutor.canonicalParentPath(for: stdRoot.path)
         var frameStack: [FindDirFrame] = [
             FindDirFrame(
@@ -952,6 +2276,8 @@ public struct DiskSpaceAnalyzer: Sendable {
                 accDate: nil,
                 isProtected: false,
                 isUserImmutable: false,
+                isHidden: false,
+                hasHiddenAncestor: false,
                 expectedCanonicalParent: "",
                 relativePath: "",
                 canonicalSelf: rootCanonicalSelf,
@@ -980,31 +2306,33 @@ public struct DiskSpaceAnalyzer: Sendable {
                     parentPath: frame.url.path,
                     scanRootPath: session.rootPath
                 ) {
-                    session.skippedCrossVolume += 1
+                    session.recordSkippedCrossVolume()
                     continue
                 }
 
                 if entry.objType == UInt32(VLNK.rawValue) {
-                    session.skippedSymlinks += 1
+                    session.recordSkippedSymlink()
                     continue
                 }
                 if (entry.flags & UInt32(SF_DATALESS)) != 0 {
-                    session.skippedDataless += 1
+                    session.recordSkippedDataless()
                     continue
                 }
                 if entry.dev != session.rootDevice {
-                    session.skippedCrossVolume += 1
+                    session.recordSkippedCrossVolume()
                     continue
                 }
                 if entry.objType == UInt32(VDIR.rawValue),
                    (entry.dirMountStatus & UInt32(DIR_MNTSTATUS_MNTPOINT)) != 0 {
-                    session.skippedCrossVolume += 1
+                    session.recordSkippedCrossVolume()
                     continue
                 }
 
-                let childURL = frame.url.appendingPathComponent(entry.name)
-                let relPath = Self.relativePath(of: childURL.path, under: stdRoot.path)
-                let childProtected = !safetyGuard.validateForRemoval(childURL).isAllowed
+                let entryHidden = Self.isEntryHidden(name: entry.name, flags: entry.flags)
+                if !allowHidden && entryHidden {
+                    continue
+                }
+                let effectiveHidden = entryHidden || frame.hasHiddenAncestor
                 let childImmutable = (entry.flags & UInt32(UF_IMMUTABLE)) != 0
 
                 if entry.objType == UInt32(VREG.rawValue) {
@@ -1013,65 +2341,79 @@ public struct DiskSpaceAnalyzer: Sendable {
                         : UInt64(max(0, entry.dataLength))
                     if entry.linkCount > 1 {
                         let key = FileInodeKey(dev: entry.dev, ino: ino_t(entry.fileID))
-                        if !session.seenHardlinks.insert(key).inserted {
+                        if !session.insertHardlinkIfNew(key) {
                             fileBytes = 0
-                            session.deduplicatedHardlinks += 1
+                            session.recordDedupHardlink()
                         }
                     }
-                    session.scannedFiles += 1
-                    session.totalBytes &+= fileBytes
+                    session.recordFile(bytes: fileBytes)
                     frame.accumulatedBytes &+= fileBytes
 
                     if fileBytes >= filter.minBytes,
-                       !(filter.excludeProtected && childProtected),
-                       Self.matchesAge(modDate: entry.modDate, accDate: entry.accDate, cutoffDate: cutoffDate, basis: filter.ageBasis),
-                       Self.matchesSearch(name: entry.name, relativePath: relPath, query: query) {
-                        results.append(DiskFilteredItem(
-                            url: childURL,
-                            name: entry.name,
-                            isDirectory: false,
-                            isPackage: false,
-                            bytes: fileBytes,
-                            modificationDate: entry.modDate,
-                            accessDate: entry.accDate,
-                            expectedCanonicalParent: frame.canonicalSelf,
-                            isProtected: childProtected,
-                            isUserImmutable: childImmutable,
-                            relativePathFromRoot: relPath
-                        ))
+                       Self.matchesAge(modDate: entry.modDate, accDate: entry.accDate, cutoffDate: cutoffDate, basis: filter.ageBasis) {
+                        let relPath = frame.relativePath.isEmpty ? entry.name : "\(frame.relativePath)/\(entry.name)"
+                        if Self.matchesSearch(name: entry.name, relativePath: relPath, query: query) {
+                            let childURL = frame.url.appendingPathComponent(entry.name)
+                            let childProtected = !safetyGuard.validateForRemoval(childURL).isAllowed
+                            if !(filter.excludeProtected && childProtected) {
+                                results.append(DiskFilteredItem(
+                                    url: childURL,
+                                    name: entry.name,
+                                    isDirectory: false,
+                                    isPackage: false,
+                                    bytes: fileBytes,
+                                    modificationDate: entry.modDate,
+                                    accessDate: entry.accDate,
+                                    expectedCanonicalParent: frame.canonicalSelf,
+                                    isProtected: childProtected,
+                                    isUserImmutable: childImmutable,
+                                    isHidden: effectiveHidden,
+                                    relativePathFromRoot: relPath
+                                ))
+                            }
+                        }
                     }
                 } else if entry.objType == UInt32(VDIR.rawValue) {
-                    session.scannedFolders += 1
+                    session.recordFolder()
+                    let childURL = frame.url.appendingPathComponent(entry.name)
+                    let relPath = frame.relativePath.isEmpty ? entry.name : "\(frame.relativePath)/\(entry.name)"
                     let isPkg = Self.detectIsPackage(at: childURL)
                     if isPkg {
                         // Measure package sharing `session` (seenHardlinks, maxTotalEntries, hitGlobalCap).
                         // Never descend into `.app` packages for `.filesOnly` item emission.
-                        let pkgMeas = try measureCollapsedSubtree(at: childURL, session: &session)
+                        let pkgMeas = try measureCollapsedSubtree(
+                            at: childURL,
+                            includeHiddenOverride: allowHidden,
+                            session: &session
+                        )
                         frame.accumulatedBytes &+= pkgMeas.bytes
 
                         if (filter.scope == .filesAndPackages || filter.scope == .allItems),
                            pkgMeas.bytes >= filter.minBytes,
-                           !(filter.excludeProtected && childProtected),
                            Self.matchesAge(modDate: entry.modDate, accDate: entry.accDate, cutoffDate: cutoffDate, basis: filter.ageBasis),
                            Self.matchesSearch(name: entry.name, relativePath: relPath, query: query) {
-                            results.append(DiskFilteredItem(
-                                url: childURL,
-                                name: entry.name,
-                                isDirectory: true,
-                                isPackage: true,
-                                bytes: pkgMeas.bytes,
-                                modificationDate: entry.modDate,
-                                accessDate: entry.accDate,
-                                expectedCanonicalParent: frame.canonicalSelf,
-                                isProtected: childProtected,
-                                isUserImmutable: childImmutable,
-                                relativePathFromRoot: relPath
-                            ))
+                            let childProtected = !safetyGuard.validateForRemoval(childURL).isAllowed
+                            if !(filter.excludeProtected && childProtected) {
+                                results.append(DiskFilteredItem(
+                                    url: childURL,
+                                    name: entry.name,
+                                    isDirectory: true,
+                                    isPackage: true,
+                                    bytes: pkgMeas.bytes,
+                                    modificationDate: entry.modDate,
+                                    accessDate: entry.accDate,
+                                    expectedCanonicalParent: frame.canonicalSelf,
+                                    isProtected: childProtected,
+                                    isUserImmutable: childImmutable,
+                                    isHidden: effectiveHidden,
+                                    relativePathFromRoot: relPath
+                                ))
+                            }
                         }
                     } else {
                         let childEntries: [RawDirEntry]
                         do {
-                            childEntries = try readDirectoryEntries(at: childURL, expectedDevice: session.rootDevice)
+                            childEntries = try readDirectoryEntries(at: childURL, expectedDevice: session.rootDevice, scratch: session.scratch)
                         } catch let scanErr as DiskScanError {
                             switch scanErr {
                             case .permissionDenied:
@@ -1090,8 +2432,10 @@ public struct DiskSpaceAnalyzer: Sendable {
                             name: entry.name,
                             modDate: entry.modDate,
                             accDate: entry.accDate,
-                            isProtected: childProtected,
+                            isProtected: false,
                             isUserImmutable: childImmutable,
+                            isHidden: entryHidden,
+                            hasHiddenAncestor: effectiveHidden,
                             expectedCanonicalParent: frame.canonicalSelf,
                             relativePath: relPath,
                             canonicalSelf: childCanonicalSelf,
@@ -1111,22 +2455,25 @@ public struct DiskSpaceAnalyzer: Sendable {
             frameStack.removeLast()
             if frame.emitSelfWhenDone,
                frame.accumulatedBytes >= filter.minBytes,
-               !(filter.excludeProtected && frame.isProtected),
                Self.matchesAge(modDate: frame.modDate, accDate: frame.accDate, cutoffDate: cutoffDate, basis: filter.ageBasis),
                Self.matchesSearch(name: frame.name, relativePath: frame.relativePath, query: query) {
-                results.append(DiskFilteredItem(
-                    url: frame.url,
-                    name: frame.name,
-                    isDirectory: true,
-                    isPackage: false,
-                    bytes: frame.accumulatedBytes,
-                    modificationDate: frame.modDate,
-                    accessDate: frame.accDate,
-                    expectedCanonicalParent: frame.expectedCanonicalParent,
-                    isProtected: frame.isProtected,
-                    isUserImmutable: frame.isUserImmutable,
-                    relativePathFromRoot: frame.relativePath
-                ))
+                let frameProtected = !safetyGuard.validateForRemoval(frame.url).isAllowed
+                if !(filter.excludeProtected && frameProtected) {
+                    results.append(DiskFilteredItem(
+                        url: frame.url,
+                        name: frame.name,
+                        isDirectory: true,
+                        isPackage: false,
+                        bytes: frame.accumulatedBytes,
+                        modificationDate: frame.modDate,
+                        accessDate: frame.accDate,
+                        expectedCanonicalParent: frame.expectedCanonicalParent,
+                        isProtected: frameProtected,
+                        isUserImmutable: frame.isUserImmutable,
+                        isHidden: frame.hasHiddenAncestor,
+                        relativePathFromRoot: frame.relativePath
+                    ))
+                }
             }
             if !frameStack.isEmpty {
                 frameStack[frameStack.count - 1].accumulatedBytes &+= frame.accumulatedBytes
@@ -1162,7 +2509,11 @@ public struct DiskSpaceAnalyzer: Sendable {
         return st
     }
 
-    private func readDirectoryEntries(at dirURL: URL, expectedDevice: dev_t) throws -> [RawDirEntry] {
+    private func readDirectoryEntries(
+        at dirURL: URL,
+        expectedDevice: dev_t,
+        scratch: BulkReadScratch
+    ) throws -> [RawDirEntry] {
         let path = dirURL.path
         let fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
         if fd < 0 {
@@ -1199,7 +2550,7 @@ public struct DiskSpaceAnalyzer: Sendable {
 
         if shouldUseBulk {
             do {
-                return try readDirectoryEntriesBulk(dirFD: fd, dirPath: path)
+                return try readDirectoryEntriesBulk(dirFD: fd, dirPath: path, scratch: scratch)
             } catch let fallbackSignal as BulkUnsupportedError {
                 _ = fallbackSignal
                 if enumerationMode == .bulkOnly {
@@ -1215,7 +2566,11 @@ public struct DiskSpaceAnalyzer: Sendable {
 
     private struct BulkUnsupportedError: Error {}
 
-    private func readDirectoryEntriesBulk(dirFD: Int32, dirPath: String) throws -> [RawDirEntry] {
+    private func readDirectoryEntriesBulk(
+        dirFD: Int32,
+        dirPath: String,
+        scratch: BulkReadScratch
+    ) throws -> [RawDirEntry] {
         var alist = attrlist()
         alist.bitmapcount = UInt16(ATTR_BIT_MAP_COUNT)
 
@@ -1239,15 +2594,12 @@ public struct DiskSpaceAnalyzer: Sendable {
         fileAttr |= UInt32(ATTR_FILE_DATALENGTH)
         alist.fileattr = fileAttr
 
-        var buffer = [UInt8](repeating: 0, count: Self.bulkBufferSize)
+        let rawBuf = scratch.buffer
         var results: [RawDirEntry] = []
         var firstBatch = true
 
         while true {
-            let count = buffer.withUnsafeMutableBytes { rawBuf -> Int32 in
-                guard let base = rawBuf.baseAddress else { return -1 }
-                return getattrlistbulk(dirFD, &alist, base, rawBuf.count, 0)
-            }
+            let count = getattrlistbulk(dirFD, &alist, rawBuf.baseAddress, rawBuf.count, 0)
             if count == 0 {
                 break
             }
@@ -1266,8 +2618,8 @@ public struct DiskSpaceAnalyzer: Sendable {
             }
             firstBatch = false
 
-            buffer.withUnsafeBytes { rawBuf in
-                guard let base = rawBuf.baseAddress else { return }
+            guard let base = rawBuf.baseAddress else { break }
+            do {
                 var entryOffset = 0
                 for _ in 0..<Int(count) {
                     guard entryOffset + 4 <= rawBuf.count else { break }
@@ -1533,6 +2885,10 @@ public struct DiskSpaceAnalyzer: Sendable {
             return true
         }
         return false
+    }
+
+    private static func isEntryHidden(name: String, flags: UInt32) -> Bool {
+        name.hasPrefix(".") || (flags & UInt32(UF_HIDDEN)) != 0
     }
 
     private static func detectIsPackage(at url: URL) -> Bool {

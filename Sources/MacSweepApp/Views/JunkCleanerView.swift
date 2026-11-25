@@ -91,7 +91,7 @@ struct JunkCleanerView: View {
             // Summary Pill Card
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Text(ByteFormatter.format(store.totalJunkDiscoveredBytes))
+                    Text(ByteFormatter.format(store.totalVisibleJunkDiscoveredBytes))
                         .font(.system(size: 18, weight: .bold, design: .rounded))
                         .foregroundStyle(palette.primaryText)
                         .monospacedDigit()
@@ -177,31 +177,59 @@ struct JunkCleanerView: View {
                 .padding(.bottom, 8)
             }
 
-            // Search box
+            // Search box & Hidden Files toggle
             HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 12))
-                    .foregroundStyle(palette.tertiaryText)
-                TextField(l10n.searchPlaceholder, text: $store.junkSearchText)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 12.5))
-                    .foregroundStyle(palette.primaryText)
-                if !store.junkSearchText.isEmpty {
-                    Button { store.junkSearchText = "" } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 11))
-                            .foregroundStyle(palette.tertiaryText)
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 12))
+                        .foregroundStyle(palette.tertiaryText)
+                    TextField(l10n.searchPlaceholder, text: $store.junkSearchText)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(palette.primaryText)
+                    if !store.junkSearchText.isEmpty {
+                        Button { store.junkSearchText = "" } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 11))
+                                .foregroundStyle(palette.tertiaryText)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(palette.cardBackground.opacity(0.65))
+                        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(palette.border, lineWidth: 1))
+                )
+
+                Button {
+                    store.toggleJunkIncludeHidden()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: store.junkIncludeHidden ? "eye.fill" : "eye.slash")
+                            .font(.system(size: 10.5))
+                        Text(l10n.hiddenFilesChipLabel)
+                            .font(.system(size: 11, weight: store.junkIncludeHidden ? .semibold : .medium))
+                            .lineLimit(1)
+                    }
+                    .foregroundStyle(store.junkIncludeHidden ? palette.accent : palette.secondaryText)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(store.junkIncludeHidden ? palette.accent.opacity(0.14) : palette.cardBackground.opacity(0.65))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    .strokeBorder(store.junkIncludeHidden ? palette.activeBorder : palette.border, lineWidth: 1)
+                            )
+                    )
+                    .fixedSize(horizontal: true, vertical: false)
+                }
+                .buttonStyle(.plain)
+                .help(l10n.junkHiddenFilesHelp)
             }
-            .padding(.horizontal, 9)
-            .padding(.vertical, 6)
-            .background(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(palette.cardBackground.opacity(0.65))
-                    .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(palette.border, lineWidth: 1))
-            )
             .padding(.horizontal, 12)
             .padding(.bottom, 8)
 
@@ -233,12 +261,14 @@ struct JunkCleanerView: View {
     private func categoryRow(_ cat: JunkCategoryItem) -> some View {
         let isSelected = activeCategory?.id == cat.id
         let hasSelected = cat.selectedCount > 0
-        let allUnselectable = cat.entries.allSatisfy { $0.isProtected || $0.isRunningAppBlocked }
+        let visibleEntries = store.visibleEntries(for: cat)
+        let visibleBytes = store.visibleBytes(for: cat)
+        let allUnselectable = visibleEntries.allSatisfy { $0.isProtected || $0.isRunningAppBlocked }
 
         return HStack(spacing: 7) {
             SweepCheckbox(
                 isChecked: hasSelected,
-                isDisabled: cat.entries.isEmpty || allUnselectable,
+                isDisabled: visibleEntries.isEmpty || allUnselectable,
                 palette: palette
             ) {
                 store.toggleJunkCategory(categoryID: cat.id, selected: !hasSelected)
@@ -264,7 +294,7 @@ struct JunkCleanerView: View {
                         miniBadge(l10n.adminBadge, color: palette.warning)
                     }
                 }
-                Text(l10n.itemCountLabel(cat.entries.count))
+                Text(l10n.itemCountLabel(visibleEntries.count))
                     .font(.system(size: 10.5))
                     .foregroundStyle(palette.tertiaryText)
             }
@@ -272,7 +302,7 @@ struct JunkCleanerView: View {
             Spacer(minLength: 4)
 
             VStack(alignment: .trailing, spacing: 2) {
-                Text(ByteFormatter.format(cat.totalBytes))
+                Text(ByteFormatter.format(visibleBytes))
                     .font(.system(size: 12, weight: .semibold, design: .rounded))
                     .foregroundStyle(palette.primaryText)
                     .monospacedDigit()
@@ -347,7 +377,7 @@ struct JunkCleanerView: View {
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
-                        .disabled(cat.entries.isEmpty)
+                        .disabled(visibleEntries.isEmpty)
 
                         Button(l10n.deselectAll) {
                             store.toggleJunkCategory(categoryID: cat.id, selected: false)
@@ -561,9 +591,12 @@ struct JunkCleanerView: View {
                 HStack(spacing: 6) {
                     Text(verbatim: entry.displayName)
                         .font(.system(size: 12.5, weight: .medium))
-                        .foregroundStyle(palette.primaryText)
+                        .foregroundStyle(entry.isHidden ? palette.secondaryText : palette.primaryText)
                         .lineLimit(1)
 
+                    if entry.isHidden {
+                        miniBadge(l10n.hiddenBadge, color: palette.secondaryText)
+                    }
                     if let subgroup = entry.subgroup, !subgroup.isEmpty {
                         miniBadge(SafeFileReader.sanitizeForDisplay(subgroup), color: palette.secondaryText)
                     }

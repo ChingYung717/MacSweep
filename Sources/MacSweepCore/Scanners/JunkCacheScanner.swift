@@ -39,6 +39,7 @@ public struct JunkCacheScanner: Sendable {
         let name: String
         let isDirectory: Bool
         let isUserImmutable: Bool
+        let isHidden: Bool
         let isDataless: Bool
         let isSymlink: Bool
     }
@@ -59,6 +60,7 @@ public struct JunkCacheScanner: Sendable {
         let isSelected: Bool
         let requiresAdmin: Bool
         let isUserImmutable: Bool
+        let isHidden: Bool
         let expectedCanonicalParent: String
         let isRunningAppBlocked: Bool
         let runningAppName: String?
@@ -228,6 +230,7 @@ public struct JunkCacheScanner: Sendable {
                     requiresAdmin: spec.requiresAdmin,
                     isProtected: false,
                     isUserImmutable: spec.isUserImmutable,
+                    isHidden: spec.isHidden,
                     expectedCanonicalParent: spec.expectedCanonicalParent,
                     isRunningAppBlocked: spec.isRunningAppBlocked,
                     runningAppName: spec.runningAppName,
@@ -413,6 +416,7 @@ public struct JunkCacheScanner: Sendable {
             isSelected: !blocked,
             requiresAdmin: safetyGuard.requiresAdmin(for: url),
             isUserImmutable: info.isUserImmutable,
+            isHidden: info.isHidden,
             expectedCanonicalParent: PrivilegedExecutor.canonicalParentPath(forTargetURL: url),
             isRunningAppBlocked: blocked,
             runningAppName: runningMatch,
@@ -473,6 +477,7 @@ public struct JunkCacheScanner: Sendable {
                     isSelected: defaultSelected && !reqAdmin && !blocked,
                     requiresAdmin: reqAdmin,
                     isUserImmutable: child.isUserImmutable,
+                    isHidden: child.isHidden,
                     expectedCanonicalParent: canonicalParent,
                     isRunningAppBlocked: blocked,
                     runningAppName: runningName,
@@ -515,6 +520,7 @@ public struct JunkCacheScanner: Sendable {
                 isSelected: defaultSelected && !reqAdmin,
                 requiresAdmin: reqAdmin,
                 isUserImmutable: info.isUserImmutable,
+                isHidden: false,
                 expectedCanonicalParent: PrivilegedExecutor.canonicalParentPath(forTargetURL: target),
                 isRunningAppBlocked: false,
                 runningAppName: nil,
@@ -660,6 +666,7 @@ public struct JunkCacheScanner: Sendable {
             isSelected: !blocked && !reqAdmin,
             requiresAdmin: reqAdmin,
             isUserImmutable: child.isUserImmutable,
+            isHidden: child.isHidden,
             expectedCanonicalParent: PrivilegedExecutor.canonicalParentPath(forTargetURL: child.url),
             isRunningAppBlocked: blocked,
             runningAppName: runningName,
@@ -758,6 +765,7 @@ public struct JunkCacheScanner: Sendable {
                 isSelected: !reqAdmin,
                 requiresAdmin: reqAdmin,
                 isUserImmutable: child.isUserImmutable,
+                isHidden: child.isHidden,
                 expectedCanonicalParent: canonicalParent,
                 isRunningAppBlocked: false,
                 runningAppName: nil,
@@ -819,6 +827,7 @@ public struct JunkCacheScanner: Sendable {
                 isSelected: !reqAdmin,
                 requiresAdmin: reqAdmin,
                 isUserImmutable: child.isUserImmutable,
+                isHidden: child.isHidden,
                 expectedCanonicalParent: canonicalParent,
                 isRunningAppBlocked: false,
                 runningAppName: nil,
@@ -866,12 +875,14 @@ public struct JunkCacheScanner: Sendable {
 
             let isDataless = (st.st_flags & UInt32(SF_DATALESS)) != 0
             let isImmutable = (st.st_flags & UInt32(UF_IMMUTABLE)) != 0
+            let isHidden = name.hasPrefix(".") || (st.st_flags & UInt32(UF_HIDDEN)) != 0
             let childURL = directory.appendingPathComponent(name).standardizedFileURL
             children.append(RawChild(
                 url: childURL,
                 name: name,
                 isDirectory: isDir,
                 isUserImmutable: isImmutable,
+                isHidden: isHidden,
                 isDataless: isDataless,
                 isSymlink: isSymlink
             ))
@@ -890,11 +901,13 @@ public struct JunkCacheScanner: Sendable {
         if !isSymlink && !isDir && !isReg {
             return nil
         }
+        let name = url.lastPathComponent
         return RawChild(
             url: url.standardizedFileURL,
-            name: url.lastPathComponent,
+            name: name,
             isDirectory: isDir,
             isUserImmutable: (st.st_flags & UInt32(UF_IMMUTABLE)) != 0,
+            isHidden: name.hasPrefix(".") || (st.st_flags & UInt32(UF_HIDDEN)) != 0,
             isDataless: (st.st_flags & UInt32(SF_DATALESS)) != 0,
             isSymlink: isSymlink
         )

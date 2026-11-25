@@ -381,12 +381,24 @@ struct ResourceReleaseView: View {
                     store.scanLargeFiles(at: $0)
                 }
                 Button(l10n.chooseFolder) {
-                    if let picked = chooseDirectoryPanel(title: l10n.chooseFolder, initialURL: store.largeFilesRootURL) {
+                    if let picked = chooseDirectoryPanel(
+                        title: l10n.chooseFolder,
+                        initialURL: store.largeFilesRootURL,
+                        showsHiddenFiles: store.largeFilesIncludeHidden
+                    ) {
                         store.scanLargeFiles(at: picked)
                     }
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+
+                Button {
+                    store.toggleLargeFilesIncludeHidden()
+                } label: {
+                    hiddenToggleChipLabel(isOn: store.largeFilesIncludeHidden)
+                }
+                .buttonStyle(.plain)
+                .help(l10n.includeHiddenFilesHelp)
 
                 Text(verbatim: SafeFileReader.sanitizeForDisplay(store.largeFilesRootURL.path))
                     .font(.system(size: 11, design: .monospaced))
@@ -493,11 +505,14 @@ struct ResourceReleaseView: View {
                 HStack(spacing: 6) {
                     Text(verbatim: item.displayName)
                         .font(.system(size: 12.5, weight: .medium))
-                        .foregroundStyle(palette.primaryText)
+                        .foregroundStyle(item.isHidden ? palette.secondaryText : palette.primaryText)
                         .lineLimit(1)
 
                     miniBadge(l10n.largeFileCategoryTitle(item.category), color: palette.secondaryText)
 
+                    if item.isHidden {
+                        miniBadge(l10n.hiddenBadge, color: palette.secondaryText)
+                    }
                     if item.isUserImmutable {
                         miniBadge(l10n.userLockedBadge, color: palette.warning)
                     }
@@ -674,7 +689,11 @@ struct ResourceReleaseView: View {
                     store.scanDuplicates(at: $0)
                 }
                 Button(l10n.chooseFolder) {
-                    if let picked = chooseDirectoryPanel(title: l10n.chooseFolder, initialURL: store.duplicateRootURL) {
+                    if let picked = chooseDirectoryPanel(
+                        title: l10n.chooseFolder,
+                        initialURL: store.duplicateRootURL,
+                        showsHiddenFiles: store.duplicateIncludeHidden
+                    ) {
                         store.scanDuplicates(at: picked)
                     }
                 }
@@ -693,6 +712,14 @@ struct ResourceReleaseView: View {
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize(horizontal: true, vertical: false)
+
+                Button {
+                    store.toggleDuplicateIncludeHidden()
+                } label: {
+                    hiddenToggleChipLabel(isOn: store.duplicateIncludeHidden)
+                }
+                .buttonStyle(.plain)
+                .help(l10n.includeHiddenFilesHelp)
 
                 Text(verbatim: SafeFileReader.sanitizeForDisplay(store.duplicateRootURL.path))
                     .font(.system(size: 11, design: .monospaced))
@@ -847,13 +874,16 @@ struct ResourceReleaseView: View {
                 HStack(spacing: 6) {
                     Text(verbatim: entry.displayName)
                         .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(palette.primaryText)
+                        .foregroundStyle(entry.isHidden ? palette.secondaryText : palette.primaryText)
                         .lineLimit(1)
 
                     miniBadge(
                         entry.isSelected ? l10n.duplicateDeleteLabel : l10n.duplicateKeepLabel,
                         color: entry.isSelected ? palette.danger : palette.success
                     )
+                    if entry.isHidden {
+                        miniBadge(l10n.hiddenBadge, color: palette.secondaryText)
+                    }
                     if entry.isUserImmutable {
                         miniBadge(l10n.userLockedBadge, color: palette.warning)
                     }
@@ -1246,6 +1276,28 @@ struct ResourceReleaseView: View {
         .fixedSize(horizontal: true, vertical: false)
     }
 
+    private func hiddenToggleChipLabel(isOn: Bool) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: isOn ? "eye.fill" : "eye.slash")
+                .font(.system(size: 10.5))
+            Text(l10n.hiddenFilesChipLabel)
+                .font(.system(size: 11.5, weight: isOn ? .semibold : .medium))
+                .lineLimit(1)
+        }
+        .foregroundStyle(isOn ? palette.accent : palette.secondaryText)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4.5)
+        .background(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(isOn ? palette.accent.opacity(0.14) : palette.cardBackground)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .strokeBorder(isOn ? palette.activeBorder : palette.border, lineWidth: 1)
+                )
+        )
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
     private func filterChipLabel(title: String) -> some View {
         HStack(spacing: 4) {
             Text(title)
@@ -1422,7 +1474,7 @@ struct ResourceReleaseView: View {
         }
     }
 
-    private func chooseDirectoryPanel(title: String, initialURL: URL) -> URL? {
+    private func chooseDirectoryPanel(title: String, initialURL: URL, showsHiddenFiles: Bool) -> URL? {
         if state.isDemoMode {
             state.banner = OperationBanner(
                 isError: false,
@@ -1437,6 +1489,7 @@ struct ResourceReleaseView: View {
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
         panel.canCreateDirectories = false
+        panel.showsHiddenFiles = showsHiddenFiles
         panel.title = title
         panel.directoryURL = initialURL
         return panel.runModal() == .OK ? panel.url?.standardizedFileURL : nil

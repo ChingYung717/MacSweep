@@ -88,6 +88,7 @@ public struct LargeAndDuplicateScanner: Sendable {
         ageBasis: DiskAgeDateBasis = .modificationDate,
         categories: Set<LargeFileCategory> = [],
         includePackages: Bool = false,
+        includeHiddenFiles: Bool = true,
         maxResults: Int = 500,
         referenceDate: Date = Date(),
         onProgress: (@Sendable (ResourceScanProgress) -> Void)? = nil
@@ -98,6 +99,7 @@ public struct LargeAndDuplicateScanner: Sendable {
             ageBasis: ageBasis,
             categories: categories,
             includePackages: includePackages,
+            includeHiddenFiles: includeHiddenFiles,
             maxResults: maxResults
         )
         return try await scanLargeFiles(
@@ -292,6 +294,7 @@ public struct LargeAndDuplicateScanner: Sendable {
         let modDate: Date?
         let expectedCanonicalParent: String
         let isUserImmutable: Bool
+        let isHidden: Bool
         let requiresAdmin: Bool
         let relativePath: String
     }
@@ -330,8 +333,9 @@ public struct LargeAndDuplicateScanner: Sendable {
         )
         var results: [LargeFileItem] = []
 
-        var stack: [URL] = [root]
-        while let dirURL = stack.popLast() {
+        var stack: [(url: URL, ancestorHidden: Bool)] = [(root, false)]
+        while let frame = stack.popLast() {
+            let dirURL = frame.url
             if cancelFlag.isCancelled || Task.isCancelled {
                 throw CancellationError()
             }
@@ -354,6 +358,12 @@ public struct LargeAndDuplicateScanner: Sendable {
                 if cancelFlag.isCancelled || Task.isCancelled {
                     throw CancellationError()
                 }
+                let entryHidden = entry.name.hasPrefix(".") || (entry.flags & UInt32(UF_HIDDEN)) != 0
+                if !options.includeHiddenFiles && entryHidden {
+                    continue
+                }
+                let effectiveHidden = entryHidden || frame.ancestorHidden
+
                 if Self.shouldSkipSpecialRootChild(
                     name: entry.name,
                     parentPath: dirPath,
@@ -417,6 +427,7 @@ public struct LargeAndDuplicateScanner: Sendable {
                         expectedCanonicalParent: canonicalSelf,
                         isPackage: false,
                         isUserImmutable: (entry.flags & UInt32(UF_IMMUTABLE)) != 0,
+                        isHidden: effectiveHidden,
                         requiresAdmin: safetyGuard.requiresAdmin(for: childURL),
                         isProtected: false,
                         isSelected: false,
@@ -453,13 +464,14 @@ public struct LargeAndDuplicateScanner: Sendable {
                             expectedCanonicalParent: canonicalSelf,
                             isPackage: true,
                             isUserImmutable: (entry.flags & UInt32(UF_IMMUTABLE)) != 0,
+                            isHidden: effectiveHidden,
                             requiresAdmin: safetyGuard.requiresAdmin(for: childURL),
                             isProtected: false,
                             isSelected: false,
                             relativePathFromRoot: Self.relativePath(of: childURL.path, under: stats.rootPath)
                         ))
                     } else {
-                        stack.append(childURL)
+                        stack.append((childURL, effectiveHidden))
                     }
                 }
             }
@@ -526,9 +538,10 @@ public struct LargeAndDuplicateScanner: Sendable {
 
         // Stage 1: Exact Byte Size Grouping (deduplicating hardlinks via (st_dev, st_ino))
         var sizeBuckets: [UInt64: [CandidateFile]] = [:]
-        var stack: [URL] = [root]
+        var stack: [(url: URL, ancestorHidden: Bool)] = [(root, false)]
 
-        while let dirURL = stack.popLast() {
+        while let frame = stack.popLast() {
+            let dirURL = frame.url
             if cancelFlag.isCancelled || Task.isCancelled {
                 throw CancellationError()
             }
@@ -554,9 +567,11 @@ public struct LargeAndDuplicateScanner: Sendable {
                 if entry.name == ".DS_Store" || entry.name == ".localized" {
                     continue
                 }
-                if !options.includeHiddenFiles && entry.name.hasPrefix(".") {
+                let entryHidden = entry.name.hasPrefix(".") || (entry.flags & UInt32(UF_HIDDEN)) != 0
+                if !options.includeHiddenFiles && entryHidden {
                     continue
                 }
+                let effectiveHidden = entryHidden || frame.ancestorHidden
                 if Self.shouldSkipSpecialRootChild(
                     name: entry.name,
                     parentPath: dirPath,
@@ -606,6 +621,7 @@ public struct LargeAndDuplicateScanner: Sendable {
                         modDate: entry.modDate,
                         expectedCanonicalParent: canonicalSelf,
                         isUserImmutable: (entry.flags & UInt32(UF_IMMUTABLE)) != 0,
+                        isHidden: effectiveHidden,
                         requiresAdmin: safetyGuard.requiresAdmin(for: childURL),
                         relativePath: Self.relativePath(of: childURL.path, under: stats.rootPath)
                     ))
@@ -617,7 +633,7 @@ public struct LargeAndDuplicateScanner: Sendable {
                     if Self.detectIsPackage(at: childURL) {
                         continue
                     }
-                    stack.append(childURL)
+                    stack.append((childURL, effectiveHidden))
                 }
             }
 
@@ -741,6 +757,7 @@ public struct LargeAndDuplicateScanner: Sendable {
                             modificationDate: item.modDate,
                             expectedCanonicalParent: item.expectedCanonicalParent,
                             isUserImmutable: item.isUserImmutable,
+                            isHidden: item.isHidden,
                             requiresAdmin: item.requiresAdmin,
                             isProtected: false,
                             isSelected: false,

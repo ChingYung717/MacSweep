@@ -88,6 +88,7 @@ public final class CleanupCenterStore: ObservableObject {
     @Published public var selectedJunkCategoryID: String?
     @Published public var focusedJunkEntryID: String?
     @Published public var junkSearchText: String = ""
+    @Published public var junkIncludeHidden: Bool = true
     @Published public var isScanningJunk: Bool = false
     @Published public var junkScanProgressText: String?
     @Published public var junkError: String?
@@ -104,6 +105,7 @@ public final class CleanupCenterStore: ObservableObject {
     @Published public var largeFileCategoryFilter: LargeFileCategoryFilter = .all
     @Published public var largeFileSortOrder: LargeFileSortOrder = .sizeDescending
     @Published public var largeFileSearchText: String = ""
+    @Published public var largeFilesIncludeHidden: Bool = false
     @Published public var largeFiles: [LargeFileItem] = []
     @Published public var selectedLargeFileIDs: Set<String> = []
     @Published public var focusedLargeFileID: String?
@@ -120,6 +122,7 @@ public final class CleanupCenterStore: ObservableObject {
     // MARK: - Duplicate Files State
     @Published public var duplicateRootURL: URL
     @Published public var duplicateMinSizePreset: DuplicateMinSizePreset = .mb1
+    @Published public var duplicateIncludeHidden: Bool = false
     @Published public var duplicateGroups: [DuplicateGroup] = []
     @Published public var duplicateSearchText: String = ""
     @Published public var isScanningDuplicates: Bool = false
@@ -253,13 +256,47 @@ public final class CleanupCenterStore: ObservableObject {
         junkCategories.reduce(into: UInt64(0)) { $0 &+= $1.selectedBytes }
     }
 
+    func visibleEntries(for category: JunkCategoryItem) -> [JunkEntry] {
+        if junkIncludeHidden {
+            return category.entries
+        }
+        return category.entries.filter { !$0.isHidden }
+    }
+
+    func visibleBytes(for category: JunkCategoryItem) -> UInt64 {
+        visibleEntries(for: category)
+            .filter { !$0.isProtected }
+            .reduce(into: UInt64(0)) { $0 &+= $1.bytes }
+    }
+
+    var totalVisibleJunkDiscoveredBytes: UInt64 {
+        junkCategories.reduce(into: UInt64(0)) { $0 &+= visibleBytes(for: $1) }
+    }
+
     func filteredEntries(for category: JunkCategoryItem) -> [JunkEntry] {
+        let base = visibleEntries(for: category)
         let q = junkSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else { return category.entries }
-        return category.entries.filter {
+        guard !q.isEmpty else { return base }
+        return base.filter {
             $0.name.localizedCaseInsensitiveContains(q)
                 || $0.url.path.localizedCaseInsensitiveContains(q)
                 || ($0.subgroup?.localizedCaseInsensitiveContains(q) ?? false)
+        }
+    }
+
+    public func toggleJunkIncludeHidden() {
+        junkIncludeHidden.toggle()
+        if !junkIncludeHidden {
+            for cIdx in junkCategories.indices {
+                for eIdx in junkCategories[cIdx].entries.indices where junkCategories[cIdx].entries[eIdx].isHidden {
+                    junkCategories[cIdx].entries[eIdx].isSelected = false
+                }
+            }
+            if let cat = activeJunkCategory,
+               let focusedID = focusedJunkEntryID,
+               cat.entries.first(where: { $0.id == focusedID })?.isHidden == true {
+                focusedJunkEntryID = filteredEntries(for: cat).first?.id
+            }
         }
     }
 
@@ -313,7 +350,15 @@ public final class CleanupCenterStore: ObservableObject {
                 guard !Task.isCancelled else { return }
                 await MainActor.run { [weak self] in
                     guard let self, self.junkGeneration == gen else { return }
-                    self.junkCategories = result.categories
+                    var categories = result.categories
+                    if !self.junkIncludeHidden {
+                        for cIdx in categories.indices {
+                            for eIdx in categories[cIdx].entries.indices where categories[cIdx].entries[eIdx].isHidden {
+                                categories[cIdx].entries[eIdx].isSelected = false
+                            }
+                        }
+                    }
+                    self.junkCategories = categories
                     self.junkNeedsFDA = result.needsFullDiskAccess
                     self.junkBlockedBrowserNames = result.blockedLocations
                     if self.selectedJunkCategoryID == nil
@@ -365,6 +410,10 @@ public final class CleanupCenterStore: ObservableObject {
             let entry = junkCategories[cIdx].entries[eIdx]
             guard !entry.isProtected && !entry.isRunningAppBlocked else { continue }
             if selected {
+                if !junkIncludeHidden && entry.isHidden {
+                    junkCategories[cIdx].entries[eIdx].isSelected = false
+                    continue
+                }
                 // Keep admin-required or safety-flagged items (e.g. Xcode Archives) opt-in unless explicitly toggled per-item,
                 // OR allow category toggle for non-admin safe items; if all are admin/flagged, allow toggling user entries.
                 let isUnsafeDefault = entry.category == .developerCaches && !entry.isRecommendedSafe
@@ -382,6 +431,7 @@ public final class CleanupCenterStore: ObservableObject {
             for eIdx in junkCategories[cIdx].entries.indices {
                 let entry = junkCategories[cIdx].entries[eIdx]
                 junkCategories[cIdx].entries[eIdx].isSelected = entry.isRecommendedSafe
+                    && (junkIncludeHidden || !entry.isHidden)
                     && !entry.isProtected
                     && !entry.isRunningAppBlocked
                     && !entry.requiresAdmin
@@ -516,12 +566,15 @@ public final class CleanupCenterStore: ObservableObject {
         hasLoadedLargeFilesOnce = true
 
         let minBytes = max(LargeFileSizeThreshold.mb50.rawValue, largeFileMinSizePreset.rawValue)
+        let includeHidden = largeFilesIncludeHidden
         let guardCopy = currentGuard
 
         if isDemoMode, let catalog = demoCatalog {
             let rootPath = targetURL.path
             largeFiles = catalog.largeFiles.filter { item in
-                item.bytes >= minBytes && (rootPath == DemoFixtureCatalog.homeDirectoryPath || item.url.path.hasPrefix(rootPath + "/") || item.url.path == rootPath)
+                item.bytes >= minBytes
+                    && (includeHidden || !item.isHidden)
+                    && (rootPath == DemoFixtureCatalog.homeDirectoryPath || item.url.path.hasPrefix(rootPath + "/") || item.url.path == rootPath)
             }
             isScanningLargeFiles = false
             largeFilesProgress = nil
@@ -542,7 +595,11 @@ public final class CleanupCenterStore: ObservableObject {
                 let scanner = LargeAndDuplicateScanner(safetyGuard: guardCopy)
                 let items = try await scanner.scanLargeFiles(
                     under: targetURL,
-                    options: LargeFileScanOptions(minBytes: minBytes, maxResults: 500),
+                    options: LargeFileScanOptions(
+                        minBytes: minBytes,
+                        includeHiddenFiles: includeHidden,
+                        maxResults: 500
+                    ),
                     onProgress: onProgress
                 )
 
@@ -581,6 +638,11 @@ public final class CleanupCenterStore: ObservableObject {
         largeFilesTask = nil
         isScanningLargeFiles = false
         largeFilesProgress = nil
+    }
+
+    public func toggleLargeFilesIncludeHidden() {
+        largeFilesIncludeHidden.toggle()
+        scanLargeFiles()
     }
 
     func toggleLargeFileSelection(_ id: String) {
@@ -738,14 +800,19 @@ public final class CleanupCenterStore: ObservableObject {
         focusedDuplicateURL = nil
 
         let minBytes = duplicateMinSizePreset.rawValue
+        let includeHidden = duplicateIncludeHidden
         let guardCopy = currentGuard
 
         if isDemoMode, let catalog = demoCatalog {
             let rootPath = targetURL.path
-            duplicateGroups = catalog.duplicateGroups.filter { group in
-                group.fileSize >= minBytes && group.files.contains {
-                    rootPath == DemoFixtureCatalog.homeDirectoryPath || $0.url.path.hasPrefix(rootPath + "/")
+            duplicateGroups = catalog.duplicateGroups.compactMap { group in
+                guard group.fileSize >= minBytes else { return nil }
+                let visibleFiles = group.files.filter { file in
+                    (includeHidden || !file.isHidden)
+                        && (rootPath == DemoFixtureCatalog.homeDirectoryPath || file.url.path.hasPrefix(rootPath + "/"))
                 }
+                guard visibleFiles.count >= 2 else { return nil }
+                return DuplicateGroup(sha256Hex: group.sha256Hex, fileSize: group.fileSize, files: visibleFiles)
             }
             isScanningDuplicates = false
             duplicateProgress = nil
@@ -765,7 +832,11 @@ public final class CleanupCenterStore: ObservableObject {
                 let scanner = LargeAndDuplicateScanner(safetyGuard: guardCopy)
                 let groups = try await scanner.scanDuplicates(
                     under: targetURL,
-                    options: DuplicateScanOptions(minBytes: minBytes, maxGroups: 400),
+                    options: DuplicateScanOptions(
+                        minBytes: minBytes,
+                        includeHiddenFiles: includeHidden,
+                        maxGroups: 400
+                    ),
                     onProgress: onProgress
                 )
 
@@ -799,6 +870,13 @@ public final class CleanupCenterStore: ObservableObject {
         duplicatesTask = nil
         isScanningDuplicates = false
         duplicateProgress = nil
+    }
+
+    public func toggleDuplicateIncludeHidden() {
+        duplicateIncludeHidden.toggle()
+        if isScanningDuplicates || !duplicateGroups.isEmpty || duplicateError != nil {
+            scanDuplicates()
+        }
     }
 
     func toggleDuplicateEntry(groupID: String, entryID: String) {

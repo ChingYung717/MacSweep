@@ -47,7 +47,7 @@ MacSweep/
 │                                       # AppIconView / AnalyzerCapacityComponents / FileInspectorView /
 │                                       # QuickLookPreviewController
 ├── Tests/
-│   ├── MacSweepChecks/                 # 144 项沙盒与回归校验套件（含 --live-audit 只读巡检）
+│   ├── MacSweepChecks/                 # 148 项沙盒与回归校验套件（含 --live-audit 只读巡检）
 │   └── MacSweepE2E/                    # 独立黑盒端到端测试套件（154 项严格 E2E 校验）
 ├── scripts/
 │   ├── generate_icon.swift             # 图标生成器
@@ -182,7 +182,7 @@ mv MacSweep.app /Applications/
 仅需 macOS Command Line Tools（Swift 6.0+），无需 Homebrew 或完整 `Xcode.app`：
 
 ```bash
-# 编译并运行 144 项沙盒与回归校验
+# 编译并运行 148 项沙盒与回归校验
 swift run MacSweepChecks
 
 # 执行只读本机巡检（不修改任何文件）

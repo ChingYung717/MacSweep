@@ -693,6 +693,7 @@ public struct DemoFixtureCatalog: Sendable, Equatable {
                     folderCount: 410,
                     modificationDate: daysAgo(2),
                     accessDate: daysAgo(0),
+                    isHidden: true,
                     expectedCanonicalParent: "/Users/alex/Projects/swift-studio"
                 ),
                 DiskTreeNode(

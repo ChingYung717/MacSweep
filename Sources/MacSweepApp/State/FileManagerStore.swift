@@ -57,6 +57,7 @@ public final class FileManagerStore: ObservableObject {
     @Published public var analyzerSizePreset: DiskSizeThresholdPreset = .all
     @Published public var analyzerAgePreset: DiskAgePreset = .all
     @Published public var analyzerAgeBasis: DiskAgeDateBasis = .modificationDate
+    @Published public var analyzerIncludeHiddenFiles: Bool = true
     @Published public var analyzerFilteredItems: [DiskFilteredItem] = []
     @Published public var isFilteringDeep: Bool = false
     @Published public var selectedAnalyzerNodeIDs: Set<String> = []
@@ -319,6 +320,7 @@ public final class FileManagerStore: ObservableObject {
             ageBasis: analyzerAgeBasis,
             scope: .filesAndPackages,
             excludeProtected: false,
+            includeHiddenFiles: analyzerIncludeHiddenFiles,
             searchText: analyzerSearchText,
             maxResults: 400
         )
@@ -351,6 +353,8 @@ public final class FileManagerStore: ObservableObject {
         selectedAnalyzerNodeIDs.removeAll()
         focusedAnalyzerNodeID = nil
 
+        let includeHidden = analyzerIncludeHiddenFiles
+
         if isDemoMode, let catalog = demoCatalog {
             analyzerVolumeInfo = catalog.volumeInfo
             let targetNorm = Self.normalizedKey(targetURL.path)
@@ -358,7 +362,8 @@ public final class FileManagerStore: ObservableObject {
             let fallbackRoot = demoHomeDiskTree
                 ?? Self.pruningTree(catalog.diskTreeRoot(for: targetURL), removedNormalized: demoRemovedPaths)
             let effectiveRoot = matchedNode ?? fallbackRoot
-            analyzerRootNode = updatingDemoProtection(effectiveRoot, using: currentGuard)
+            let filteredRoot = Self.filteringHiddenTree(effectiveRoot, includeHidden: includeHidden)
+            analyzerRootNode = updatingDemoProtection(filteredRoot, using: currentGuard)
             analyzerBreadcrumbIDs = []
             isAnalyzing = false
             scanProgress = nil
@@ -379,18 +384,35 @@ public final class FileManagerStore: ObservableObject {
             }
 
             do {
-                let analyzer = DiskSpaceAnalyzer(safetyGuard: guardCopy, maxChildrenPerDirectory: 200, progressThrottleInterval: 0.12)
-                let tree = try await analyzer.analyze(root: targetURL, maxDepth: 6) { [weak self] progress in
-                    Task { @MainActor [weak self] in
-                        guard let self, self.analyzerGeneration == gen, self.isAnalyzing else { return }
-                        self.scanProgress = progress
+                let analyzer = DiskSpaceAnalyzer(
+                    safetyGuard: guardCopy,
+                    maxChildrenPerDirectory: 200,
+                    progressThrottleInterval: 0.12,
+                    includeHiddenFiles: includeHidden
+                )
+                let tree = try await analyzer.analyze(
+                    root: targetURL,
+                    maxDepth: 4,
+                    onPartialTree: { [weak self] partial in
+                        Task { @MainActor [weak self] in
+                            guard let self, self.analyzerGeneration == gen, self.isAnalyzing else { return }
+                            self.analyzerRootNode = partial
+                        }
+                    },
+                    onProgress: { [weak self] progress in
+                        Task { @MainActor [weak self] in
+                            guard let self, self.analyzerGeneration == gen, self.isAnalyzing else { return }
+                            self.scanProgress = progress
+                        }
                     }
-                }
+                )
                 guard !Task.isCancelled else { return }
                 await MainActor.run { [weak self] in
                     guard let self, self.analyzerGeneration == gen else { return }
                     self.analyzerRootNode = tree
-                    self.analyzerBreadcrumbIDs = []
+                    if self.analyzerRootURL != targetURL {
+                        self.analyzerBreadcrumbIDs = []
+                    }
                     self.isAnalyzing = false
                     self.scanProgress = nil
                     self.recomputeAnalyzerFilter()
@@ -494,12 +516,13 @@ public final class FileManagerStore: ObservableObject {
         isFilteringDeep = true
         let targetURL = currentNode.url
         let guardCopy = currentGuard
+        let includeHidden = analyzerIncludeHiddenFiles
 
         filterTask = Task { [weak self] in
             do {
                 try await Task.sleep(nanoseconds: 250_000_000)
                 guard !Task.isCancelled else { return }
-                let analyzer = DiskSpaceAnalyzer(safetyGuard: guardCopy)
+                let analyzer = DiskSpaceAnalyzer(safetyGuard: guardCopy, includeHiddenFiles: includeHidden)
                 let deepResults = try await analyzer.findMatchingFiles(under: targetURL, filter: filter)
                 guard !Task.isCancelled else { return }
                 await MainActor.run { [weak self] in
@@ -514,6 +537,11 @@ public final class FileManagerStore: ObservableObject {
                 }
             }
         }
+    }
+
+    public func toggleAnalyzerIncludeHiddenFiles() {
+        analyzerIncludeHiddenFiles.toggle()
+        startSpaceAnalysis(at: analyzerRootURL)
     }
 
     func setAnalyzerSizePreset(_ preset: DiskSizeThresholdPreset) {
@@ -1522,6 +1550,7 @@ public final class FileManagerStore: ObservableObject {
                         expectedCanonicalParent: item.expectedCanonicalParent,
                         isProtected: prot,
                         isUserImmutable: item.isUserImmutable,
+                        isHidden: item.isHidden,
                         relativePathFromRoot: item.relativePathFromRoot
                     )
                 }
@@ -1557,6 +1586,7 @@ public final class FileManagerStore: ObservableObject {
                     expectedCanonicalParent: item.expectedCanonicalParent,
                     isProtected: prot,
                     isUserImmutable: item.isUserImmutable,
+                    isHidden: item.isHidden,
                     relativePathFromRoot: item.relativePathFromRoot
                 )
             }
@@ -2272,6 +2302,59 @@ public final class FileManagerStore: ObservableObject {
             isAccessible: node.isAccessible,
             isProtected: status.isProtected,
             isUserImmutable: node.isUserImmutable,
+            isHidden: node.isHidden,
+            expectedCanonicalParent: node.expectedCanonicalParent
+        )
+    }
+
+    private nonisolated static func filteringHiddenTree(_ node: DiskTreeNode, includeHidden: Bool) -> DiskTreeNode {
+        guard !includeHidden, node.isDirectory, !node.children.isEmpty else { return node }
+        var keptChildren: [DiskTreeNode] = []
+        keptChildren.reserveCapacity(node.children.count)
+        var removedBytes: UInt64 = 0
+        var removedFiles = 0
+        var removedFolders = 0
+
+        for child in node.children {
+            if child.isHidden {
+                removedBytes &+= child.bytes
+                removedFiles += child.fileCount
+                removedFolders += (child.isDirectory && !child.isSymlink) ? (1 + child.folderCount) : 0
+            } else {
+                let filtered = filteringHiddenTree(child, includeHidden: false)
+                if filtered.bytes < child.bytes {
+                    removedBytes &+= (child.bytes - filtered.bytes)
+                }
+                if filtered.fileCount < child.fileCount {
+                    removedFiles += (child.fileCount - filtered.fileCount)
+                }
+                if filtered.folderCount < child.folderCount {
+                    removedFolders += (child.folderCount - filtered.folderCount)
+                }
+                keptChildren.append(filtered)
+            }
+        }
+
+        keptChildren.sort(by: Self.diskTreeChildrenSort)
+
+        return DiskTreeNode(
+            url: node.url,
+            name: node.name,
+            isDirectory: node.isDirectory,
+            isPackage: node.isPackage,
+            isSymlink: node.isSymlink,
+            bytes: node.bytes > removedBytes ? (node.bytes - removedBytes) : 0,
+            fileCount: max(0, node.fileCount - removedFiles),
+            folderCount: max(0, node.folderCount - removedFolders),
+            modificationDate: node.modificationDate,
+            accessDate: node.accessDate,
+            children: keptChildren,
+            isTruncated: node.isTruncated,
+            truncatedChildCount: node.truncatedChildCount,
+            isAccessible: node.isAccessible,
+            isProtected: node.isProtected,
+            isUserImmutable: node.isUserImmutable,
+            isHidden: node.isHidden,
             expectedCanonicalParent: node.expectedCanonicalParent
         )
     }
@@ -2370,6 +2453,7 @@ public final class FileManagerStore: ObservableObject {
             isAccessible: node.isAccessible,
             isProtected: node.isProtected,
             isUserImmutable: node.isUserImmutable,
+            isHidden: node.isHidden,
             expectedCanonicalParent: node.expectedCanonicalParent
         )
     }
@@ -2472,6 +2556,7 @@ public final class FileManagerStore: ObservableObject {
             children: [],
             isProtected: entry.isProtected,
             isUserImmutable: entry.isUserImmutable,
+            isHidden: entry.isHidden,
             expectedCanonicalParent: entry.expectedCanonicalParent
         )
     }
@@ -2710,7 +2795,8 @@ public final class FileManagerStore: ObservableObject {
             ?? (isVolumeRootFallback ? demoHomeDiskTree : nil)
 
         if let updated = resolvedNode {
-            analyzerRootNode = updatingDemoProtection(updated, using: currentGuard)
+            let filtered = Self.filteringHiddenTree(updated, includeHidden: analyzerIncludeHiddenFiles)
+            analyzerRootNode = updatingDemoProtection(filtered, using: currentGuard)
             if let root = analyzerRootNode {
                 var validBreadcrumbs: [String] = []
                 var cursor = root
@@ -2765,6 +2851,7 @@ public final class FileManagerStore: ObservableObject {
             isAccessible: node.isAccessible,
             isProtected: node.isProtected,
             isUserImmutable: node.isUserImmutable,
+            isHidden: newName != nil ? resolvedName.hasPrefix(".") : node.isHidden,
             expectedCanonicalParent: parent
         )
     }
@@ -2843,6 +2930,7 @@ public final class FileManagerStore: ObservableObject {
             isAccessible: node.isAccessible,
             isProtected: node.isProtected,
             isUserImmutable: node.isUserImmutable,
+            isHidden: node.isHidden,
             expectedCanonicalParent: node.expectedCanonicalParent
         )
         return (updated, extracted)
@@ -2879,6 +2967,7 @@ public final class FileManagerStore: ObservableObject {
                 isAccessible: node.isAccessible,
                 isProtected: node.isProtected,
                 isUserImmutable: node.isUserImmutable,
+                isHidden: node.isHidden,
                 expectedCanonicalParent: node.expectedCanonicalParent
             )
             return (updated, true)
@@ -2933,6 +3022,7 @@ public final class FileManagerStore: ObservableObject {
             isAccessible: node.isAccessible,
             isProtected: node.isProtected,
             isUserImmutable: node.isUserImmutable,
+            isHidden: node.isHidden,
             expectedCanonicalParent: node.expectedCanonicalParent
         )
         return (updated, true)
@@ -2964,6 +3054,7 @@ public final class FileManagerStore: ObservableObject {
                 isAccessible: node.isAccessible,
                 isProtected: node.isProtected,
                 isUserImmutable: node.isUserImmutable,
+                isHidden: node.isHidden,
                 expectedCanonicalParent: node.expectedCanonicalParent
             )
             return (updated, true)
@@ -3024,6 +3115,7 @@ public final class FileManagerStore: ObservableObject {
             isAccessible: node.isAccessible,
             isProtected: node.isProtected,
             isUserImmutable: node.isUserImmutable,
+            isHidden: node.isHidden,
             expectedCanonicalParent: node.expectedCanonicalParent
         )
         return (updated, true)

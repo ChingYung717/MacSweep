@@ -486,4 +486,63 @@ func runAppRuntimeChecks(_ runner: CheckRunner) {
             try check(!src.contains("QuickLookPanelBridgeHost"), "\(viewRel) must not duplicate QuickLookPanelBridgeHost")
         }
     }
+
+    runner.run("Hidden-file UI store toggles: FileManagerStore & CleanupCenterStore (Large, Duplicates, Junk deselect safety)") {
+        try MainActor.assumeIsolated {
+            let demoState = AppState(launchOptions: DemoLaunchOptions(isDemoMode: true))
+            let fmStore = demoState.fileManagerStore
+            let cleanupStore = demoState.cleanupCenterStore
+
+            // 1. Space Analyzer hidden toggle in Demo Mode filters .build under swift-studio
+            try checkEqual(fmStore.analyzerIncludeHiddenFiles, true)
+            let swiftStudioWithHidden = fmStore.analyzerRootNode?
+                .children.first(where: { $0.name == "Projects" })?
+                .children.first(where: { $0.name == "swift-studio" })
+            try check(swiftStudioWithHidden?.children.contains(where: { $0.name == ".build" && $0.isHidden }) == true, "Demo swift-studio must contain hidden .build when analyzerIncludeHiddenFiles is true")
+
+            fmStore.toggleAnalyzerIncludeHiddenFiles()
+            try checkEqual(fmStore.analyzerIncludeHiddenFiles, false)
+            let swiftStudioNoHidden = fmStore.analyzerRootNode?
+                .children.first(where: { $0.name == "Projects" })?
+                .children.first(where: { $0.name == "swift-studio" })
+            try check(swiftStudioNoHidden?.children.contains(where: { $0.name == ".build" }) == false, "Toggling analyzerIncludeHiddenFiles off must exclude hidden .build")
+
+            fmStore.toggleAnalyzerIncludeHiddenFiles()
+            try checkEqual(fmStore.analyzerIncludeHiddenFiles, true)
+
+            // 2. Resource Release Large Files & Duplicate Files hidden toggles default to false and toggle cleanly
+            try checkEqual(cleanupStore.largeFilesIncludeHidden, false)
+            cleanupStore.toggleLargeFilesIncludeHidden()
+            try checkEqual(cleanupStore.largeFilesIncludeHidden, true)
+
+            try checkEqual(cleanupStore.duplicateIncludeHidden, false)
+            cleanupStore.toggleDuplicateIncludeHidden()
+            try checkEqual(cleanupStore.duplicateIncludeHidden, true)
+
+            // 3. Junk Cleaner hidden toggle defaults to true; turning it OFF deselects hidden items so hidden items can never be silently removed
+            try checkEqual(cleanupStore.junkIncludeHidden, true)
+            let hiddenTrashEntry = JunkEntry(
+                url: URL(fileURLWithPath: "/Users/alex/.Trash/.hidden-cache-item"),
+                name: ".hidden-cache-item",
+                category: .trash,
+                bytes: 4096,
+                isDirectory: false,
+                isSelected: true,
+                isHidden: true,
+                expectedCanonicalParent: "/Users/alex/.Trash",
+                isRecommendedSafe: true
+            )
+            if let trashIdx = cleanupStore.junkCategories.firstIndex(where: { $0.category == .trash }) {
+                cleanupStore.junkCategories[trashIdx].entries.append(hiddenTrashEntry)
+                cleanupStore.junkCategories[trashIdx].recalculateTotalBytes()
+
+                cleanupStore.toggleJunkIncludeHidden()
+                try checkEqual(cleanupStore.junkIncludeHidden, false)
+                let updatedHidden = cleanupStore.junkCategories[trashIdx].entries.first(where: { $0.id == hiddenTrashEntry.id })
+                try checkEqual(updatedHidden?.isSelected, false, "Turning junkIncludeHidden OFF must deselect hidden junk items")
+            } else {
+                try check(false, "Expected .trash category in demo junkCategories")
+            }
+        }
+    }
 }

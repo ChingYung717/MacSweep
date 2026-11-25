@@ -18,6 +18,7 @@ public struct DiskTreeNode: Identifiable, Hashable, Sendable {
     public let isAccessible: Bool
     public let isProtected: Bool
     public let isUserImmutable: Bool
+    public let isHidden: Bool
     public let expectedCanonicalParent: String
 
     public init(
@@ -37,6 +38,7 @@ public struct DiskTreeNode: Identifiable, Hashable, Sendable {
         isAccessible: Bool = true,
         isProtected: Bool = false,
         isUserImmutable: Bool = false,
+        isHidden: Bool = false,
         expectedCanonicalParent: String? = nil
     ) {
         let stdURL = url.standardizedFileURL
@@ -57,6 +59,7 @@ public struct DiskTreeNode: Identifiable, Hashable, Sendable {
         self.isAccessible = isAccessible
         self.isProtected = isProtected
         self.isUserImmutable = isUserImmutable
+        self.isHidden = isHidden
         self.expectedCanonicalParent = expectedCanonicalParent
             ?? PrivilegedExecutor.canonicalParentPath(forTargetURL: stdURL)
     }
@@ -94,6 +97,7 @@ public struct DiskTreeNode: Identifiable, Hashable, Sendable {
             isAccessible: isAccessible,
             isProtected: protected,
             isUserImmutable: isUserImmutable,
+            isHidden: isHidden,
             expectedCanonicalParent: expectedCanonicalParent
         )
     }
@@ -209,6 +213,7 @@ public struct DiskEntryFilter: Sendable, Equatable, Hashable {
     public var ageBasis: DiskAgeDateBasis
     public var scope: DiskTreeFilterScope
     public var excludeProtected: Bool
+    public var includeHiddenFiles: Bool
     public var searchText: String
     public var maxResults: Int
 
@@ -218,6 +223,7 @@ public struct DiskEntryFilter: Sendable, Equatable, Hashable {
         ageBasis: DiskAgeDateBasis = .modificationDate,
         scope: DiskTreeFilterScope = .filesAndPackages,
         excludeProtected: Bool = false,
+        includeHiddenFiles: Bool = true,
         searchText: String = "",
         maxResults: Int = 500
     ) {
@@ -226,6 +232,7 @@ public struct DiskEntryFilter: Sendable, Equatable, Hashable {
         self.ageBasis = ageBasis
         self.scope = scope
         self.excludeProtected = excludeProtected
+        self.includeHiddenFiles = includeHiddenFiles
         self.searchText = searchText
         self.maxResults = max(1, maxResults)
     }
@@ -243,6 +250,7 @@ public struct DiskFilteredItem: Identifiable, Hashable, Sendable {
     public let expectedCanonicalParent: String
     public let isProtected: Bool
     public let isUserImmutable: Bool
+    public let isHidden: Bool
     public let relativePathFromRoot: String
 
     public init(
@@ -256,6 +264,7 @@ public struct DiskFilteredItem: Identifiable, Hashable, Sendable {
         expectedCanonicalParent: String? = nil,
         isProtected: Bool = false,
         isUserImmutable: Bool = false,
+        isHidden: Bool = false,
         relativePathFromRoot: String
     ) {
         let stdURL = url.standardizedFileURL
@@ -271,6 +280,7 @@ public struct DiskFilteredItem: Identifiable, Hashable, Sendable {
             ?? PrivilegedExecutor.canonicalParentPath(forTargetURL: stdURL)
         self.isProtected = isProtected
         self.isUserImmutable = isUserImmutable
+        self.isHidden = isHidden
         self.relativePathFromRoot = relativePathFromRoot
     }
 

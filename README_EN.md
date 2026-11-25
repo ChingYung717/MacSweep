@@ -47,7 +47,7 @@ MacSweep/
 │                                       # AppIconView, AnalyzerCapacityComponents, FileInspectorView,
 │                                       # QuickLookPreviewController
 ├── Tests/
-│   ├── MacSweepChecks/                 # 144 sandbox & regression checks (+ read-only --live-audit)
+│   ├── MacSweepChecks/                 # 148 sandbox & regression checks (+ read-only --live-audit)
 │   └── MacSweepE2E/                    # Standalone black-box E2E suite (154 strict checks)
 ├── scripts/
 │   ├── generate_icon.swift             # Programmatic squircle icon generator
@@ -182,7 +182,7 @@ mv MacSweep.app /Applications/
 ### Option B: Build, Test, Demo & Launch from Source
 
 ```bash
-# Run all 144 sandbox & regression checks
+# Run all 148 sandbox & regression checks
 swift run MacSweepChecks
 
 # Run a read-only audit on the current Mac

@@ -158,7 +158,7 @@
 │  ├── Models/              AppItem / DiskTreeNode / FileBrowserItem / ...   │
 │  └── Demo/                DemoFixtureCatalog (/Users/alex 脱敏夹具)        │
 ├────────────────────────────────────────────────────────────────────────────┤
-│  Tests/MacSweepChecks     144 项沙盒与回归校验套件 + 只读本机 --live-audit  │
+│  Tests/MacSweepChecks     148 项沙盒与回归校验套件 + 只读本机 --live-audit  │
 │  Tests/MacSweepE2E        独立端到端验证套件 (154 项严格 E2E 校验)         │
 ├────────────────────────────────────────────────────────────────────────────┤
 │  macOS System Frameworks  SwiftUI / AppKit / Foundation / Darwin /         │
@@ -210,7 +210,7 @@ mv MacSweep.app /Applications/
 #### 3. 方式二：从源码构建、测试、演示预览与打包
 
 ```bash
-# 运行核心引擎沙盒与回归校验（144 项）
+# 运行核心引擎沙盒与回归校验（148 项）
 swift run MacSweepChecks
 
 # 执行只读本机扫描巡检（不修改任何文件）
@@ -325,7 +325,7 @@ mv MacSweep.app /Applications/
 #### Option B: Build, Test, Demo & Package from Source (`macOS 14.0+`)
 
 ```bash
-# 1. Run all 144 sandbox & regression checks
+# 1. Run all 148 sandbox & regression checks
 swift run MacSweepChecks
 
 # 2. Run a read-only live audit on this Mac (modifies nothing)

@@ -864,4 +864,140 @@ func runFileManagerChecks(_ runner: CheckRunner) {
             }
         }
     }
+
+    runner.run("DiskSpaceAnalyzer parallel 2-level fan-out emits progressive onPartialTree snapshots and matches single-threaded parity") {
+        let sandbox = try runner.makeTempSandbox(prefix: "fm-parallel-parity")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let fm = FileManager.default
+        let protectedDir = sandbox.appendingPathComponent("ProtectedZone")
+        try fm.createDirectory(at: protectedDir, withIntermediateDirectories: true)
+        _ = try writeExactFile(at: protectedDir.appendingPathComponent("keep.dat"), byteCount: 8_192)
+
+        for idx in 0..<6 {
+            let top = sandbox.appendingPathComponent("Top_\(idx)")
+            let deep = top.appendingPathComponent("SubA/SubB/SubC/SubD/SubE")
+            try fm.createDirectory(at: deep, withIntermediateDirectories: true)
+            _ = try writeExactFile(at: top.appendingPathComponent("direct.bin"), byteCount: 4_096 * (idx + 1))
+            _ = try writeExactFile(at: deep.appendingPathComponent("leaf.bin"), byteCount: 16_384 * (idx + 1))
+        }
+        let hlSrc = sandbox.appendingPathComponent("Top_0/direct.bin")
+        let hlDst = sandbox.appendingPathComponent("Top_1/hardlink_copy.bin")
+        try fm.linkItem(at: hlSrc, to: hlDst)
+
+        let sg = SafetyGuard(homeDirectory: sandbox, protectedPaths: [protectedDir.path])
+        let parallelAnalyzer = DiskSpaceAnalyzer(safetyGuard: sg)
+        let serialAnalyzer = DiskSpaceAnalyzer(safetyGuard: sg, maxTotalEntries: 100_000)
+
+        final class SnapshotCounter: @unchecked Sendable {
+            private let lock = NSLock()
+            private var count = 0
+            func record() { lock.withLock { count += 1 } }
+            var value: Int { lock.withLock { count } }
+        }
+        let partials = SnapshotCounter()
+
+        let parallelTree = try runAsync {
+            try await parallelAnalyzer.analyze(
+                root: sandbox,
+                maxDepth: 3,
+                onPartialTree: { _ in partials.record() },
+                onProgress: { _ in }
+            )
+        }
+        let serialTree = try runAsync {
+            try await serialAnalyzer.analyze(root: sandbox, maxDepth: 3)
+        }
+
+        try runner.expect(partials.value >= 1, "Parallel analyzer must emit at least one immediate onPartialTree snapshot")
+        try runner.expectEqual(parallelTree.bytes, serialTree.bytes, "Parallel bytes must match single-threaded bytes including cross-dir hardlinks")
+        try runner.expectEqual(parallelTree.fileCount, serialTree.fileCount)
+        try runner.expectEqual(parallelTree.folderCount, serialTree.folderCount)
+        try runner.expectEqual(parallelTree.children.first(where: { $0.name == "ProtectedZone" })?.isProtected, true)
+        try runner.expectEqual(parallelTree.children.first(where: { $0.name == "Top_0" })?.isProtected, false)
+    }
+
+    runner.run("DiskSpaceAnalyzer honors includeHiddenFiles across dotfiles, UF_HIDDEN items, parallel/serial modes, collapsed depth, and DiskEntryFilter") {
+        let sandbox = try runner.makeTempSandbox(prefix: "fm-hidden-opts")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let fm = FileManager.default
+        let visibleDir = sandbox.appendingPathComponent("VisibleDir")
+        let dotDir = sandbox.appendingPathComponent(".dotdir/nested/deep")
+        let flagHiddenDir = sandbox.appendingPathComponent("FlagHiddenDir/nested/deep")
+        try fm.createDirectory(at: visibleDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: dotDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: flagHiddenDir, withIntermediateDirectories: true)
+
+        _ = try writeExactFile(at: visibleDir.appendingPathComponent("visible.bin"), byteCount: 16_384)
+        _ = try writeExactFile(at: visibleDir.appendingPathComponent(".inner_dot.bin"), byteCount: 12_288)
+        let dotFile = sandbox.appendingPathComponent(".root_dot.bin")
+        let flagHiddenFile = sandbox.appendingPathComponent("flag_hidden.bin")
+        _ = try writeExactFile(at: dotFile, byteCount: 8_192)
+        _ = try writeExactFile(at: flagHiddenFile, byteCount: 20_480)
+        _ = try writeExactFile(at: dotDir.appendingPathComponent("dot_deep.bin"), byteCount: 24_576)
+        _ = try writeExactFile(at: flagHiddenDir.appendingPathComponent("flag_deep.bin"), byteCount: 28_672)
+
+        try runner.expectEqual(chflags(flagHiddenFile.path, UInt32(UF_HIDDEN)), 0)
+        try runner.expectEqual(chflags(sandbox.appendingPathComponent("FlagHiddenDir").path, UInt32(UF_HIDDEN)), 0)
+
+        let sg = SafetyGuard(homeDirectory: sandbox)
+        let withHiddenParallel = DiskSpaceAnalyzer(safetyGuard: sg, includeHiddenFiles: true)
+        let noHiddenParallel = DiskSpaceAnalyzer(safetyGuard: sg, includeHiddenFiles: false)
+        let noHiddenSerial = DiskSpaceAnalyzer(safetyGuard: sg, maxTotalEntries: 100_000, includeHiddenFiles: false)
+
+        let treeAll = try runAsync { try await withHiddenParallel.analyze(root: sandbox, maxDepth: 4) }
+        let treeNoHidden = try runAsync { try await noHiddenParallel.analyze(root: sandbox, maxDepth: 4) }
+        let treeNoHiddenSerial = try runAsync { try await noHiddenSerial.analyze(root: sandbox, maxDepth: 4) }
+        let treeNoHiddenCollapsed = try runAsync { try await noHiddenParallel.analyze(root: sandbox, maxDepth: 1) }
+
+        // With hidden enabled, all hidden items are present and tagged isHidden == true
+        try runner.expectEqual(treeAll.children.first(where: { $0.url.path == dotFile.standardizedFileURL.path })?.isHidden, true)
+        try runner.expectEqual(treeAll.children.first(where: { $0.name == ".dotdir" })?.isHidden, true)
+        try runner.expectEqual(treeAll.children.first(where: { $0.name == "flag_hidden.bin" })?.isHidden, true)
+        try runner.expectEqual(treeAll.children.first(where: { $0.name == "FlagHiddenDir" })?.isHidden, true)
+        try runner.expectEqual(treeAll.children.first(where: { $0.name == "VisibleDir" })?.isHidden, false)
+        try runner.expectEqual(treeAll.fileCount, 6)
+
+        // With hidden disabled, only visible.bin survives across parallel, serial, and depth-collapsed scans
+        try runner.expectEqual(treeNoHidden.fileCount, 1)
+        try runner.expectEqual(treeNoHidden.children.map(\.name), ["VisibleDir"])
+        try runner.expectEqual(treeNoHidden.children.first?.children.map(\.name), ["visible.bin"])
+        try runner.expectEqual(treeNoHidden.bytes, treeNoHiddenSerial.bytes, "Parallel and serial no-hidden bytes must match")
+        try runner.expectEqual(treeNoHidden.fileCount, treeNoHiddenSerial.fileCount)
+        try runner.expectEqual(treeNoHidden.bytes, treeNoHiddenCollapsed.bytes, "Collapsed depth-1 no-hidden bytes must match")
+        try runner.expectEqual(treeNoHidden.fileCount, treeNoHiddenCollapsed.fileCount)
+
+        // DiskEntryFilter(includeHiddenFiles: false) filters hidden items in both in-memory filterNodes and deep findMatchingFiles
+        let memHiddenOff = DiskSpaceAnalyzer.filterNodes(
+            in: treeAll,
+            filter: DiskEntryFilter(minBytes: 1, includeHiddenFiles: false)
+        )
+        try runner.expectEqual(memHiddenOff.map(\.name), ["visible.bin"])
+
+        let memHiddenOn = DiskSpaceAnalyzer.filterNodes(
+            in: treeAll,
+            filter: DiskEntryFilter(minBytes: 1, includeHiddenFiles: true)
+        )
+        try runner.expectEqual(memHiddenOn.count, 6)
+        try runner.expectEqual(memHiddenOn.first(where: { $0.name == "dot_deep.bin" })?.isHidden, true)
+        try runner.expectEqual(memHiddenOn.first(where: { $0.name == "visible.bin" })?.isHidden, false)
+
+        let deepHiddenOff = try runAsync {
+            try await withHiddenParallel.findMatchingFiles(
+                under: sandbox,
+                filter: DiskEntryFilter(minBytes: 1, includeHiddenFiles: false)
+            )
+        }
+        try runner.expectEqual(deepHiddenOff.map(\.name), ["visible.bin"])
+
+        let deepHiddenOn = try runAsync {
+            try await withHiddenParallel.findMatchingFiles(
+                under: sandbox,
+                filter: DiskEntryFilter(minBytes: 1, includeHiddenFiles: true)
+            )
+        }
+        try runner.expectEqual(deepHiddenOn.count, 6)
+        try runner.expectEqual(deepHiddenOn.first(where: { $0.name == "flag_deep.bin" })?.isHidden, true)
+    }
 }

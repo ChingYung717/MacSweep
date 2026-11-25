@@ -329,6 +329,20 @@ public struct L10n {
     var navUp: String { t("上级目录", "Enclosing Folder") }
     var showHiddenFiles: String { t("显示隐藏文件", "Show Hidden Files") }
     var hideHiddenFiles: String { t("隐藏点文件", "Hide Hidden Files") }
+    var hiddenFilesChipLabel: String { t("隐藏文件", "Hidden Files") }
+    var hiddenBadge: String { t("隐藏", "Hidden") }
+    var includeHiddenFilesHelp: String {
+        t(
+            "扫描并显示隐藏文件与文件夹（如 .git、.cache、~/Library）",
+            "Scan and display hidden files and folders (e.g. .git, .cache, ~/Library)"
+        )
+    }
+    var junkHiddenFilesHelp: String {
+        t(
+            "显示或隐藏缓存、日志与废纸篓中的隐藏项目（以 . 开头或带隐藏标志）",
+            "Show or hide hidden items (dot-files or UF_HIDDEN) in caches, logs, and Trash"
+        )
+    }
     var newFolder: String { t("新建文件夹", "New Folder") }
     var renameItem: String { t("重命名", "Rename") }
     var moveTo: String { t("移动到...", "Move To...") }

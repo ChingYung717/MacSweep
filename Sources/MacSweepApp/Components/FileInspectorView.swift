@@ -120,6 +120,9 @@ struct FileInspectorView: View {
             }
 
             HStack(spacing: 5) {
+                if metadata?.isHidden == true {
+                    badgePill(l10n.hiddenBadge, icon: "eye.slash.fill", color: palette.secondaryText)
+                }
                 if metadata?.isSIPRestricted == true {
                     badgePill(l10n.systemProtectedBadge, icon: "lock.shield.fill", color: palette.danger)
                 } else if isProtected {

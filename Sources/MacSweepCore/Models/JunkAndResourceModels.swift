@@ -25,6 +25,7 @@ public struct JunkEntry: Identifiable, Hashable, Sendable {
     public let requiresAdmin: Bool
     public var isProtected: Bool
     public let isUserImmutable: Bool
+    public let isHidden: Bool
     public let expectedCanonicalParent: String
     public let isRunningAppBlocked: Bool
     public let runningAppName: String?
@@ -47,6 +48,7 @@ public struct JunkEntry: Identifiable, Hashable, Sendable {
         requiresAdmin: Bool = false,
         isProtected: Bool = false,
         isUserImmutable: Bool = false,
+        isHidden: Bool = false,
         expectedCanonicalParent: String? = nil,
         isRunningAppBlocked: Bool = false,
         runningAppName: String? = nil,
@@ -64,6 +66,7 @@ public struct JunkEntry: Identifiable, Hashable, Sendable {
         self.isDirectory = isDirectory
         self.isProtected = isProtected
         self.isUserImmutable = isUserImmutable
+        self.isHidden = isHidden
         self.expectedCanonicalParent = expectedCanonicalParent
             ?? PrivilegedExecutor.canonicalParentPath(forTargetURL: std)
         self.isRunningAppBlocked = isRunningAppBlocked
@@ -195,6 +198,7 @@ public struct LargeFileScanOptions: Sendable, Equatable, Hashable {
     public var ageBasis: DiskAgeDateBasis
     public var categories: Set<LargeFileCategory>
     public var includePackages: Bool
+    public var includeHiddenFiles: Bool
     public var maxResults: Int
 
     public init(
@@ -203,6 +207,7 @@ public struct LargeFileScanOptions: Sendable, Equatable, Hashable {
         ageBasis: DiskAgeDateBasis = .modificationDate,
         categories: Set<LargeFileCategory> = [],
         includePackages: Bool = false,
+        includeHiddenFiles: Bool = true,
         maxResults: Int = 500
     ) {
         self.minBytes = minBytes
@@ -210,6 +215,7 @@ public struct LargeFileScanOptions: Sendable, Equatable, Hashable {
         self.ageBasis = ageBasis
         self.categories = categories
         self.includePackages = includePackages
+        self.includeHiddenFiles = includeHiddenFiles
         self.maxResults = max(1, maxResults)
     }
 }
@@ -225,6 +231,7 @@ public struct LargeFileItem: Identifiable, Hashable, Sendable {
     public let expectedCanonicalParent: String
     public let isPackage: Bool
     public let isUserImmutable: Bool
+    public let isHidden: Bool
     public let requiresAdmin: Bool
     public var isProtected: Bool
     public var isSelected: Bool
@@ -244,6 +251,7 @@ public struct LargeFileItem: Identifiable, Hashable, Sendable {
         expectedCanonicalParent: String? = nil,
         isPackage: Bool = false,
         isUserImmutable: Bool = false,
+        isHidden: Bool = false,
         requiresAdmin: Bool = false,
         isProtected: Bool = false,
         isSelected: Bool = false,
@@ -261,6 +269,7 @@ public struct LargeFileItem: Identifiable, Hashable, Sendable {
             ?? PrivilegedExecutor.canonicalParentPath(forTargetURL: std)
         self.isPackage = isPackage
         self.isUserImmutable = isUserImmutable
+        self.isHidden = isHidden
         self.requiresAdmin = requiresAdmin
         self.isProtected = isProtected
         self.isSelected = isProtected ? false : isSelected
@@ -312,6 +321,7 @@ public struct DuplicateFileEntry: Identifiable, Hashable, Sendable {
     public let modificationDate: Date?
     public let expectedCanonicalParent: String
     public let isUserImmutable: Bool
+    public let isHidden: Bool
     public let requiresAdmin: Bool
     public var isProtected: Bool
     public var isSelected: Bool
@@ -327,6 +337,7 @@ public struct DuplicateFileEntry: Identifiable, Hashable, Sendable {
         modificationDate: Date?,
         expectedCanonicalParent: String? = nil,
         isUserImmutable: Bool = false,
+        isHidden: Bool = false,
         requiresAdmin: Bool = false,
         isProtected: Bool = false,
         isSelected: Bool = false,
@@ -340,6 +351,7 @@ public struct DuplicateFileEntry: Identifiable, Hashable, Sendable {
         self.expectedCanonicalParent = expectedCanonicalParent
             ?? PrivilegedExecutor.canonicalParentPath(forTargetURL: std)
         self.isUserImmutable = isUserImmutable
+        self.isHidden = isHidden
         self.requiresAdmin = requiresAdmin
         self.isProtected = isProtected
         self.isSelected = isProtected ? false : isSelected

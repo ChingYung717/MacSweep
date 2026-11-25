@@ -1269,4 +1269,93 @@ func runJunkAndResourceChecks(_ runner: CheckRunner) {
         }
         try runner.expect(blockedSystem, "Scanning /System must still throw DiskScanError.permissionDenied")
     }
+
+    runner.run("Hidden-file options: LargeAndDuplicateScanner (dotfiles & UF_HIDDEN) and JunkCacheScanner isHidden tagging") {
+        let sandbox = try runner.makeTempSandbox(prefix: "m3-hidden-opts")
+        defer { try? FileManager.default.removeItem(at: sandbox) }
+
+        let fm = FileManager.default
+        let scanRoot = sandbox.appendingPathComponent("Scan")
+        try fm.createDirectory(at: scanRoot, withIntermediateDirectories: true)
+
+        let payloadA = Data(repeating: 0x21, count: 16_384)
+        let payloadB = Data(repeating: 0x42, count: 16_384)
+        let payloadC = Data(repeating: 0x63, count: 16_384)
+
+        _ = try createFile(in: scanRoot, relativePath: "visible_a.bin", data: payloadA)
+        _ = try createFile(in: scanRoot, relativePath: "visible_b.bin", data: payloadA)
+        _ = try createFile(in: scanRoot, relativePath: ".dot_file.bin", data: payloadB)
+        _ = try createFile(in: scanRoot, relativePath: ".dot_folder/inside_dot.bin", data: payloadB)
+        let ufFile = try createFile(in: scanRoot, relativePath: "uf_hidden.bin", data: payloadC)
+        _ = try createFile(in: scanRoot, relativePath: "UFHiddenDir/inside_uf.bin", data: payloadC)
+
+        try runner.expectEqual(chflags(ufFile.path, UInt32(UF_HIDDEN)), 0)
+        try runner.expectEqual(chflags(scanRoot.appendingPathComponent("UFHiddenDir").path, UInt32(UF_HIDDEN)), 0)
+
+        let sg = SafetyGuard(homeDirectory: sandbox, selfBundlePath: nil)
+        let scanner = LargeAndDuplicateScanner(safetyGuard: sg)
+
+        // Large files: includeHiddenFiles false vs true
+        let largeVisibleOnly = try runAsync {
+            try await scanner.scanLargeFiles(
+                under: scanRoot,
+                options: LargeFileScanOptions(minBytes: 4_096, includeHiddenFiles: false)
+            )
+        }
+        try runner.expectEqual(Set(largeVisibleOnly.map(\.name)), Set(["visible_a.bin", "visible_b.bin"]))
+
+        let largeWithHidden = try runAsync {
+            try await scanner.scanLargeFiles(
+                under: scanRoot,
+                options: LargeFileScanOptions(minBytes: 4_096, includeHiddenFiles: true)
+            )
+        }
+        try runner.expectEqual(largeWithHidden.count, 6)
+        try runner.expectEqual(largeWithHidden.first(where: { $0.name == "visible_a.bin" })?.isHidden, false)
+        try runner.expectEqual(largeWithHidden.first(where: { $0.name == ".dot_file.bin" })?.isHidden, true)
+        try runner.expectEqual(largeWithHidden.first(where: { $0.name == "inside_dot.bin" })?.isHidden, true)
+        try runner.expectEqual(largeWithHidden.first(where: { $0.name == "uf_hidden.bin" })?.isHidden, true)
+        try runner.expectEqual(largeWithHidden.first(where: { $0.name == "inside_uf.bin" })?.isHidden, true)
+
+        // Duplicate files: includeHiddenFiles false skips both dotfiles and UF_HIDDEN; true includes all 3 groups with isHidden tags
+        let dupVisibleOnly = try runAsync {
+            try await scanner.scanDuplicates(
+                under: scanRoot,
+                options: DuplicateScanOptions(minBytes: 1, includeHiddenFiles: false)
+            )
+        }
+        try runner.expectEqual(dupVisibleOnly.count, 1)
+        try runner.expectEqual(Set(dupVisibleOnly[0].files.map(\.name)), Set(["visible_a.bin", "visible_b.bin"]))
+
+        let dupWithHidden = try runAsync {
+            try await scanner.scanDuplicates(
+                under: scanRoot,
+                options: DuplicateScanOptions(minBytes: 1, includeHiddenFiles: true)
+            )
+        }
+        try runner.expectEqual(dupWithHidden.count, 3)
+        let allDupEntries = dupWithHidden.flatMap(\.files)
+        try runner.expectEqual(allDupEntries.first(where: { $0.name == "visible_a.bin" })?.isHidden, false)
+        try runner.expectEqual(allDupEntries.first(where: { $0.name == "inside_dot.bin" })?.isHidden, true)
+        try runner.expectEqual(allDupEntries.first(where: { $0.name == "uf_hidden.bin" })?.isHidden, true)
+        try runner.expectEqual(allDupEntries.first(where: { $0.name == "inside_uf.bin" })?.isHidden, true)
+
+        // JunkCacheScanner tags hidden items in Trash with isHidden == true
+        let trashDir = sandbox.appendingPathComponent(".Trash")
+        try fm.createDirectory(at: trashDir, withIntermediateDirectories: true)
+        _ = try createFile(in: trashDir, relativePath: "normal-trash.tmp", data: Data(repeating: 0x11, count: 1024))
+        _ = try createFile(in: trashDir, relativePath: ".secret-trash.tmp", data: Data(repeating: 0x22, count: 1024))
+
+        let junkScanner = JunkCacheScanner(
+            safetyGuard: sg,
+            homeDirectory: sandbox,
+            includeSystemLogs: false,
+            runningBundleIDs: [],
+            runningAppNames: []
+        )
+        let junkCats = try runAsync { try await junkScanner.scan() }
+        let trashEntries = junkCats.first(where: { $0.category == .trash })?.entries ?? []
+        try runner.expectEqual(trashEntries.first(where: { $0.name == "normal-trash.tmp" })?.isHidden, false)
+        try runner.expectEqual(trashEntries.first(where: { $0.name == ".secret-trash.tmp" })?.isHidden, true)
+    }
 }
