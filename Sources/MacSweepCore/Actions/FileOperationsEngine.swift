@@ -588,6 +588,9 @@ public struct FileOperationsEngine: Sendable {
     ) throws {
         let stageName = ".macsweep-move.\(UUID().uuidString)"
         var deferredDirs: [DeferredDirectoryMetadata] = []
+        var rootDeferredDir: DeferredDirectoryMetadata?
+        var stagedRootDev: dev_t = 0
+        var stagedRootIno: ino_t = 0
         do {
             try copyEntryConfined(
                 srcParentFD: srcParentFD,
@@ -600,13 +603,35 @@ public struct FileOperationsEngine: Sendable {
                 srcDisplayPath: srcDisplayPath,
                 dstDisplayPath: dstDisplayPath
             )
-            try applyDeferredDirectoryMetadata(
-                deferredDirs,
-                baseParentFD: dstParentFD,
-                stageName: stageName,
-                srcDisplayPath: srcDisplayPath,
-                dstDisplayPath: dstDisplayPath
-            )
+
+            // Finalize nested subdirectories before commit, but defer the staged root directory's
+            // mode/timestamps until immediately after `renameatx_np`: on macOS 15, renaming a
+            // read-only (`0o555`) directory fails with EACCES (`KAUTH_VNODE_WRITE_DATA`).
+            let childDeferredDirs = deferredDirs.filter { !$0.relativePath.isEmpty }
+            rootDeferredDir = deferredDirs.first(where: { $0.relativePath.isEmpty })
+
+            if !childDeferredDirs.isEmpty {
+                try applyDeferredDirectoryMetadata(
+                    childDeferredDirs,
+                    baseParentFD: dstParentFD,
+                    stageName: stageName,
+                    srcDisplayPath: srcDisplayPath,
+                    dstDisplayPath: dstDisplayPath
+                )
+            }
+
+            if rootDeferredDir != nil {
+                var stagedSt = stat()
+                guard fstatat(dstParentFD, stageName, &stagedSt, AT_SYMLINK_NOFOLLOW) == 0 else {
+                    throw FileOperationError.crossVolumeMoveFailed(
+                        source: srcDisplayPath,
+                        destination: dstDisplayPath,
+                        detail: "stat staging root: \(String(cString: strerror(errno)))"
+                    )
+                }
+                stagedRootDev = stagedSt.st_dev
+                stagedRootIno = stagedSt.st_ino
+            }
 
             if renameatx_np(dstParentFD, stageName, dstParentFD, dstName, UInt32(RENAME_EXCL)) != 0 {
                 let err = errno
@@ -619,7 +644,7 @@ public struct FileOperationsEngine: Sendable {
                         throw FileOperationError.crossVolumeMoveFailed(
                             source: srcDisplayPath,
                             destination: dstDisplayPath,
-                            detail: String(cString: strerror(errno))
+                            detail: "rename staging: \(String(cString: strerror(errno)))"
                         )
                     }
                 } else if err == EEXIST {
@@ -628,13 +653,37 @@ public struct FileOperationsEngine: Sendable {
                     throw FileOperationError.crossVolumeMoveFailed(
                         source: srcDisplayPath,
                         destination: dstDisplayPath,
-                        detail: String(cString: strerror(err))
+                        detail: "rename staging: \(String(cString: strerror(err)))"
                     )
                 }
             }
         } catch {
             try? removeEntryTreeConfined(parentFD: dstParentFD, name: stageName)
             throw error
+        }
+
+        if let rootMeta = rootDeferredDir {
+            var rootFD = openat(dstParentFD, dstName, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+            if rootFD < 0 && errno == EACCES {
+                rootFD = openat(dstParentFD, dstName, O_SEARCH | O_DIRECTORY | O_NOFOLLOW)
+            }
+            if rootFD >= 0 {
+                defer { close(rootFD) }
+                var committedSt = stat()
+                if fstat(rootFD, &committedSt) == 0,
+                   committedSt.st_dev == stagedRootDev,
+                   committedSt.st_ino == stagedRootIno {
+                    var times: [timespec] = [rootMeta.atime, rootMeta.mtime]
+                    _ = futimens(rootFD, &times)
+                    if fchmod(rootFD, rootMeta.mode) != 0, errno != ENOTSUP {
+                        throw FileOperationError.crossVolumeMoveFailed(
+                            source: srcDisplayPath,
+                            destination: dstDisplayPath,
+                            detail: "restore root mode: \(String(cString: strerror(errno)))"
+                        )
+                    }
+                }
+            }
         }
 
         do {
@@ -1112,23 +1161,35 @@ public struct FileOperationsEngine: Sendable {
     ) throws {
         // Apply deepest children first so modifying children never resets parent timestamps or hits read-only modes.
         for entry in entries.reversed() {
-            var currentFD = openat(baseParentFD, stageName, O_SEARCH | O_DIRECTORY | O_NOFOLLOW)
+            var currentFD = openat(baseParentFD, stageName, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+            if currentFD < 0 && errno == EACCES {
+                currentFD = openat(baseParentFD, stageName, O_SEARCH | O_DIRECTORY | O_NOFOLLOW)
+            }
             guard currentFD >= 0 else {
                 throw FileOperationError.crossVolumeMoveFailed(
                     source: srcDisplayPath,
                     destination: dstDisplayPath,
-                    detail: String(cString: strerror(errno))
+                    detail: "open staging dir: \(String(cString: strerror(errno)))"
                 )
             }
             if !entry.relativePath.isEmpty {
-                for comp in entry.relativePath.split(separator: "/").map(String.init) {
-                    let nextFD = openat(currentFD, comp, O_SEARCH | O_DIRECTORY | O_NOFOLLOW)
+                let comps = entry.relativePath.split(separator: "/").map(String.init)
+                for (idx, comp) in comps.enumerated() {
+                    let isLast = idx == comps.count - 1
+                    var nextFD = openat(
+                        currentFD,
+                        comp,
+                        (isLast ? O_RDONLY : O_SEARCH) | O_DIRECTORY | O_NOFOLLOW
+                    )
+                    if isLast && nextFD < 0 && errno == EACCES {
+                        nextFD = openat(currentFD, comp, O_SEARCH | O_DIRECTORY | O_NOFOLLOW)
+                    }
                     close(currentFD)
                     guard nextFD >= 0 else {
                         throw FileOperationError.crossVolumeMoveFailed(
                             source: srcDisplayPath,
                             destination: dstDisplayPath,
-                            detail: String(cString: strerror(errno))
+                            detail: "open deferred dir '\(comp)': \(String(cString: strerror(errno)))"
                         )
                     }
                     currentFD = nextFD
@@ -1141,7 +1202,7 @@ public struct FileOperationsEngine: Sendable {
                 throw FileOperationError.crossVolumeMoveFailed(
                     source: srcDisplayPath,
                     destination: dstDisplayPath,
-                    detail: String(cString: strerror(errno))
+                    detail: "chmod deferred dir: \(String(cString: strerror(errno)))"
                 )
             }
         }
